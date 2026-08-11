@@ -1,0 +1,179 @@
+"""Profile data model: the learned, per-installation detection parameters.
+
+A profile is a *derived artifact* — it is always recomputed in full from
+the calibration store by :func:`..learn.learn_profile` and carries every
+learned threshold plus diagnostic learning statistics. It contains no
+hand-tuned numbers: everything in here is user setup data (ROI, bin
+list, working width) or learned from the user's calibration images.
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any
+
+from .errors import ProfileError
+
+SCHEMA_VERSION = 1
+
+# Categorical resampling choice, stored in the profile so calibration
+# and detection always run the identical pipeline. Bilinear is the
+# default: it approximates an area average without Lanczos overshoot,
+# so no out-of-gamut colors are invented at lid edges.
+KNOWN_RESAMPLE = ("bilinear", "nearest")
+
+# Shared floating-point slack for validating relative coordinates
+# (e.g. x + w == 1.0 arriving as 1.0000000000000002 after division).
+# Used identically by every bounds check in the pipeline — one policy,
+# not per-module copies.
+REL_EPS = 1e-9
+
+
+@dataclass(frozen=True)
+class Roi:
+    """Region of interest in image-relative coordinates (0..1)."""
+
+    x: float
+    y: float
+    w: float
+    h: float
+
+
+@dataclass(frozen=True)
+class Rect:
+    """Axis-aligned rectangle in ROI-relative coordinates (0..1)."""
+
+    x: float
+    y: float
+    w: float
+    h: float
+
+
+@dataclass
+class BinModel:
+    """Learned color and area model for one bin."""
+
+    id: str
+    name: str
+    hue_center_deg: float
+    hue_tol_deg: float
+    sat_min: float
+    val_min: float
+    min_area_frac: float
+    learning_stats: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class Profile:
+    """Complete learned detection profile for one installation."""
+
+    roi: Roi
+    working_width: int | None
+    resample: str
+    daylight_sat_min: float
+    bins: list[BinModel]
+    daylight_stats: dict[str, Any] = field(default_factory=dict)
+    schema_version: int = SCHEMA_VERSION
+
+
+def validate_profile(profile: Profile) -> None:
+    """Raise :class:`ProfileError` if the profile is structurally invalid."""
+    if profile.schema_version != SCHEMA_VERSION:
+        raise ProfileError(
+            f"unsupported profile schema_version {profile.schema_version} "
+            f"(supported: {SCHEMA_VERSION}) — re-run 'learn' on this "
+            "installation or migrate the profile"
+        )
+    if profile.resample not in KNOWN_RESAMPLE:
+        raise ProfileError(
+            f"unknown resample {profile.resample!r}; known: {KNOWN_RESAMPLE}"
+        )
+    if profile.working_width is not None and profile.working_width <= 0:
+        raise ProfileError(f"working_width must be positive, got {profile.working_width}")
+    if not 0.0 <= profile.daylight_sat_min <= 1.0:
+        raise ProfileError(f"daylight_sat_min outside [0, 1]: {profile.daylight_sat_min}")
+    if not profile.bins:
+        raise ProfileError("profile contains no bins")
+    seen: set[str] = set()
+    for b in profile.bins:
+        if not b.id:
+            raise ProfileError("bin with empty id")
+        if b.id in seen:
+            raise ProfileError(f"duplicate bin id {b.id!r}")
+        seen.add(b.id)
+        if not 0.0 <= b.hue_center_deg < 360.0:
+            raise ProfileError(f"bin {b.id}: hue_center_deg outside [0, 360): {b.hue_center_deg}")
+        # 2·tol ≥ 180° would accept at least half the color circle —
+        # geometrically no discriminative power left (same bound the
+        # learner enforces; re-checked here against hand-edited files).
+        if not 0.0 < b.hue_tol_deg or 2.0 * b.hue_tol_deg >= 180.0:
+            raise ProfileError(f"bin {b.id}: hue_tol_deg out of range (0, 90): {b.hue_tol_deg}")
+        for name, value in (("sat_min", b.sat_min), ("val_min", b.val_min)):
+            if not 0.0 <= value <= 1.0:
+                raise ProfileError(f"bin {b.id}: {name} outside [0, 1]: {value}")
+        if not 0.0 < b.min_area_frac <= 1.0:
+            raise ProfileError(f"bin {b.id}: min_area_frac outside (0, 1]: {b.min_area_frac}")
+
+
+def profile_to_dict(profile: Profile) -> dict[str, Any]:
+    data = asdict(profile)
+    # Stable, human-scannable key order for the JSON file.
+    return {
+        "schema_version": data["schema_version"],
+        "roi": data["roi"],
+        "working_width": data["working_width"],
+        "resample": data["resample"],
+        "daylight_sat_min": data["daylight_sat_min"],
+        "daylight_stats": data["daylight_stats"],
+        "bins": data["bins"],
+    }
+
+
+def profile_from_dict(data: dict[str, Any]) -> Profile:
+    try:
+        profile = Profile(
+            schema_version=int(data["schema_version"]),
+            roi=Roi(**{k: float(data["roi"][k]) for k in ("x", "y", "w", "h")}),
+            working_width=(
+                None if data["working_width"] is None else int(data["working_width"])
+            ),
+            resample=str(data["resample"]),
+            daylight_sat_min=float(data["daylight_sat_min"]),
+            daylight_stats=dict(data.get("daylight_stats", {})),
+            bins=[
+                BinModel(
+                    id=str(b["id"]),
+                    name=str(b["name"]),
+                    hue_center_deg=float(b["hue_center_deg"]),
+                    hue_tol_deg=float(b["hue_tol_deg"]),
+                    sat_min=float(b["sat_min"]),
+                    val_min=float(b["val_min"]),
+                    min_area_frac=float(b["min_area_frac"]),
+                    learning_stats=dict(b.get("learning_stats", {})),
+                )
+                for b in data["bins"]
+            ],
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ProfileError(f"malformed profile data: {exc!r}") from exc
+    validate_profile(profile)
+    return profile
+
+
+def load_profile(path: str | Path) -> Profile:
+    path = Path(path)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ProfileError(f"cannot read profile {path}: {exc}") from exc
+    return profile_from_dict(data)
+
+
+def save_profile(profile: Profile, path: str | Path) -> None:
+    validate_profile(profile)
+    Path(path).write_text(
+        json.dumps(profile_to_dict(profile), indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )

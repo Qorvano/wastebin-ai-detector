@@ -1,0 +1,11 @@
+{
+  "domain": "wastebin_ai_detector",
+  "name": "Wastebin AI Detector",
+  "codeowners": ["@Qorvano"],
+  "documentation": "https://github.com/Qorvano/wastebin-ai-detector",
+  "integration_type": "service",
+  "iot_class": "local_polling",
+  "issue_tracker": "https://github.com/Qorvano/wastebin-ai-detector/issues",
+  "requirements": ["numpy>=1.26.0", "Pillow>=10.0.0"],
+  "version": "0.1.0"
+}
