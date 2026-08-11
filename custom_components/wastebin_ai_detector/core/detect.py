@@ -14,9 +14,29 @@ import numpy as np
 from PIL import Image
 
 from .ccl import largest_component_area
-from .color import circular_dist_deg, rgb_to_hsv
+from .color import RGB_8BIT_LEVELS, circular_dist_deg, rgb_to_hsv
 from .imageio import extract_working_roi, load_image_rgb
 from .profile import BinModel, Profile, validate_profile
+
+
+def is_uncertain(area_frac: float, learning_stats: dict[str, Any]) -> bool:
+    """Is this area fraction inside the learned ambiguity interval?
+
+    The interval between the smallest observed positive and the largest
+    observed negative blob is ambiguous by construction: nothing in the
+    calibration data says which side such a frame belongs to. For
+    non-separable profiles the interval is inverted; taking min/max of
+    the two bounds covers both orientations conservatively. Profiles
+    without learning stats (hand-written) yield False: no information,
+    no claim of uncertainty.
+    """
+    min_pos = learning_stats.get("min_pos_area_frac")
+    max_neg = learning_stats.get("max_neg_area_frac")
+    if min_pos is None or max_neg is None:
+        return False
+    lo = min(min_pos, max_neg)
+    hi = max(min_pos, max_neg)
+    return lo < area_frac < hi
 
 
 def bin_mask(
@@ -37,6 +57,7 @@ class BinResult:
     area_frac: float
     min_area_frac: float
     margin: float  # area_frac / min_area_frac - confidence on a ratio scale
+    uncertain: bool = False  # inside the learned ambiguity interval
 
     def to_dict(self) -> dict[str, Any]:
         # Values are serialized unrounded: any display rounding could
@@ -49,6 +70,7 @@ class BinResult:
             "area_frac": self.area_frac,
             "min_area_frac": self.min_area_frac,
             "margin": self.margin,
+            "uncertain": self.uncertain,
         }
 
 
@@ -58,12 +80,18 @@ class DetectionResult:
     median_sat: float
     grayscale_suspect: bool
     working_size: tuple[int, int]  # (width, height) of the analyzed ROI
+    median_val: float = 0.0
+    clip_frac: float = 0.0
+    overexposure_suspect: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "bins": [b.to_dict() for b in self.bins],
             "median_sat": self.median_sat,
+            "median_val": self.median_val,
+            "clip_frac": self.clip_frac,
             "grayscale_suspect": self.grayscale_suspect,
+            "overexposure_suspect": self.overexposure_suspect,
             "working_size": list(self.working_size),
         }
 
@@ -86,15 +114,28 @@ def detect(img: Image.Image, profile: Profile) -> DetectionResult:
                 area_frac=frac,
                 min_area_frac=model.min_area_frac,
                 margin=frac / model.min_area_frac,
+                uncertain=is_uncertain(frac, model.learning_stats),
             )
         )
     median_sat = float(np.median(sat))
+    median_val = float(np.median(val))
+    # Same derivation as in the learner: one 8-bit quantum below full
+    # brightness marks a pixel as clipped or about to clip.
+    clip_frac = float(np.mean(val >= 1.0 - 1.0 / RGB_8BIT_LEVELS))
     return DetectionResult(
         bins=results,
         median_sat=median_sat,
+        median_val=median_val,
+        clip_frac=clip_frac,
         # Below the least-saturated daylight calibration image → likely
         # an IR/greyscale night frame; color detection is unreliable.
         grayscale_suspect=median_sat < profile.daylight_sat_min,
+        # More clipping or a brighter frame than anything the learner
+        # ever saw → harsh-light frame, color evidence is degraded.
+        overexposure_suspect=(
+            clip_frac > profile.overexposure_clip_max
+            or median_val > profile.daylight_val_max
+        ),
         working_size=(arr.shape[1], arr.shape[0]),
     )
 

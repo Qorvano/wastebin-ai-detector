@@ -7,7 +7,14 @@ unchanged by the Home Assistant integration layer.
 
 from .ccl import largest_component_area
 from .color import circular_dist_deg, circular_mean_deg, rgb_to_hsv
-from .detect import BinResult, DetectionResult, bin_mask, detect, detect_file
+from .detect import (
+    BinResult,
+    DetectionResult,
+    bin_mask,
+    detect,
+    detect_file,
+    is_uncertain,
+)
 from .errors import (
     CalibrationError,
     ImageLoadError,
@@ -68,6 +75,7 @@ __all__ = [
     "detect",
     "detect_file",
     "extract_working_roi",
+    "is_uncertain",
     "largest_component_area",
     "learn_area_threshold",
     "learn_color_model",

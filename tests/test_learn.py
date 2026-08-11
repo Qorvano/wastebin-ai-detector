@@ -27,6 +27,9 @@ class TestAreaThreshold:
         result = learn_area_threshold([0.04], [], bin_id="t")
         assert result.min_area_frac == pytest.approx(0.02)
         assert result.stats["provisional"] is True
+        # No observed negative: the stat must be None, not a claimed
+        # 0.0, or the ambiguity interval would swallow (0, min_pos).
+        assert result.stats["max_neg_area_frac"] is None
         assert any("provisional" in w for w in result.warnings)
 
     def test_zero_negatives_not_provisional(self):

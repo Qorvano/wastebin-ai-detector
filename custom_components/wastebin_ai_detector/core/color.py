@@ -17,6 +17,13 @@ from .errors import CalibrationError
 # so it can never reclassify a real color - it only protects 0/0.
 _EPS = 1e-12
 
+# Structural constants of the input encoding, not tuning values:
+# hue is defined as 60° per RGB sextant, and source images are 8-bit.
+# Together they give the hue quantization of a pixel with chroma c:
+# one 8-bit step in a channel shifts hue by 60° / (255 · c).
+HUE_DEG_PER_SEXTANT = 60.0
+RGB_8BIT_LEVELS = 255.0
+
 
 def rgb_to_hsv(rgb: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Convert an (..., 3) float array in [0, 1] to HSV.

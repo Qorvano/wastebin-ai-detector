@@ -21,6 +21,7 @@ from .const import (
     CONF_BINS,
     CONF_CAMERA,
     CONF_CAPTURE_INTERVAL,
+    CONF_CONFIRM_SCANS,
     CONF_ROI_H,
     CONF_ROI_W,
     CONF_ROI_X,
@@ -28,9 +29,11 @@ from .const import (
     CONF_SCAN_INTERVAL,
     CONF_WORKING_WIDTH,
     DEFAULT_CAPTURE_INTERVAL_MIN,
+    DEFAULT_CONFIRM_SCANS,
     DEFAULT_SCAN_INTERVAL_MIN,
     DEFAULT_WORKING_WIDTH,
     DOMAIN,
+    MAX_CONFIRM_SCANS,
 )
 
 CONF_ADD_ANOTHER = "add_another"
@@ -196,6 +199,19 @@ class WastebinOptionsFlow(OptionsFlow):
                             CONF_CAPTURE_INTERVAL, DEFAULT_CAPTURE_INTERVAL_MIN
                         ),
                     ): minutes,
+                    vol.Required(
+                        CONF_CONFIRM_SCANS,
+                        default=options.get(
+                            CONF_CONFIRM_SCANS, DEFAULT_CONFIRM_SCANS
+                        ),
+                    ): selector.NumberSelector(
+                        selector.NumberSelectorConfig(
+                            min=1,
+                            max=MAX_CONFIRM_SCANS,
+                            step=1,
+                            mode=selector.NumberSelectorMode.BOX,
+                        )
+                    ),
                 }
             ),
         )

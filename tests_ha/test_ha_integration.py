@@ -42,12 +42,63 @@ ENTRY_DATA = {
 }
 
 
-def _scene_jpeg(with_yellow: bool) -> bytes:
-    rects = [(YELLOW, 0.30, 0.30, 0.20, 0.20)] if with_yellow else []
+# Saturated backdrop covering the whole frame: keeps the median
+# saturation high in every test scene, so the greyscale gate stays
+# quiet and the overexposure gate can be tested in isolation.
+_BACKDROP = ((0.45, 0.55, 0.35), 0.0, 0.0, 1.0, 1.0)
+
+
+def _scene_jpeg(
+    with_yellow: bool, blown: bool = False, yellow_scale: float = 1.0
+) -> bytes:
+    rects = [_BACKDROP]
+    if with_yellow:
+        rects.append(
+            (YELLOW, 0.30, 0.30, 0.20 * yellow_scale, 0.20 * yellow_scale)
+        )
+    if blown:
+        rects.append(((1.0, 1.0, 1.0), 0.05, 0.55, 0.90, 0.35))
     scene = make_scene(size=(320, 200), rects=rects, seed=5)
     buffer = io.BytesIO()
     scene.save(buffer, format="JPEG", quality=90)
     return buffer.getvalue()
+
+
+class _CameraFeed:
+    """Mutable stand-in for async_get_image in tests."""
+
+    def __init__(self, content: bytes) -> None:
+        self.content = content
+
+    async def __call__(self, *_args, **_kwargs):
+        return SimpleNamespace(content=self.content)
+
+
+async def _calibrate_yellow(hass: HomeAssistant) -> str:
+    response = await hass.services.async_call(
+        DOMAIN, "capture_snapshot", {}, blocking=True, return_response=True
+    )
+    filename = response["filename"]
+    await hass.services.async_call(
+        DOMAIN,
+        "add_sample",
+        {
+            "filename": filename,
+            "bin": "gelbe_tonne",
+            "rect": [0.35, 0.35, 0.10, 0.10],
+            "space": "image",
+        },
+        blocking=True,
+    )
+    await hass.services.async_call(
+        DOMAIN,
+        "label_image",
+        {"filename": filename, "present": ["gelbe_tonne"]},
+        blocking=True,
+        return_response=True,
+    )
+    await hass.async_block_till_done()
+    return filename
 
 
 async def test_full_config_flow(hass: HomeAssistant) -> None:
@@ -180,6 +231,119 @@ async def test_calibration_services_full_cycle(hass: HomeAssistant) -> None:
         state = hass.states.get(sensor_id)
         assert state.state == "on"
         assert state.attributes["margin"] > 1.0
+
+
+async def test_overexposed_frame_holds_state(hass: HomeAssistant) -> None:
+    entry = MockConfigEntry(domain=DOMAIN, data=ENTRY_DATA, title="Test")
+    entry.add_to_hass(hass)
+    feed = _CameraFeed(_scene_jpeg(with_yellow=True))
+    with patch(
+        "custom_components.wastebin_ai_detector.coordinator.async_get_image",
+        new=feed,
+    ):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        await _calibrate_yellow(hass)
+
+        registry = er.async_get(hass)
+        sensor_id = registry.async_get_entity_id(
+            "binary_sensor", DOMAIN, f"{entry.entry_id}_gelbe_tonne"
+        )
+        assert hass.states.get(sensor_id).state == "on"
+
+        # A blown-out frame must not flip the sensor to off.
+        feed.content = _scene_jpeg(with_yellow=False, blown=True)
+        await entry.runtime_data.coordinator.async_refresh()
+        await hass.async_block_till_done()
+        assert hass.states.get(sensor_id).state == "on"
+        assert entry.runtime_data.coordinator.last_overexposure_skip is not None
+
+
+async def test_confirm_scans_requires_consecutive_evidence(
+    hass: HomeAssistant,
+) -> None:
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data=ENTRY_DATA,
+        options={"confirm_scans": 2},
+        title="Test",
+    )
+    entry.add_to_hass(hass)
+    feed = _CameraFeed(_scene_jpeg(with_yellow=True))
+    with patch(
+        "custom_components.wastebin_ai_detector.coordinator.async_get_image",
+        new=feed,
+    ):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        await _calibrate_yellow(hass)
+
+        registry = er.async_get(hass)
+        sensor_id = registry.async_get_entity_id(
+            "binary_sensor", DOMAIN, f"{entry.entry_id}_gelbe_tonne"
+        )
+        assert hass.states.get(sensor_id).state == "on"
+
+        # Confident absence, first analysis: pending, state held.
+        feed.content = _scene_jpeg(with_yellow=False)
+        await entry.runtime_data.coordinator.async_refresh()
+        await hass.async_block_till_done()
+        assert hass.states.get(sensor_id).state == "on"
+
+        # Second consecutive confident absence: flip accepted.
+        await entry.runtime_data.coordinator.async_refresh()
+        await hass.async_block_till_done()
+        assert hass.states.get(sensor_id).state == "off"
+
+
+async def test_reload_on_ambiguous_frame_stays_unavailable(
+    hass: HomeAssistant,
+) -> None:
+    """An uncertain first frame after a reload must not publish a raw
+    verdict; the sensor stays unavailable until a confident frame."""
+    entry = MockConfigEntry(domain=DOMAIN, data=ENTRY_DATA, title="Test")
+    entry.add_to_hass(hass)
+    feed = _CameraFeed(_scene_jpeg(with_yellow=True))
+    with patch(
+        "custom_components.wastebin_ai_detector.coordinator.async_get_image",
+        new=feed,
+    ):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        filename = await _calibrate_yellow(hass)
+        # A real absent example gives the profile an observed negative,
+        # which activates the ambiguity interval.
+        feed.content = _scene_jpeg(with_yellow=False)
+        response = await hass.services.async_call(
+            DOMAIN, "capture_snapshot", {}, blocking=True, return_response=True
+        )
+        response = await hass.services.async_call(
+            DOMAIN,
+            "label_image",
+            {"filename": response["filename"], "absent": ["gelbe_tonne"]},
+            blocking=True,
+            return_response=True,
+        )
+        assert response["relearn"] == "ok", response
+        assert response["bins"]["gelbe_tonne"]["max_neg_area_frac"] == 0.0
+        await hass.async_block_till_done()
+
+        registry = er.async_get(hass)
+        sensor_id = registry.async_get_entity_id(
+            "binary_sensor", DOMAIN, f"{entry.entry_id}_gelbe_tonne"
+        )
+
+        # Reload with a shrunken (ambiguous) lid in view.
+        feed.content = _scene_jpeg(with_yellow=True, yellow_scale=0.6)
+        assert await hass.config_entries.async_reload(entry.entry_id)
+        await hass.async_block_till_done()
+        assert hass.states.get(sensor_id).state == "unavailable"
+
+        # First confident frame brings the sensor back.
+        feed.content = _scene_jpeg(with_yellow=True)
+        await entry.runtime_data.coordinator.async_refresh()
+        await hass.async_block_till_done()
+        assert hass.states.get(sensor_id).state == "on"
 
 
 async def test_forget_image_removes_calibration_data(

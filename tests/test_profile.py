@@ -72,6 +72,14 @@ def test_bad_area_frac_rejected():
         profile_from_dict(data)
 
 
+def test_bad_learning_stats_rejected():
+    for bad in ("kaputt", 1.5, True):
+        data = profile_to_dict(_valid_profile())
+        data["bins"][0]["learning_stats"] = {"min_pos_area_frac": bad}
+        with pytest.raises(ProfileError):
+            profile_from_dict(data)
+
+
 def test_missing_field_rejected():
     data = profile_to_dict(_valid_profile())
     del data["roi"]

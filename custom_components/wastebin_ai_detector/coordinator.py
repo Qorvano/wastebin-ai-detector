@@ -14,6 +14,7 @@ calibration data as soon as the user labels them.
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from datetime import datetime, timedelta
 
 from homeassistant.components.camera import async_get_image
@@ -31,8 +32,10 @@ from homeassistant.util import dt as dt_util
 from .const import (
     CONF_CAMERA,
     CONF_CAPTURE_INTERVAL,
+    CONF_CONFIRM_SCANS,
     CONF_SCAN_INTERVAL,
     DEFAULT_CAPTURE_INTERVAL_MIN,
+    DEFAULT_CONFIRM_SCANS,
     DEFAULT_SCAN_INTERVAL_MIN,
     DOMAIN,
 )
@@ -68,6 +71,12 @@ class WastebinCoordinator(DataUpdateCoordinator[DetectionResult]):
         self.camera_entity: str = entry.data[CONF_CAMERA]
         self.last_daylight_update: datetime | None = None
         self.last_greyscale_skip: datetime | None = None
+        self.last_overexposure_skip: datetime | None = None
+        self.last_confident_update: dict[str, datetime] = {}
+        self._confirm_scans: int = int(
+            entry.options.get(CONF_CONFIRM_SCANS, DEFAULT_CONFIRM_SCANS)
+        )
+        self._pending_flips: dict[str, int] = {}
 
     async def _async_update_data(self) -> DetectionResult:
         profile = self.storage.profile
@@ -86,19 +95,75 @@ class WastebinCoordinator(DataUpdateCoordinator[DetectionResult]):
             )
         except WastebinError as err:
             raise UpdateFailed(f"detection failed: {err}") from err
-        if result.grayscale_suspect:
-            self.last_greyscale_skip = dt_util.utcnow()
+        now = dt_util.utcnow()
+        if result.grayscale_suspect or result.overexposure_suspect:
+            # Degraded evidence (IR night frame or harsher light than
+            # anything calibrated): hold the last accepted state rather
+            # than publishing a verdict the color signal cannot carry.
+            # Both diagnostics are stamped independently; a frame can
+            # legitimately trip both gates.
+            if result.grayscale_suspect:
+                self.last_greyscale_skip = now
+            if result.overexposure_suspect:
+                self.last_overexposure_skip = now
+            # A gated frame breaks the chain of consecutive confident
+            # analyses the confirm_scans option promises.
+            self._pending_flips.clear()
             if self.data is not None:
                 return self.data
-            # No daylight result exists yet (fresh setup or a reload at
-            # night): publishing an IR verdict would present "all bins
-            # absent" as real state. Stay unavailable instead.
             raise UpdateFailed(
-                "greyscale/IR frame and no daylight result yet; waiting "
-                "for the first daylight analysis"
+                "frame quality too low (greyscale/IR or overexposed) and "
+                "no prior daylight result yet; waiting for the first "
+                "clean analysis"
             )
-        self.last_daylight_update = dt_util.utcnow()
-        return result
+        self.last_daylight_update = now
+        return self._apply_stability(result, now)
+
+    def _apply_stability(self, result: DetectionResult, now: datetime) -> DetectionResult:
+        """Per-bin acceptance: learned-uncertainty hold plus optional
+        k-confirmation for state flips (clear evidence switches with
+        the default of 1 immediately)."""
+        if self.data is None and any(b.uncertain for b in result.bins):
+            # Cold start (fresh setup or entry reload) on an ambiguous
+            # frame: publishing its raw threshold verdict would let a
+            # sensor flip across the reload boundary on evidence that
+            # never confidently established anything. Stay unavailable
+            # like the quality gates do; the first confident frame is
+            # accepted immediately.
+            raise UpdateFailed(
+                "first analysis is ambiguous for at least one bin; "
+                "waiting for a confident frame"
+            )
+        previous = {b.id: b for b in self.data.bins} if self.data else {}
+        bins = []
+        for result_bin in result.bins:
+            prev_bin = previous.get(result_bin.id)
+            if result_bin.uncertain:
+                # Ambiguous frame: never flip on it, hold the previous
+                # state, and break this bin's confident-flip chain
+                # (confirm_scans counts consecutive confident analyses).
+                self._pending_flips.pop(result_bin.id, None)
+                if prev_bin is not None:
+                    result_bin = replace(result_bin, present=prev_bin.present)
+                bins.append(result_bin)
+                continue
+            if prev_bin is None or result_bin.present == prev_bin.present:
+                self._pending_flips.pop(result_bin.id, None)
+                self.last_confident_update[result_bin.id] = now
+                bins.append(result_bin)
+                continue
+            # Confident evidence contradicting the accepted state.
+            count = self._pending_flips.get(result_bin.id, 0) + 1
+            if count >= self._confirm_scans:
+                self._pending_flips.pop(result_bin.id, None)
+                self.last_confident_update[result_bin.id] = now
+                bins.append(result_bin)
+            else:
+                self._pending_flips[result_bin.id] = count
+                bins.append(
+                    replace(result_bin, present=prev_bin.present, uncertain=True)
+                )
+        return replace(result, bins=bins)
 
     @staticmethod
     def _detect_bytes(data: bytes, profile: Profile) -> DetectionResult:
@@ -155,7 +220,9 @@ class LearningCollector:
         failures, so every caller has a single error contract.
         """
         image = await async_get_image(self._hass, self._camera)
-        filename = dt_util.now().strftime("%Y%m%d_%H%M%S") + ".jpg"
+        # Microsecond precision: two captures within the same second
+        # must not silently overwrite each other (and their labels).
+        filename = dt_util.now().strftime("%Y%m%d_%H%M%S_%f") + ".jpg"
         try:
             await self._hass.async_add_executor_job(
                 self._write, filename, image.content

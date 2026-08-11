@@ -214,6 +214,47 @@ def test_image_modes_are_normalized(tmp_path):
         assert img.mode == "RGB"
 
 
+def test_overexposure_gate(profile):
+    # Calibration scenes contain essentially no clipped pixels, so the
+    # learned ceiling is near zero and a frame with a large blown-out
+    # region must trip the gate.
+    result = detect(scene_all(), profile)
+    assert result.overexposure_suspect is False
+
+    blown = make_scene(
+        size=(320, 200),
+        rects=[
+            ((1.0, 1.0, 1.0), 0.25, 0.25, 0.50, 0.25),
+            (BLUE, *RECT_BLUE),
+            (BROWN, *RECT_BROWN),
+        ],
+        seed=6,
+    )
+    result = detect(blown, profile)
+    assert result.overexposure_suspect is True
+    assert result.clip_frac > profile.overexposure_clip_max
+
+
+def test_shrunken_lid_is_uncertain_not_flipped(profile):
+    # A lid at 36 percent of its calibrated area lands inside the
+    # learned ambiguity interval: below the smallest observed positive,
+    # above the largest observed negative (0).
+    x, y, w, h = RECT_YELLOW
+    small_yellow = make_scene(
+        size=(320, 200),
+        rects=[
+            (YELLOW, x, y, w * 0.6, h * 0.6),
+            (BLUE, *RECT_BLUE),
+            (BROWN, *RECT_BROWN),
+        ],
+        seed=7,
+    )
+    result = detect(small_yellow, profile)
+    by_id = {b.id: b for b in result.bins}
+    assert by_id["gelb"].uncertain is True
+    assert by_id["blau"].uncertain is False
+
+
 def test_missing_archive_image_is_skipped_with_warning(tmp_path):
     # A store may outlive individual snapshot files; relearn must skip
     # them loudly instead of failing forever.

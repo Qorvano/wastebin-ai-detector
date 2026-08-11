@@ -76,6 +76,11 @@ class Profile:
     bins: list[BinModel]
     daylight_stats: dict[str, Any] = field(default_factory=dict)
     schema_version: int = SCHEMA_VERSION
+    # Learned evidence-quality gates. The permissive defaults (1.0)
+    # keep profiles from older versions valid; the gates then simply
+    # never fire until the next relearn fills in real learned maxima.
+    overexposure_clip_max: float = 1.0
+    daylight_val_max: float = 1.0
 
 
 def validate_profile(profile: Profile) -> None:
@@ -94,6 +99,12 @@ def validate_profile(profile: Profile) -> None:
         raise ProfileError(f"working_width must be positive, got {profile.working_width}")
     if not 0.0 <= profile.daylight_sat_min <= 1.0:
         raise ProfileError(f"daylight_sat_min outside [0, 1]: {profile.daylight_sat_min}")
+    for name, value in (
+        ("overexposure_clip_max", profile.overexposure_clip_max),
+        ("daylight_val_max", profile.daylight_val_max),
+    ):
+        if not 0.0 <= value <= 1.0:
+            raise ProfileError(f"{name} outside [0, 1]: {value}")
     if not profile.bins:
         raise ProfileError("profile contains no bins")
     seen: set[str] = set()
@@ -115,6 +126,20 @@ def validate_profile(profile: Profile) -> None:
                 raise ProfileError(f"bin {b.id}: {name} outside [0, 1]: {value}")
         if not 0.0 < b.min_area_frac <= 1.0:
             raise ProfileError(f"bin {b.id}: min_area_frac outside (0, 1]: {b.min_area_frac}")
+        # These two stats feed the ambiguity interval in detection, so
+        # hand-edited profiles must not smuggle in broken values.
+        for key in ("min_pos_area_frac", "max_neg_area_frac"):
+            value = b.learning_stats.get(key)
+            if value is None:
+                continue
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ProfileError(
+                    f"bin {b.id}: learning_stats.{key} is not numeric: {value!r}"
+                )
+            if not 0.0 <= float(value) <= 1.0:
+                raise ProfileError(
+                    f"bin {b.id}: learning_stats.{key} outside [0, 1]: {value}"
+                )
 
 
 def profile_to_dict(profile: Profile) -> dict[str, Any]:
@@ -126,6 +151,8 @@ def profile_to_dict(profile: Profile) -> dict[str, Any]:
         "working_width": data["working_width"],
         "resample": data["resample"],
         "daylight_sat_min": data["daylight_sat_min"],
+        "overexposure_clip_max": data["overexposure_clip_max"],
+        "daylight_val_max": data["daylight_val_max"],
         "daylight_stats": data["daylight_stats"],
         "bins": data["bins"],
     }
@@ -141,6 +168,8 @@ def profile_from_dict(data: dict[str, Any]) -> Profile:
             ),
             resample=str(data["resample"]),
             daylight_sat_min=float(data["daylight_sat_min"]),
+            overexposure_clip_max=float(data.get("overexposure_clip_max", 1.0)),
+            daylight_val_max=float(data.get("daylight_val_max", 1.0)),
             daylight_stats=dict(data.get("daylight_stats", {})),
             bins=[
                 BinModel(

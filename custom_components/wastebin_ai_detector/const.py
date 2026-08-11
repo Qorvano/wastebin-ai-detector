@@ -15,6 +15,7 @@ CONF_BIN_ID = "id"
 CONF_BIN_NAME = "name"
 CONF_SCAN_INTERVAL = "scan_interval_minutes"
 CONF_CAPTURE_INTERVAL = "capture_interval_minutes"
+CONF_CONFIRM_SCANS = "confirm_scans"
 
 # Config DEFAULTS. These are user-changeable schema defaults (a
 # legitimate value source), not hidden in-code thresholds:
@@ -26,6 +27,14 @@ CONF_CAPTURE_INTERVAL = "capture_interval_minutes"
 DEFAULT_WORKING_WIDTH = 640
 DEFAULT_SCAN_INTERVAL_MIN = 15
 DEFAULT_CAPTURE_INTERVAL_MIN = 30
+# 1 = clear evidence switches immediately (uncertain frames never
+# switch, they hold). Raise to demand that many consecutive confident
+# analyses before a state flip is accepted.
+DEFAULT_CONFIRM_SCANS = 1
+# UI upper bound: at the default 15-minute cadence, 20 confirmations
+# already mean a five-hour worst-case flip latency; anything beyond
+# would mask same-day events entirely instead of stabilizing them.
+MAX_CONFIRM_SCANS = 20
 
 SERVICE_RELEARN = "relearn"
 SERVICE_CAPTURE = "capture_snapshot"

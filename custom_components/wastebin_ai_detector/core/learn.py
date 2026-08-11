@@ -35,7 +35,13 @@ from typing import Any
 import numpy as np
 
 from .ccl import largest_component_area
-from .color import circular_dist_deg, circular_mean_deg, rgb_to_hsv
+from .color import (
+    HUE_DEG_PER_SEXTANT,
+    RGB_8BIT_LEVELS,
+    circular_dist_deg,
+    circular_mean_deg,
+    rgb_to_hsv,
+)
 from .detect import bin_mask
 from .errors import CalibrationError, ImageLoadError
 from .imageio import extract_working_roi, load_image_rgb, rect_to_pixels
@@ -46,13 +52,6 @@ HUE_TOL_PERCENTILE = 95.0
 SV_MIN_PERCENTILE = 5.0
 PROVISIONAL_AREA_SAFETY = 0.5
 DEGENERATE_HUE_BAND_DEG = 180.0
-
-# Structural constants of the input encoding, not tuning values:
-# hue is defined as 60° per RGB sextant, and source images are 8-bit.
-# Together they give the hue quantization of a pixel with chroma c:
-# one 8-bit step in a channel shifts hue by 60° / (255 · c).
-HUE_DEG_PER_SEXTANT = 60.0
-RGB_8BIT_LEVELS = 255.0
 
 
 @dataclass
@@ -176,7 +175,10 @@ def learn_area_threshold(
             "n_pos": len(pos_areas),
             "n_neg": len(neg_areas),
             "min_pos_area_frac": min_pos,
-            "max_neg_area_frac": max_neg,
+            # None (not 0.0) without any negative image: 0.0 would be an
+            # unobserved claim, and the ambiguity interval downstream
+            # would then treat everything below min_pos as uncertain.
+            "max_neg_area_frac": max_neg if neg_areas else None,
             "provisional": provisional,
             "separable": separable,
         },
@@ -290,18 +292,34 @@ def learn_profile(
         model.min_area_frac = result.min_area_frac
         model.learning_stats.update(result.stats)
 
-    # 3) Daylight saturation floor (all calibration images are daylight
-    # by contract - documented calibration rule).
-    median_sats = [
-        float(np.median(hsv_by_image[e.path][1])) for e in usable_images
-    ]
+    # 3) Daylight quality gates (all calibration images are daylight by
+    # contract - documented calibration rule). Alongside the saturation
+    # floor, learn the overexposure ceiling: the clip fraction counts
+    # ROI pixels within one 8-bit quantum of full brightness (a pixel
+    # at 254 or 255 is clipped or about to; derived from
+    # RGB_8BIT_LEVELS, not chosen). The maxima over the calibration set
+    # define "worse than anything ever calibrated", the same extremum
+    # logic as daylight_sat_min in the opposite direction.
+    clip_floor = 1.0 - 1.0 / RGB_8BIT_LEVELS
+    median_sats: list[float] = []
+    clip_fracs: list[float] = []
+    median_vals: list[float] = []
+    for e in usable_images:
+        _hue, sat, val = hsv_by_image[e.path]
+        median_sats.append(float(np.median(sat)))
+        clip_fracs.append(float(np.mean(val >= clip_floor)))
+        median_vals.append(float(np.median(val)))
     if not median_sats:
         raise CalibrationError("store contains no usable calibration images")
     daylight_sat_min = min(median_sats)
+    overexposure_clip_max = max(clip_fracs)
+    daylight_val_max = max(median_vals)
     daylight_stats = {
         "n_images": len(median_sats),
         "min_median_sat": daylight_sat_min,
         "median_of_medians": float(np.median(np.asarray(median_sats))),
+        "max_clip_frac": overexposure_clip_max,
+        "max_median_val": daylight_val_max,
     }
 
     # 4) Ambiguity diagnosis: overlapping learned hue bands.
@@ -321,6 +339,8 @@ def learn_profile(
         working_width=store.working_width,
         resample=store.resample,
         daylight_sat_min=daylight_sat_min,
+        overexposure_clip_max=overexposure_clip_max,
+        daylight_val_max=daylight_val_max,
         daylight_stats=daylight_stats,
         bins=bins,
     )

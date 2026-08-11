@@ -51,7 +51,11 @@
         "title": "Intervalle",
         "data": {
           "scan_interval_minutes": "Erkennungsintervall",
-          "capture_interval_minutes": "Lern-Aufnahmeintervall"
+          "capture_interval_minutes": "Lern-Aufnahmeintervall",
+          "confirm_scans": "Bestätigungs-Scans für Zustandswechsel"
+        },
+        "data_description": {
+          "confirm_scans": "1 = eine eindeutige Erkennung schaltet sofort. Höhere Werte verlangen so viele aufeinanderfolgende eindeutige Erkennungen, bevor ein Sensor den Zustand wechselt."
         }
       }
     }

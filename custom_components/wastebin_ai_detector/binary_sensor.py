@@ -84,9 +84,19 @@ class WastebinPresenceSensor(
             "area_frac": result.area_frac,
             "min_area_frac": result.min_area_frac,
             "margin": result.margin,
+            "uncertain": result.uncertain,
             "median_sat": self.coordinator.data.median_sat,
-            "grayscale_suspect": self.coordinator.data.grayscale_suspect,
         }
+        # The suspect flags of the PUBLISHED result are False by
+        # construction (gated frames are never published); the hold
+        # timestamps are the meaningful diagnostics.
+        for name, stamp in (
+            ("last_confident_update", self.coordinator.last_confident_update.get(self._bin_id)),
+            ("last_greyscale_hold", self.coordinator.last_greyscale_skip),
+            ("last_overexposure_hold", self.coordinator.last_overexposure_skip),
+        ):
+            if stamp is not None:
+                attributes[name] = stamp.isoformat()
         profile = self.coordinator.storage.profile
         if profile is not None:
             for model in profile.bins:

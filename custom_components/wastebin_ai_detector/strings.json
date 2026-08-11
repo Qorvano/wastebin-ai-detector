@@ -51,7 +51,11 @@
         "title": "Cadence",
         "data": {
           "scan_interval_minutes": "Detection interval",
-          "capture_interval_minutes": "Learning capture interval"
+          "capture_interval_minutes": "Learning capture interval",
+          "confirm_scans": "Confirmation scans for state changes"
+        },
+        "data_description": {
+          "confirm_scans": "1 = a clear detection switches immediately. Higher values require that many consecutive clear detections before a sensor changes state."
         }
       }
     }
