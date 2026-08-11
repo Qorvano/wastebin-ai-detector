@@ -182,6 +182,41 @@ async def test_calibration_services_full_cycle(hass: HomeAssistant) -> None:
         assert state.attributes["margin"] > 1.0
 
 
+async def test_forget_image_removes_calibration_data(
+    hass: HomeAssistant,
+) -> None:
+    entry = MockConfigEntry(domain=DOMAIN, data=ENTRY_DATA, title="Test")
+    entry.add_to_hass(hass)
+    image = SimpleNamespace(content=_scene_jpeg(with_yellow=True))
+    with patch(
+        "custom_components.wastebin_ai_detector.coordinator.async_get_image",
+        return_value=image,
+    ):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        response = await hass.services.async_call(
+            DOMAIN, "capture_snapshot", {}, blocking=True, return_response=True
+        )
+        filename = response["filename"]
+        await hass.services.async_call(
+            DOMAIN,
+            "add_sample",
+            {
+                "filename": filename,
+                "bin": "gelbe_tonne",
+                "rect": [0.35, 0.35, 0.10, 0.10],
+                "space": "image",
+            },
+            blocking=True,
+        )
+        await hass.services.async_call(
+            DOMAIN, "forget_image", {"filename": filename}, blocking=True
+        )
+        assert (
+            entry.runtime_data.storage.calibration.get_image(filename) is None
+        )
+
+
 async def test_relearn_without_data_fails_cleanly(hass: HomeAssistant) -> None:
     from homeassistant.exceptions import ServiceValidationError
 

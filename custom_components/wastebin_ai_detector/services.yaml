@@ -73,3 +73,16 @@ relearn:
       selector:
         config_entry:
           integration: wastebin_ai_detector
+
+forget_image:
+  fields:
+    entry_id:
+      required: false
+      selector:
+        config_entry:
+          integration: wastebin_ai_detector
+    filename:
+      required: true
+      example: "20260811_131029.jpg"
+      selector:
+        text:

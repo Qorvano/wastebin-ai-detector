@@ -140,6 +140,20 @@
           "description": "Which detector instance (only needed with several)."
         }
       }
+    },
+    "forget_image": {
+      "name": "Forget snapshot",
+      "description": "Removes a snapshot's samples and labels from the calibration data (the archived file is kept). Use this to recover from samples drawn on the wrong spot.",
+      "fields": {
+        "entry_id": {
+          "name": "Entry",
+          "description": "Which detector instance (only needed with several)."
+        },
+        "filename": {
+          "name": "Filename",
+          "description": "Archived snapshot filename to forget."
+        }
+      }
     }
   }
 }

@@ -76,6 +76,20 @@ class CalibrationStore:
         entry = self.ensure_image(path)
         entry.samples.setdefault(bin_id, []).append(rect)
 
+    def forget_image(self, path: str) -> bool:
+        """Remove an image entry (all its samples and labels).
+
+        The archived file itself stays on disk; only its calibration
+        contribution is dropped. The recovery path for samples drawn on
+        the wrong spot or on an overexposed lid. Returns True if an
+        entry existed.
+        """
+        entry = self.get_image(path)
+        if entry is None:
+            return False
+        self.images.remove(entry)
+        return True
+
     def set_labels(
         self,
         path: str,

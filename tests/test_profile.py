@@ -109,6 +109,15 @@ def test_store_conflicting_labels_rejected():
         store.set_labels("x.png", present=["gelb"], absent=["gelb"])
 
 
+def test_store_forget_image():
+    store = _valid_store()
+    store.add_sample("img1.png", "gelb", Rect(0.1, 0.1, 0.2, 0.2))
+    store.set_labels("img1.png", present=["gelb"])
+    assert store.forget_image("img1.png") is True
+    assert store.get_image("img1.png") is None
+    assert store.forget_image("img1.png") is False
+
+
 def test_store_relabel_moves_bin():
     store = _valid_store()
     store.set_labels("x.png", present=["gelb"])

@@ -140,6 +140,20 @@
           "description": "Welche Detektor-Instanz (nur bei mehreren nötig)."
         }
       }
+    },
+    "forget_image": {
+      "name": "Bild vergessen",
+      "description": "Entfernt Samples und Labels eines Bildes aus den Kalibrierdaten (die archivierte Datei bleibt erhalten). Damit lassen sich falsch gesetzte Samples korrigieren.",
+      "fields": {
+        "entry_id": {
+          "name": "Instanz",
+          "description": "Welche Detektor-Instanz (nur bei mehreren nötig)."
+        },
+        "filename": {
+          "name": "Dateiname",
+          "description": "Dateiname des zu vergessenden Bildes."
+        }
+      }
     }
   }
 }

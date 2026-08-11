@@ -31,6 +31,7 @@ SERVICE_RELEARN = "relearn"
 SERVICE_CAPTURE = "capture_snapshot"
 SERVICE_ADD_SAMPLE = "add_sample"
 SERVICE_LABEL_IMAGE = "label_image"
+SERVICE_FORGET_IMAGE = "forget_image"
 
 ATTR_ENTRY_ID = "entry_id"
 ATTR_FILENAME = "filename"

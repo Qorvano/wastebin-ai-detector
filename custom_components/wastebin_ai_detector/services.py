@@ -33,6 +33,7 @@ from .const import (
     DOMAIN,
     SERVICE_ADD_SAMPLE,
     SERVICE_CAPTURE,
+    SERVICE_FORGET_IMAGE,
     SERVICE_LABEL_IMAGE,
     SERVICE_RELEARN,
 )
@@ -75,6 +76,13 @@ LABEL_SCHEMA = vol.Schema(
 )
 
 RELEARN_SCHEMA = vol.Schema(_ENTRY_SCHEMA)
+
+FORGET_SCHEMA = vol.Schema(
+    {
+        **_ENTRY_SCHEMA,
+        vol.Required(ATTR_FILENAME): cv.string,
+    }
+)
 
 
 def _get_entry(hass: HomeAssistant, call: ServiceCall) -> ConfigEntry:
@@ -200,6 +208,16 @@ def async_setup_services(hass: HomeAssistant) -> None:
         entry = _get_entry(hass, call)
         return await _async_relearn(hass, entry)
 
+    async def handle_forget(call: ServiceCall) -> None:
+        entry = _get_entry(hass, call)
+        storage = entry.runtime_data.storage
+        filename = _validated_filename(call.data[ATTR_FILENAME])
+        if not storage.calibration.forget_image(filename):
+            raise ServiceValidationError(
+                f"no calibration entry for {filename!r}"
+            )
+        await storage.async_save()
+
     hass.services.async_register(
         DOMAIN,
         SERVICE_CAPTURE,
@@ -223,4 +241,7 @@ def async_setup_services(hass: HomeAssistant) -> None:
         handle_relearn,
         schema=RELEARN_SCHEMA,
         supports_response=SupportsResponse.OPTIONAL,
+    )
+    hass.services.async_register(
+        DOMAIN, SERVICE_FORGET_IMAGE, handle_forget, schema=FORGET_SCHEMA
     )
