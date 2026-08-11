@@ -1,0 +1,145 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Kamera auswählen",
+        "description": "Wählen Sie die Kamera, die den Stellplatz Ihrer Mülltonnen sieht.",
+        "data": {
+          "camera_entity": "Kamera"
+        }
+      },
+      "area": {
+        "title": "Erkennungsbereich",
+        "description": "Der Bildbereich, in dem Tonnen stehen können, als relative Koordinaten (0 bis 1). Wählen Sie den Bereich großzügig: x/y ist die linke obere Ecke, w/h die Größe. Die Analysebreite steuert die interne Auflösung.",
+        "data": {
+          "roi_x": "x (linke Kante)",
+          "roi_y": "y (obere Kante)",
+          "roi_w": "w (Breite)",
+          "roi_h": "h (Höhe)",
+          "working_width": "Analysebreite"
+        }
+      },
+      "bin": {
+        "title": "Tonne hinzufügen",
+        "description": "Bereits angelegt: {bins}",
+        "data": {
+          "name": "Name der Tonne (z. B. Gelbe Tonne)",
+          "add_another": "Weitere Tonne hinzufügen"
+        }
+      }
+    },
+    "error": {
+      "invalid_roi": "Der Bereich muss innerhalb des Bildes liegen (x+w und y+h höchstens 1, Größen über 0).",
+      "invalid_name": "Bitte geben Sie einen Namen ein.",
+      "duplicate_bin": "Eine Tonne mit diesem Namen existiert bereits."
+    },
+    "abort": {
+      "already_configured": "Für diese Kamera und diesen Bereich ist bereits ein Detektor eingerichtet."
+    }
+  },
+  "selector": {
+    "space": {
+      "options": {
+        "image": "Gesamtbild",
+        "roi": "Erkennungsbereich"
+      }
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Intervalle",
+        "data": {
+          "scan_interval_minutes": "Erkennungsintervall",
+          "capture_interval_minutes": "Lern-Aufnahmeintervall"
+        }
+      }
+    }
+  },
+  "entity": {
+    "switch": {
+      "learning": {
+        "name": "Lernmodus"
+      }
+    },
+    "button": {
+      "detect_now": {
+        "name": "Jetzt erkennen"
+      }
+    }
+  },
+  "services": {
+    "capture_snapshot": {
+      "name": "Kalibrierbild aufnehmen",
+      "description": "Speichert ein Kamerabild im Kalibrier-Archiv und gibt den Dateinamen zurück.",
+      "fields": {
+        "entry_id": {
+          "name": "Instanz",
+          "description": "Welche Detektor-Instanz (nur bei mehreren nötig)."
+        }
+      }
+    },
+    "add_sample": {
+      "name": "Deckel-Sample hinzufügen",
+      "description": "Markiert ein Rechteck auf einem Tonnendeckel in einem archivierten Bild.",
+      "fields": {
+        "entry_id": {
+          "name": "Instanz",
+          "description": "Welche Detektor-Instanz (nur bei mehreren nötig)."
+        },
+        "filename": {
+          "name": "Dateiname",
+          "description": "Dateiname des archivierten Bildes."
+        },
+        "bin": {
+          "name": "Tonne",
+          "description": "Tonnen-Id (Slug des Tonnennamens)."
+        },
+        "rect": {
+          "name": "Rechteck",
+          "description": "[x, y, w, h] als relative Koordinaten."
+        },
+        "space": {
+          "name": "Koordinatenraum",
+          "description": "Ob sich das Rechteck auf das ganze Bild oder den Erkennungsbereich bezieht."
+        }
+      }
+    },
+    "label_image": {
+      "name": "Bild labeln",
+      "description": "Markiert, welche Tonnen in einem archivierten Bild stehen oder fehlen; lernt anschließend automatisch neu.",
+      "fields": {
+        "entry_id": {
+          "name": "Instanz",
+          "description": "Welche Detektor-Instanz (nur bei mehreren nötig)."
+        },
+        "filename": {
+          "name": "Dateiname",
+          "description": "Dateiname des archivierten Bildes."
+        },
+        "present": {
+          "name": "Vorhanden",
+          "description": "Liste der Tonnen-Ids, die im Bild stehen."
+        },
+        "absent": {
+          "name": "Fehlt",
+          "description": "Liste der Tonnen-Ids, die nicht im Bild stehen."
+        },
+        "auto_relearn": {
+          "name": "Automatisch neu lernen",
+          "description": "Profil direkt nach dem Labeln neu berechnen."
+        }
+      }
+    },
+    "relearn": {
+      "name": "Neu lernen",
+      "description": "Berechnet alle Schwellwerte aus den Kalibrierdaten neu.",
+      "fields": {
+        "entry_id": {
+          "name": "Instanz",
+          "description": "Welche Detektor-Instanz (nur bei mehreren nötig)."
+        }
+      }
+    }
+  }
+}

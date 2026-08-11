@@ -37,7 +37,7 @@ import numpy as np
 from .ccl import largest_component_area
 from .color import circular_dist_deg, circular_mean_deg, rgb_to_hsv
 from .detect import bin_mask
-from .errors import CalibrationError
+from .errors import CalibrationError, ImageLoadError
 from .imageio import extract_working_roi, load_image_rgb, rect_to_pixels
 from .profile import BinModel, Profile
 from .store import CalibrationStore, resolve_image_path, validate_store
@@ -197,12 +197,21 @@ def learn_profile(
     validate_store(store)
     warnings: list[str] = []
 
-    # One pass through the single shared pipeline per image.
+    # One pass through the single shared pipeline per image. Images
+    # whose file vanished from the archive are skipped with a loud
+    # warning instead of poisoning every future relearn: the store may
+    # legitimately outlive individual snapshot files.
     hsv_by_image: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+    usable_images: list = []
     for entry in store.images:
-        img = load_image_rgb(resolve_image_path(store_path, entry.path))
+        try:
+            img = load_image_rgb(resolve_image_path(store_path, entry.path))
+        except ImageLoadError as exc:
+            warnings.append(f"skipping calibration image: {exc}")
+            continue
         arr = extract_working_roi(img, store.roi, store.working_width, store.resample)
         hsv_by_image[entry.path] = rgb_to_hsv(arr)
+        usable_images.append(entry)
 
     # 1) Color models from pooled sample rectangles.
     bins: list[BinModel] = []
@@ -211,7 +220,7 @@ def learn_profile(
         sat_parts: list[np.ndarray] = []
         val_parts: list[np.ndarray] = []
         n_sample_images = 0
-        for entry in store.images:
+        for entry in usable_images:
             rects = entry.samples.get(decl.id, [])
             if not rects:
                 continue
@@ -265,7 +274,7 @@ def learn_profile(
     for model in bins:
         pos_areas: list[float] = []
         neg_areas: list[float] = []
-        for entry in store.images:
+        for entry in usable_images:
             if model.id in entry.present:
                 target = pos_areas
             elif model.id in entry.absent:
@@ -284,10 +293,10 @@ def learn_profile(
     # 3) Daylight saturation floor (all calibration images are daylight
     # by contract - documented calibration rule).
     median_sats = [
-        float(np.median(hsv_by_image[e.path][1])) for e in store.images
+        float(np.median(hsv_by_image[e.path][1])) for e in usable_images
     ]
     if not median_sats:
-        raise CalibrationError("store contains no calibration images")
+        raise CalibrationError("store contains no usable calibration images")
     daylight_sat_min = min(median_sats)
     daylight_stats = {
         "n_images": len(median_sats),

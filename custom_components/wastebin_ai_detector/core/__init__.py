@@ -15,7 +15,12 @@ from .errors import (
     RoiError,
     WastebinError,
 )
-from .imageio import extract_working_roi, load_image_rgb, roi_to_pixels
+from .imageio import (
+    extract_working_roi,
+    load_image_rgb,
+    load_image_rgb_bytes,
+    roi_to_pixels,
+)
 from .learn import learn_area_threshold, learn_color_model, learn_profile
 from .profile import (
     SCHEMA_VERSION,
@@ -68,6 +73,7 @@ __all__ = [
     "learn_color_model",
     "learn_profile",
     "load_image_rgb",
+    "load_image_rgb_bytes",
     "load_profile",
     "load_store",
     "profile_from_dict",

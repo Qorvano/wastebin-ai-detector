@@ -87,6 +87,11 @@ python tools/calibrate.py detect --profile profile.json --image snap2.jpg --json
 - **Later:** learned achromatic mode for grey/black lids
   (saturation/value bands instead of a hue band, same percentile
   scheme).
+- **Experiment:** data-derived augmentation for cold starts
+  (brightness/gamma jitter spanning the range observed in the
+  installation's own snapshot archive, never hand-picked factors), to
+  widen the learned floors before days of real variance have been
+  collected.
 
 ---
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 
-from conftest import inner_rect
+from scenes import inner_rect
 from test_pipeline_e2e import (
     BINS,
     RECT_BLUE,

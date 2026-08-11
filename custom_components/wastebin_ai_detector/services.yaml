@@ -1,0 +1,75 @@
+capture_snapshot:
+  fields:
+    entry_id:
+      required: false
+      selector:
+        config_entry:
+          integration: wastebin_ai_detector
+
+add_sample:
+  fields:
+    entry_id:
+      required: false
+      selector:
+        config_entry:
+          integration: wastebin_ai_detector
+    filename:
+      required: true
+      example: "20260811_131029.jpg"
+      selector:
+        text:
+    bin:
+      required: true
+      example: "gelbe_tonne"
+      selector:
+        text:
+    rect:
+      required: true
+      example: "[0.52, 0.61, 0.06, 0.05]"
+      selector:
+        object:
+    space:
+      required: false
+      default: image
+      selector:
+        select:
+          translation_key: space
+          options:
+            - image
+            - roi
+
+label_image:
+  fields:
+    entry_id:
+      required: false
+      selector:
+        config_entry:
+          integration: wastebin_ai_detector
+    filename:
+      required: true
+      example: "20260811_131029.jpg"
+      selector:
+        text:
+    present:
+      required: false
+      example: "[gelbe_tonne, blaue_tonne]"
+      selector:
+        object:
+    absent:
+      required: false
+      example: "[braune_tonne]"
+      selector:
+        object:
+    auto_relearn:
+      required: false
+      default: true
+      selector:
+        boolean:
+
+relearn:
+  fields:
+    entry_id:
+      required: false
+      selector:
+        config_entry:
+          integration: wastebin_ai_detector

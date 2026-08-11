@@ -39,6 +39,23 @@ def load_image_rgb(path: str | Path) -> Image.Image:
     return img.convert("RGB")
 
 
+def load_image_rgb_bytes(data: bytes) -> Image.Image:
+    """Same normalization as :func:`load_image_rgb`, for in-memory bytes.
+
+    Camera APIs deliver raw bytes; truncated or empty payloads must
+    surface as :class:`ImageLoadError` exactly like broken files do.
+    """
+    import io
+
+    try:
+        img = Image.open(io.BytesIO(data))
+        img.load()
+    except (UnidentifiedImageError, OSError, ValueError, SyntaxError) as exc:
+        raise ImageLoadError(f"cannot decode image bytes: {exc}") from exc
+    img = ImageOps.exif_transpose(img)
+    return img.convert("RGB")
+
+
 def roi_to_pixels(roi: Roi, width: int, height: int) -> tuple[int, int, int, int]:
     """Map a relative ROI to half-open pixel bounds ``(x0, y0, x1, y1)``.
 

@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 from PIL import Image, ImageOps
 
-from conftest import BLUE, BROWN, YELLOW, inner_rect, make_scene
+from scenes import BLUE, BROWN, YELLOW, inner_rect, make_scene
 from wastebin_ai_detector.core import (
     BinDecl,
     CalibrationStore,
@@ -212,6 +212,20 @@ def test_image_modes_are_normalized(tmp_path):
         scene.convert(mode).save(path)
         img = load_image_rgb(path)
         assert img.mode == "RGB"
+
+
+def test_missing_archive_image_is_skipped_with_warning(tmp_path):
+    # A store may outlive individual snapshot files; relearn must skip
+    # them loudly instead of failing forever.
+    store, store_path = _build_store(tmp_path)
+    extra = tmp_path / "gone.png"
+    scene_all(seed=9).save(extra)
+    store.set_labels(extra.name, present=["blau", "braun"], absent=["gelb"])
+    extra.unlink()
+    prof, warnings = learn_profile(store, store_path)
+    assert any("skipping calibration image" in w for w in warnings)
+    result = detect(scene_all(), prof)
+    assert _presence(result) == {"gelb": True, "blau": True, "braun": True}
 
 
 def test_truncated_file_raises(tmp_path):

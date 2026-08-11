@@ -1,3 +1,8 @@
 [tool.pytest.ini_options]
+# Core suite only: pure numpy/Pillow, no Home Assistant. The pytest
+# plugin of pytest-homeassistant-custom-component injects async autouse
+# fixtures into every test, so it is disabled here; the HA-layer suite
+# lives in tests_ha/ and runs with its own configuration:
+#     pytest -c tests_ha/pytest.ini tests_ha
 testpaths = ["tests"]
-addopts = "-q"
+addopts = "-q -p no:homeassistant"

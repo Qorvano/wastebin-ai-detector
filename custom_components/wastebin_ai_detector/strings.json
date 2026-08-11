@@ -1,0 +1,145 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Select camera",
+        "description": "Pick the camera that sees the spot where your waste bins stand.",
+        "data": {
+          "camera_entity": "Camera"
+        }
+      },
+      "area": {
+        "title": "Region of interest",
+        "description": "The image region where bins can stand, as relative coordinates (0 to 1). Start generous: x/y is the top-left corner, w/h the size. The analysis width controls the internal resolution.",
+        "data": {
+          "roi_x": "x (left edge)",
+          "roi_y": "y (top edge)",
+          "roi_w": "w (width)",
+          "roi_h": "h (height)",
+          "working_width": "Analysis width"
+        }
+      },
+      "bin": {
+        "title": "Add a bin",
+        "description": "Already added: {bins}",
+        "data": {
+          "name": "Bin name (e.g. Yellow bin)",
+          "add_another": "Add another bin"
+        }
+      }
+    },
+    "error": {
+      "invalid_roi": "The region must lie inside the image (x+w and y+h at most 1, sizes above 0).",
+      "invalid_name": "Please enter a name.",
+      "duplicate_bin": "A bin with this name already exists."
+    },
+    "abort": {
+      "already_configured": "A detector for this camera and region is already configured."
+    }
+  },
+  "selector": {
+    "space": {
+      "options": {
+        "image": "Full image",
+        "roi": "Region of interest"
+      }
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Cadence",
+        "data": {
+          "scan_interval_minutes": "Detection interval",
+          "capture_interval_minutes": "Learning capture interval"
+        }
+      }
+    }
+  },
+  "entity": {
+    "switch": {
+      "learning": {
+        "name": "Learning mode"
+      }
+    },
+    "button": {
+      "detect_now": {
+        "name": "Detect now"
+      }
+    }
+  },
+  "services": {
+    "capture_snapshot": {
+      "name": "Capture calibration snapshot",
+      "description": "Saves a camera frame into the calibration archive and returns its filename.",
+      "fields": {
+        "entry_id": {
+          "name": "Entry",
+          "description": "Which detector instance (only needed with several)."
+        }
+      }
+    },
+    "add_sample": {
+      "name": "Add lid sample",
+      "description": "Marks a rectangle on a bin lid in an archived snapshot.",
+      "fields": {
+        "entry_id": {
+          "name": "Entry",
+          "description": "Which detector instance (only needed with several)."
+        },
+        "filename": {
+          "name": "Filename",
+          "description": "Archived snapshot filename."
+        },
+        "bin": {
+          "name": "Bin",
+          "description": "Bin id (slug of the bin name)."
+        },
+        "rect": {
+          "name": "Rectangle",
+          "description": "[x, y, w, h] as relative coordinates."
+        },
+        "space": {
+          "name": "Coordinate space",
+          "description": "Whether the rectangle is relative to the full image or to the region of interest."
+        }
+      }
+    },
+    "label_image": {
+      "name": "Label snapshot",
+      "description": "Marks which bins are present or absent in an archived snapshot; relearns automatically.",
+      "fields": {
+        "entry_id": {
+          "name": "Entry",
+          "description": "Which detector instance (only needed with several)."
+        },
+        "filename": {
+          "name": "Filename",
+          "description": "Archived snapshot filename."
+        },
+        "present": {
+          "name": "Present",
+          "description": "List of bin ids visible in the image."
+        },
+        "absent": {
+          "name": "Absent",
+          "description": "List of bin ids not in the image."
+        },
+        "auto_relearn": {
+          "name": "Relearn automatically",
+          "description": "Recompute the profile right after labeling."
+        }
+      }
+    },
+    "relearn": {
+      "name": "Relearn",
+      "description": "Recomputes all thresholds from the calibration data.",
+      "fields": {
+        "entry_id": {
+          "name": "Entry",
+          "description": "Which detector instance (only needed with several)."
+        }
+      }
+    }
+  }
+}

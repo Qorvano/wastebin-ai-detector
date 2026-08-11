@@ -20,10 +20,18 @@ import json
 import sys
 from pathlib import Path
 
-# The core lives inside the integration package so HACS ships it;
-# for offline use we import it straight from the repository checkout.
+# The core lives inside the integration package so HACS ships it. For
+# offline use, register a synthetic parent package that only carries
+# the search path: `wastebin_ai_detector.core` then resolves without
+# executing the integration __init__.py, which imports homeassistant.
+import types
+
 _REPO_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(_REPO_ROOT / "custom_components"))
+_pkg = types.ModuleType("wastebin_ai_detector")
+_pkg.__path__ = [
+    str(_REPO_ROOT / "custom_components" / "wastebin_ai_detector")
+]
+sys.modules.setdefault("wastebin_ai_detector", _pkg)
 
 from wastebin_ai_detector.core import (  # noqa: E402
     BinDecl,
