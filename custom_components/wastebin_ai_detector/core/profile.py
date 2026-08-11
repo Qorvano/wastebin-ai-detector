@@ -1,6 +1,6 @@
 """Profile data model: the learned, per-installation detection parameters.
 
-A profile is a *derived artifact* — it is always recomputed in full from
+A profile is a *derived artifact* - it is always recomputed in full from
 the calibration store by :func:`..learn.learn_profile` and carries every
 learned threshold plus diagnostic learning statistics. It contains no
 hand-tuned numbers: everything in here is user setup data (ROI, bin
@@ -26,7 +26,7 @@ KNOWN_RESAMPLE = ("bilinear", "nearest")
 
 # Shared floating-point slack for validating relative coordinates
 # (e.g. x + w == 1.0 arriving as 1.0000000000000002 after division).
-# Used identically by every bounds check in the pipeline — one policy,
+# Used identically by every bounds check in the pipeline - one policy,
 # not per-module copies.
 REL_EPS = 1e-9
 
@@ -83,7 +83,7 @@ def validate_profile(profile: Profile) -> None:
     if profile.schema_version != SCHEMA_VERSION:
         raise ProfileError(
             f"unsupported profile schema_version {profile.schema_version} "
-            f"(supported: {SCHEMA_VERSION}) — re-run 'learn' on this "
+            f"(supported: {SCHEMA_VERSION}) - re-run 'learn' on this "
             "installation or migrate the profile"
         )
     if profile.resample not in KNOWN_RESAMPLE:
@@ -105,7 +105,7 @@ def validate_profile(profile: Profile) -> None:
         seen.add(b.id)
         if not 0.0 <= b.hue_center_deg < 360.0:
             raise ProfileError(f"bin {b.id}: hue_center_deg outside [0, 360): {b.hue_center_deg}")
-        # 2·tol ≥ 180° would accept at least half the color circle —
+        # 2·tol ≥ 180° would accept at least half the color circle -
         # geometrically no discriminative power left (same bound the
         # learner enforces; re-checked here against hand-edited files).
         if not 0.0 < b.hue_tol_deg or 2.0 * b.hue_tol_deg >= 180.0:

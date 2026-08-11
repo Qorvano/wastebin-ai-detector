@@ -2,7 +2,7 @@
 
 Scenes are grey noisy backgrounds with colored rectangles ("lids").
 All numbers in here are test-fixture data (the scene being drawn), not
-detector tuning — the detector learns its thresholds from these scenes
+detector tuning - the detector learns its thresholds from these scenes
 through the real calibration code path.
 """
 
@@ -22,7 +22,7 @@ sys.path.insert(0, str(_REPO_ROOT / "tools"))
 YELLOW = (0.95, 0.80, 0.10)
 BLUE = (0.15, 0.35, 0.85)
 BROWN = (0.55, 0.30, 0.12)
-RED = (0.90, 0.10, 0.12)  # hue ≈ 358.5° — exercises the 0°/360° wraparound
+RED = (0.90, 0.10, 0.12)  # hue ≈ 358.5° - exercises the 0°/360° wraparound
 
 
 def make_scene(

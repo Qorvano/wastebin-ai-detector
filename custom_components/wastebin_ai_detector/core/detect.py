@@ -36,7 +36,7 @@ class BinResult:
     present: bool
     area_frac: float
     min_area_frac: float
-    margin: float  # area_frac / min_area_frac — confidence on a ratio scale
+    margin: float  # area_frac / min_area_frac - confidence on a ratio scale
 
     def to_dict(self) -> dict[str, Any]:
         # Values are serialized unrounded: any display rounding could

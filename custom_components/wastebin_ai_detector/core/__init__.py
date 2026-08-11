@@ -1,4 +1,4 @@
-"""Wastebin AI Detector — self-contained detection core.
+"""Wastebin AI Detector - self-contained detection core.
 
 Pure numpy + Pillow, no Home Assistant imports: everything in this
 package can be exercised offline (calibration CLI, tests) and is reused

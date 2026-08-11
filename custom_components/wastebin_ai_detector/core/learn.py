@@ -1,12 +1,12 @@
 """Learning: turn the calibration store into a detection profile.
 
-``learn_profile`` always recomputes everything from the store — first
+``learn_profile`` always recomputes everything from the store - first
 the color models from the pooled lid samples, then (on top of those)
 the per-bin area thresholds from the labeled images, then the daylight
 saturation floor. The profile is a derived artifact; there is no
 incremental patching, so stale thresholds cannot survive a sample edit.
 
-Named constants in this module (rule: no magic numbers — every value is
+Named constants in this module (rule: no magic numbers - every value is
 either learned, an FP epsilon, or named and justified here):
 
 - ``HUE_TOL_PERCENTILE = 95`` / ``SV_MIN_PERCENTILE = 5``: two-sided
@@ -21,7 +21,7 @@ either learned, an FP epsilon, or named and justified here):
   ``provisional`` and the value is replaced on the first ``learn`` run
   that sees a negative sample.
 - ``DEGENERATE_HUE_BAND_DEG = 180``: an acceptance band of
-  ``2·tol ≥ 180°`` covers at least half the color circle — geometrically
+  ``2·tol ≥ 180°`` covers at least half the color circle - geometrically
   no discriminative power left, so learning fails loudly instead.
 """
 
@@ -89,9 +89,9 @@ def learn_color_model(
     if 2.0 * tol >= DEGENERATE_HUE_BAND_DEG:
         raise CalibrationError(
             f"bin {bin_id}: learned hue band ±{tol:.1f}° covers at least half "
-            f"the color circle (resultant R={resultant:.3f}) — the samples "
+            f"the color circle (resultant R={resultant:.3f}) - the samples "
             "have no consistent color. Re-draw them on a colored lid area; "
-            "grey/black lids cannot be color-calibrated — attach a small "
+            "grey/black lids cannot be color-calibrated - attach a small "
             "colored marker to the lid and sample that instead"
         )
     sat_min = float(np.percentile(sat, SV_MIN_PERCENTILE))
@@ -101,7 +101,7 @@ def learn_color_model(
     # the sample is too small for the percentile to differ from min.
     if SV_MIN_PERCENTILE / 100.0 * (n_px - 1) < 1.0:
         warnings.append(
-            f"bin {bin_id}: only {n_px} sample pixels — the "
+            f"bin {bin_id}: only {n_px} sample pixels - the "
             f"{SV_MIN_PERCENTILE:g}th percentile equals the sample minimum; "
             "draw larger sample rectangles"
         )
@@ -132,19 +132,19 @@ def learn_area_threshold(
     """Learn the presence threshold from labeled blob-area fractions.
 
     Separable case: geometric mean of (smallest positive, largest
-    negative) — the midpoint on the ratio scale areas live on.
+    negative) - the midpoint on the ratio scale areas live on.
     """
     warnings: list[str] = []
     if not pos_areas:
         raise CalibrationError(
-            f"bin {bin_id}: no image is labeled 'present' — at least one "
+            f"bin {bin_id}: no image is labeled 'present' - at least one "
             "positive example is required"
         )
     min_pos = min(pos_areas)
     if min_pos <= 0.0:
         raise CalibrationError(
             f"bin {bin_id}: a 'present'-labeled image yields a zero-area "
-            "color blob — the color model misses the lid there entirely; "
+            "color blob - the color model misses the lid there entirely; "
             "check the labels and sample rectangles"
         )
     max_neg = max(neg_areas) if neg_areas else 0.0
@@ -155,7 +155,7 @@ def learn_area_threshold(
         provisional = not neg_areas
         if not neg_areas:
             warnings.append(
-                f"bin {bin_id}: no 'absent'-labeled image yet — provisional "
+                f"bin {bin_id}: no 'absent'-labeled image yet - provisional "
                 f"threshold {threshold:.4f} (= {PROVISIONAL_AREA_SAFETY:g} × "
                 f"smallest positive {min_pos:.4f}); label an image without "
                 "this bin to replace it"
@@ -165,7 +165,7 @@ def learn_area_threshold(
     else:
         threshold = math.sqrt(min_pos * max_neg)
         warnings.append(
-            f"bin {bin_id}: NOT separable — largest negative blob "
+            f"bin {bin_id}: NOT separable - largest negative blob "
             f"{max_neg:.4f} ≥ smallest positive {min_pos:.4f}; threshold "
             f"{threshold:.4f} lies inside the overlap and WILL misclassify "
             "some calibration images; improve samples or labels"
@@ -243,7 +243,7 @@ def learn_profile(
         # image's pixel values.
         if n_sample_images < 2:
             warnings.append(
-                f"bin {decl.id}: all lid samples come from a single image — "
+                f"bin {decl.id}: all lid samples come from a single image - "
                 "learned color floors have no cross-condition slack; add "
                 "sample rectangles from more snapshots (different light/"
                 "weather) and re-run learn"
@@ -282,7 +282,7 @@ def learn_profile(
         model.learning_stats.update(result.stats)
 
     # 3) Daylight saturation floor (all calibration images are daylight
-    # by contract — documented calibration rule).
+    # by contract - documented calibration rule).
     median_sats = [
         float(np.median(hsv_by_image[e.path][1])) for e in store.images
     ]
@@ -302,7 +302,7 @@ def learn_profile(
                 warnings.append(
                     f"bins {a.id} and {b.id}: learned hue bands overlap "
                     f"({a.hue_center_deg:.0f}°±{a.hue_tol_deg:.0f}° vs "
-                    f"{b.hue_center_deg:.0f}°±{b.hue_tol_deg:.0f}°) — one bin "
+                    f"{b.hue_center_deg:.0f}°±{b.hue_tol_deg:.0f}°) - one bin "
                     "can produce blobs in both masks; results for these two "
                     "bins are not independent"
                 )

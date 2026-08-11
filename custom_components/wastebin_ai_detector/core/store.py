@@ -3,7 +3,7 @@
 Holds the user-declared setup (ROI, bin list, working width, resample)
 plus, per calibration image, the drawn lid-sample rectangles and the
 presence labels. Profiles are always recomputed from this store in
-full, never patched incrementally — changing a sample later can never
+full, never patched incrementally - changing a sample later can never
 leave stale thresholds behind.
 
 Image paths are stored relative to the store file, so the calibration
@@ -25,7 +25,7 @@ STORE_SCHEMA_VERSION = 1
 
 @dataclass(frozen=True)
 class BinDecl:
-    """User-declared bin: identity only — everything else is learned."""
+    """User-declared bin: identity only - everything else is learned."""
 
     id: str
     name: str
@@ -129,7 +129,7 @@ class CalibrationStore:
             and y + h <= 1.0 + REL_EPS
         ):
             raise CalibrationError(
-                f"sample rect {rect} lies outside the ROI {roi} — "
+                f"sample rect {rect} lies outside the ROI {roi} - "
                 "samples must be drawn inside the region of interest"
             )
         # Clamp the FP drift away so stored rects are exactly in [0, 1].
@@ -173,7 +173,7 @@ def validate_store(store: CalibrationStore) -> None:
             raise ProfileError(f"duplicate image entry {entry.path!r}")
         paths.add(entry.path)
         # Dangling bin references (hand-edited/foreign store files) must
-        # fail loudly here — learn silently skips unmatched ids, which
+        # fail loudly here - learn silently skips unmatched ids, which
         # would quietly weaken the learned profile.
         unknown = sorted(
             (set(entry.samples) | set(entry.present) | set(entry.absent)) - seen

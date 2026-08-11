@@ -43,7 +43,7 @@ def test_two_blobs_returns_larger():
 
 
 def test_u_shape_late_merge():
-    # Arms only join in the last row — forces transitive union-find.
+    # Arms only join in the last row - forces transitive union-find.
     mask = _mask(
         [
             "#...#",

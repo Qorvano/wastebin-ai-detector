@@ -30,7 +30,7 @@ class TestAreaThreshold:
         assert any("provisional" in w for w in result.warnings)
 
     def test_zero_negatives_not_provisional(self):
-        # Negatives exist and show zero color response — best possible case.
+        # Negatives exist and show zero color response - best possible case.
         result = learn_area_threshold([0.04], [0.0, 0.0], bin_id="t")
         assert result.min_area_frac == pytest.approx(0.02)
         assert result.stats["provisional"] is False

@@ -14,7 +14,7 @@ from .errors import CalibrationError
 
 # Guard against division by zero in the HSV formulas. Purely a
 # floating-point epsilon: far below one 8-bit quantum (1/255 ≈ 3.9e-3),
-# so it can never reclassify a real color — it only protects 0/0.
+# so it can never reclassify a real color - it only protects 0/0.
 _EPS = 1e-12
 
 
@@ -55,7 +55,7 @@ def circular_mean_deg(hues_deg: np.ndarray) -> tuple[float, float]:
     valid = hues[~np.isnan(hues)]
     if valid.size == 0:
         raise CalibrationError(
-            "no valid hue pixels in sample (all grey/unsaturated) — the "
+            "no valid hue pixels in sample (all grey/unsaturated) - the "
             "sample rectangle must cover a colored surface. Grey/black "
             "lids cannot be color-calibrated; attach a small colored "
             "marker to the lid and sample that instead"

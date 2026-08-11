@@ -68,7 +68,7 @@ def extract_working_roi(
     """Crop the ROI and resize to the working width.
 
     Returns a float32 ``(height, width, 3)`` array in [0, 1]. With
-    ``working_width=None`` the native crop size is kept (identity — the
+    ``working_width=None`` the native crop size is kept (identity - the
     absence of a resize step, not a chosen number).
     """
     if resample not in _RESAMPLE_FILTERS:
@@ -93,7 +93,7 @@ def rect_to_pixels(rect_x: float, rect_y: float, rect_w: float, rect_h: float,
     """Map a ROI-relative rectangle onto working-array pixel bounds.
 
     Same deterministic rounding rules as :func:`roi_to_pixels`, applied
-    to the working array — sample pixels are cut from exactly the grid
+    to the working array - sample pixels are cut from exactly the grid
     the detector will later see.
     """
     if rect_x < -_REL_EPS or rect_w <= 0.0 or rect_x + rect_w > 1.0 + _REL_EPS:

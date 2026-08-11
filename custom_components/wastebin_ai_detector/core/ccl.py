@@ -1,6 +1,6 @@
 """Connected-component labelling on boolean masks.
 
-Runs-based two-pass algorithm with union-find over row runs — pure
+Runs-based two-pass algorithm with union-find over row runs - pure
 numpy + Python, no scipy. 8-connectivity is a modelling choice, not a
 tuning value: JPEG edge artifacts regularly thin a lid blob down to
 diagonal contact, and a lid is still one physical surface then.

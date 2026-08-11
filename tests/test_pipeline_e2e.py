@@ -56,7 +56,7 @@ def scene_no_yellow(size=(320, 200), seed=1):
 
 
 def scene_shuffled(size=(320, 200), seed=2):
-    """Same bins, positions swapped within the ROI — layout must not matter."""
+    """Same bins, positions swapped within the ROI - layout must not matter."""
     return make_scene(
         size=size,
         rects=[
@@ -72,7 +72,7 @@ def _build_store(tmp_path: Path, fmt: str = "PNG", qualities: tuple = ()):
     """Build a calibration store from the two base scenes.
 
     Documented calibration practice: lid samples from SEVERAL snapshots
-    spanning the conditions seen in operation — for JPEG cameras that
+    spanning the conditions seen in operation - for JPEG cameras that
     includes encoder quality, so pass e.g. ``qualities=(85, 60)`` to
     calibrate across encodes. Yellow exists only in the "all" scene;
     blue and brown are sampled from every calibration image.

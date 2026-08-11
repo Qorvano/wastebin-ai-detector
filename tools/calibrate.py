@@ -137,7 +137,7 @@ def cmd_detect(args: argparse.Namespace) -> int:
         if result.grayscale_suspect:
             print(
                 f"NOTE: image looks greyscale/IR (median sat "
-                f"{result.median_sat:.3f}) — result unreliable"
+                f"{result.median_sat:.3f}) - result unreliable"
             )
     return 0
 

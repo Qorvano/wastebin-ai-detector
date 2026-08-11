@@ -1,9 +1,9 @@
-"""Wastebin AI Detector — camera-based waste-bin presence detection.
+"""Wastebin AI Detector - camera-based waste-bin presence detection.
 
 Phase 1 ships the self-contained detection core (``core/``) plus the
 offline calibration CLI (``tools/calibrate.py`` in the repository). The
-Home Assistant wiring — config flow, update coordinator and one
-``binary_sensor`` per bin — lands in phase 2; this setup is
+Home Assistant wiring - config flow, update coordinator and one
+``binary_sensor`` per bin - lands in phase 2; this setup is
 intentionally a no-op so early installs are safe.
 """
 
