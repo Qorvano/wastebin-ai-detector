@@ -112,3 +112,116 @@ class TestColorModel:
     def test_empty_sample_raises(self):
         with pytest.raises(CalibrationError):
             learn_color_model(np.array([]), np.array([]), np.array([]), bin_id="t")
+
+
+class TestJunkRobustness:
+    """Field regressions from the 2026-08-11 midday calibration failures."""
+
+    @staticmethod
+    def _mixed_sample(n_coherent, n_junk, seed):
+        rng = np.random.default_rng(seed)
+        hue = np.concatenate(
+            [
+                rng.normal(50.0, 3.0, n_coherent) % 360.0,
+                rng.uniform(0.0, 360.0, n_junk),
+            ]
+        )
+        # Junk pixels: overexposed (low saturation, high value).
+        sat = np.concatenate(
+            [rng.uniform(0.5, 0.7, n_coherent), rng.uniform(0.02, 0.15, n_junk)]
+        )
+        val = np.concatenate(
+            [rng.uniform(0.5, 0.8, n_coherent), rng.uniform(0.85, 1.0, n_junk)]
+        )
+        return hue, sat, val
+
+    def test_majority_junk_still_fails(self):
+        # Attempt 1 in the field: ~25% coherent yellow, R was 0.232.
+        hue, sat, val = self._mixed_sample(500, 1500, seed=11)
+        with pytest.raises(CalibrationError):
+            learn_color_model(hue, sat, val, bin_id="gelb")
+
+    def test_recoverable_junk_now_succeeds(self):
+        # Attempt 2 in the field: ~60% coherent yellow, R was 0.605 and
+        # the old percentile learner failed; the mixture must recover.
+        hue, sat, val = self._mixed_sample(1200, 800, seed=12)
+        result = learn_color_model(hue, sat, val, bin_id="gelb")
+        assert result.hue_center_deg == pytest.approx(50.0, abs=3.0)
+        assert result.hue_tol_deg < 30.0
+        assert 0.25 < result.stats["junk_fraction"] < 0.5
+        # Floors decontaminated: junk saturation (max 0.15) must not
+        # drag sat_min below the coherent population.
+        assert result.sat_min > 0.4
+        assert any("junk" in w for w in result.warnings)
+
+    def test_two_colors_dominant_mode_wins(self):
+        # 70/30 split of two tight colors: dominant is learned, the
+        # minority is reported as junk share.
+        rng = np.random.default_rng(13)
+        hue = np.concatenate(
+            [
+                rng.normal(50.0, 3.0, 700) % 360.0,
+                rng.normal(200.0, 3.0, 300) % 360.0,
+            ]
+        )
+        sat = np.full(1000, 0.7)
+        val = np.full(1000, 0.6)
+        result = learn_color_model(hue, sat, val, bin_id="t")
+        assert result.hue_center_deg == pytest.approx(50.0, abs=3.0)
+        assert result.hue_tol_deg < 30.0
+        assert 0.2 < result.stats["junk_fraction"] < 0.4
+
+    def test_pure_uniform_junk_fails(self):
+        rng = np.random.default_rng(14)
+        hue = rng.uniform(0.0, 360.0, 2000)
+        sat = rng.uniform(0.3, 0.8, 2000)
+        val = rng.uniform(0.3, 0.8, 2000)
+        with pytest.raises(CalibrationError):
+            learn_color_model(hue, sat, val, bin_id="t")
+
+
+class TestQualityGates:
+    def test_empty_returns_none(self):
+        from wastebin_ai_detector.core import derive_quality_gates
+
+        assert derive_quality_gates([]) is None
+
+    def test_single_sample_has_zero_slack(self):
+        from wastebin_ai_detector.core import derive_quality_gates
+
+        gates = derive_quality_gates([[0.3, 0.6, 0.02]])
+        assert gates == {
+            "daylight_sat_min": 0.3,
+            "daylight_val_max": 0.6,
+            "overexposure_clip_max": 0.02,
+        }
+
+    def test_slack_extends_extrema(self):
+        from wastebin_ai_detector.core import derive_quality_gates
+
+        samples = [
+            [0.30, 0.60, 0.020],
+            [0.32, 0.62, 0.025],
+            [0.28, 0.64, 0.030],
+        ]
+        gates = derive_quality_gates(samples)
+        # sat diffs: 0.02, 0.04 -> slack 0.03; min 0.28 - 0.03 = 0.25
+        assert gates["daylight_sat_min"] == pytest.approx(0.25)
+        # val diffs: 0.02, 0.02 -> slack 0.02; max 0.64 + 0.02 = 0.66
+        assert gates["daylight_val_max"] == pytest.approx(0.66)
+        # clip diffs: 0.005, 0.005 -> slack 0.005; max 0.03 + 0.005
+        assert gates["overexposure_clip_max"] == pytest.approx(0.035)
+
+    def test_bounds_clamped(self):
+        from wastebin_ai_detector.core import derive_quality_gates
+
+        gates = derive_quality_gates([[0.001, 0.999, 0.999], [0.05, 0.5, 0.5]])
+        assert gates["daylight_sat_min"] >= 0.0
+        assert gates["daylight_val_max"] <= 1.0
+        assert gates["overexposure_clip_max"] <= 1.0
+
+    def test_bad_shape_rejected(self):
+        from wastebin_ai_detector.core import derive_quality_gates
+
+        with pytest.raises(CalibrationError):
+            derive_quality_gates([[0.1, 0.2]])

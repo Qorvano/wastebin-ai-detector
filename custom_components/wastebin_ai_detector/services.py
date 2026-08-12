@@ -47,7 +47,7 @@ from .core import (
     store_from_dict,
     store_to_dict,
 )
-from .storage import store_anchor
+from .storage import store_anchor, widen_profile_gates
 
 _ENTRY_SCHEMA = {vol.Optional(ATTR_ENTRY_ID): cv.string}
 
@@ -141,6 +141,10 @@ async def _async_relearn(hass: HomeAssistant, entry: ConfigEntry) -> dict[str, A
         )
     except WastebinError as err:
         raise ServiceValidationError(f"relearn failed: {err}") from err
+    # The labeled set defines the gates' floor; the unlabeled archive
+    # statistics may only widen them (they know the full daily light
+    # range, labels usually do not).
+    widen_profile_gates(profile, storage.gate_samples)
     storage.profile = profile
     await storage.async_save()
     await runtime.coordinator.async_request_refresh()

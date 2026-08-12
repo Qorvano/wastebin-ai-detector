@@ -72,3 +72,71 @@ def test_circular_dist():
     assert circular_dist_deg(np.array([10.0]), 350.0)[0] == pytest.approx(20.0)
     assert circular_dist_deg(np.array([0.0]), 180.0)[0] == pytest.approx(180.0)
     assert np.isnan(circular_dist_deg(np.array([np.nan]), 10.0)[0])
+
+
+def test_weighted_circular_mean():
+    from wastebin_ai_detector.core import circular_mean_deg as cm
+
+    hues = np.array([10.0, 200.0])
+    mean, _ = cm(hues, weights=np.array([1.0, 0.0]))
+    assert mean == pytest.approx(10.0)
+
+
+def test_kappa_from_resultant_monotone():
+    from wastebin_ai_detector.core import vonmises_kappa_from_resultant as k
+
+    assert k(0.0) == 0.0
+    assert 0.0 < k(0.2) < k(0.5) < k(0.9)
+    assert k(1.0) == float("inf")
+
+
+def test_mixture_single_pixel_is_trivially_coherent():
+    from wastebin_ai_detector.core import fit_vonmises_uniform_mixture
+
+    fit = fit_vonmises_uniform_mixture(
+        np.array([120.0]),
+        init_center_deg=0.0,
+        init_weight=0.5,
+        init_kappa=1.0,
+        kappa_max=100.0,
+    )
+    assert fit.center_deg == pytest.approx(120.0)
+    assert fit.weight == 1.0
+    assert fit.posterior[0] == 1.0
+
+
+def test_mixture_iterations_bounded_by_n():
+    from wastebin_ai_detector.core import fit_vonmises_uniform_mixture
+
+    rng = np.random.default_rng(31)
+    hues = rng.uniform(0.0, 360.0, 300)
+    # Adversarial start (grossly data-inconsistent weight) must still
+    # terminate within n iterations.
+    fit = fit_vonmises_uniform_mixture(
+        hues,
+        init_center_deg=10.0,
+        init_weight=0.99,
+        init_kappa=5.0,
+        kappa_max=1e4,
+    )
+    assert fit.n_iter <= 300
+
+
+def test_mixture_separates_coherent_from_uniform():
+    from wastebin_ai_detector.core import fit_vonmises_uniform_mixture
+
+    rng = np.random.default_rng(21)
+    coherent = rng.normal(120.0, 5.0, 800) % 360.0
+    junk = rng.uniform(0.0, 360.0, 200)
+    hues = np.concatenate([coherent, junk])
+    fit = fit_vonmises_uniform_mixture(
+        hues,
+        init_center_deg=120.0,
+        init_weight=0.5,
+        init_kappa=10.0,
+        kappa_max=1e6,
+    )
+    assert fit.center_deg == pytest.approx(120.0, abs=2.0)
+    assert 0.7 < fit.weight < 0.95
+    # The known-coherent pixels overwhelmingly classify as coherent.
+    assert (fit.posterior[:800] >= 0.5).mean() > 0.95

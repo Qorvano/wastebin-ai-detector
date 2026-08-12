@@ -13,6 +13,7 @@ calibration data as soon as the user labels them.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import replace
 from datetime import datetime, timedelta
@@ -47,7 +48,7 @@ from .core import (
     detect,
     load_image_rgb_bytes,
 )
-from .storage import WastebinStorage, archive_dir
+from .storage import WastebinStorage, archive_dir, widen_profile_gates
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -78,6 +79,11 @@ class WastebinCoordinator(DataUpdateCoordinator[DetectionResult]):
             entry.options.get(CONF_CONFIRM_SCANS, DEFAULT_CONFIRM_SCANS)
         )
         self._pending_flips: dict[str, int] = {}
+        # Single-flight guard: a timed-out executor thread keeps
+        # running (asyncio cannot abort it, and its future reads as
+        # done once the awaiting task was cancelled), so the worker
+        # itself clears this flag in a finally block.
+        self._executor_busy: bool = False
         # Why the last analysis ended the way it did, with the measured
         # values against the learned limits. Exposed by the always
         # available status sensor: outcomes must never be invisible.
@@ -106,6 +112,32 @@ class WastebinCoordinator(DataUpdateCoordinator[DetectionResult]):
         self.diagnostics = diag
 
     async def _async_update_data(self) -> DetectionResult:
+        # Watchdog: one analysis must finish within one scheduled cycle
+        # (a coordinator wedged for hours happened in the field). The
+        # bound derives from the configured cadence. It covers the
+        # awaitable phases (executor detection, persistence); the
+        # camera fetch carries its own timeout, and a hang that blocks
+        # the event loop itself is beyond any asyncio watchdog. A timed
+        # out executor thread keeps running, so a single-flight guard
+        # below bounds the leak to one thread.
+        if self._executor_busy:
+            self._set_diagnostics("previous_run_still_busy")
+            raise UpdateFailed(
+                "previous analysis is still running in the executor; "
+                "skipping this cycle"
+            )
+        timeout_s = self._scan_seconds()
+        try:
+            async with asyncio.timeout(timeout_s):
+                return await self._async_analyze()
+        except TimeoutError as err:
+            self._set_diagnostics("watchdog_timeout", timeout_seconds=timeout_s)
+            raise UpdateFailed(
+                f"analysis exceeded one scan cycle ({timeout_s:.0f} s) and "
+                "was aborted by the watchdog"
+            ) from err
+
+    async def _async_analyze(self) -> DetectionResult:
         profile = self.storage.profile
         if profile is None:
             self._set_diagnostics("not_calibrated")
@@ -119,8 +151,9 @@ class WastebinCoordinator(DataUpdateCoordinator[DetectionResult]):
             self._set_diagnostics("camera_error", error=str(err))
             raise UpdateFailed(f"camera snapshot failed: {err}") from err
         try:
+            self._executor_busy = True
             result = await self.hass.async_add_executor_job(
-                self._detect_bytes, image.content, profile
+                self._detect_bytes_guarded, image.content, profile
             )
         except WastebinError as err:
             self._set_diagnostics("detect_error", error=str(err))
@@ -145,6 +178,9 @@ class WastebinCoordinator(DataUpdateCoordinator[DetectionResult]):
             # A gated frame breaks the chain of consecutive confident
             # analyses the confirm_scans option promises.
             self._pending_flips.clear()
+            # Diagnostics first, so the shown limits are the ones this
+            # frame was actually judged against (absorption right after
+            # may widen them for the NEXT frame).
             self._set_diagnostics(
                 outcome,
                 result,
@@ -154,6 +190,13 @@ class WastebinCoordinator(DataUpdateCoordinator[DetectionResult]):
                     "data to widen the learned quality gates"
                 ),
             )
+            if not result.grayscale_suspect and is_up(self.hass):
+                # Self-heal applies only in the harsh-light direction.
+                # Greyscale-suspect frames are exactly the low-sat
+                # cluster the night gate exists to reject: absorbing
+                # one would widen daylight_sat_min down to IR levels
+                # and permanently disable night protection.
+                await self._async_absorb_gate_sample(result)
             if self.data is not None:
                 return self.data
             raise UpdateFailed(
@@ -164,6 +207,11 @@ class WastebinCoordinator(DataUpdateCoordinator[DetectionResult]):
         self.last_daylight_update = now
         stabilized = self._apply_stability(result, now)
         self._set_diagnostics("ok", stabilized)
+        if is_up(self.hass):
+            # Clean daylight frames teach the light gates too, so the
+            # learned daily range keeps tracking the season, labels not
+            # required.
+            await self._async_absorb_gate_sample(result)
         return stabilized
 
     def _apply_stability(self, result: DetectionResult, now: datetime) -> DetectionResult:
@@ -216,6 +264,43 @@ class WastebinCoordinator(DataUpdateCoordinator[DetectionResult]):
                     replace(result_bin, present=prev_bin.present, uncertain=True)
                 )
         return replace(result, bins=bins)
+
+    async def _async_absorb_gate_sample(self, result: DetectionResult) -> None:
+        self.storage.gate_samples.append(
+            [result.median_sat, result.median_val, result.clip_frac]
+        )
+        # Rolling window of one full daily light cycle at the current
+        # cadence: older extremes are already baked into the profile by
+        # the monotone widening below, so keeping raw samples beyond
+        # one day adds nothing and would grow the store without bound.
+        # Aging out is also the escape hatch for anomalies: a relearn
+        # rebuilds the gates from labels and re-widens only from this
+        # window.
+        window = max(int(86400.0 / max(self._scan_seconds(), 1.0)), 1)
+        if len(self.storage.gate_samples) > window:
+            del self.storage.gate_samples[:-window]
+        profile = self.storage.profile
+        if profile is None:
+            return
+        # Persist only when the limits actually moved; unsaved window
+        # entries regenerate from live frames after a restart.
+        if widen_profile_gates(profile, self.storage.gate_samples):
+            await self.storage.async_save()
+
+    def _scan_seconds(self) -> float:
+        if self.update_interval is not None:
+            return self.update_interval.total_seconds()
+        return DEFAULT_SCAN_INTERVAL_MIN * 60.0
+
+    def _detect_bytes_guarded(
+        self, data: bytes, profile: Profile
+    ) -> DetectionResult:
+        try:
+            return self._detect_bytes(data, profile)
+        finally:
+            # Runs in the executor thread: clears the single-flight
+            # flag even when the awaiting task timed out long ago.
+            self._executor_busy = False
 
     @staticmethod
     def _detect_bytes(data: bytes, profile: Profile) -> DetectionResult:

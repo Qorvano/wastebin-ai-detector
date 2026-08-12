@@ -10,14 +10,14 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from homeassistant.components.sensor import SensorEntity
+from homeassistant.components.sensor import SensorDeviceClass, SensorEntity
 from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import DOMAIN
+from .const import DOMAIN, STATUS_OUTCOMES
 from .coordinator import WastebinCoordinator
 
 if TYPE_CHECKING:
@@ -41,6 +41,8 @@ class WastebinStatusSensor(
     _attr_translation_key = "status"
     _attr_entity_category = EntityCategory.DIAGNOSTIC
     _attr_icon = "mdi:list-status"
+    _attr_device_class = SensorDeviceClass.ENUM
+    _attr_options = list(STATUS_OUTCOMES)
 
     def __init__(
         self, coordinator: WastebinCoordinator, entry: WastebinConfigEntry
@@ -62,7 +64,10 @@ class WastebinStatusSensor(
 
     @property
     def native_value(self) -> str:
-        return str(self.coordinator.diagnostics.get("outcome", "unknown"))
+        outcome = str(self.coordinator.diagnostics.get("outcome", "no_run_yet"))
+        # Enum sensors reject values outside their options; an unknown
+        # outcome (future code drift) degrades to the neutral state.
+        return outcome if outcome in STATUS_OUTCOMES else "no_run_yet"
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:

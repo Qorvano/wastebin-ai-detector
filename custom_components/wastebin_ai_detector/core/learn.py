@@ -23,6 +23,11 @@ either learned, an FP epsilon, or named and justified here):
 - ``DEGENERATE_HUE_BAND_DEG = 180``: an acceptance band of
   ``2·tol ≥ 180°`` covers at least half the color circle - geometrically
   no discriminative power left, so learning fails loudly instead.
+- ``COHERENT_POSTERIOR_MIN = 0.5``: the Bayes/MAP decision boundary
+  between the mixture components, not an adjustable cutoff.
+- ``COHERENT_MAJORITY_MIN = 0.5``: the theoretical breakdown point of
+  robust estimation; less than a coherent majority means the sample
+  cannot claim to show the lid color.
 """
 
 from __future__ import annotations
@@ -40,7 +45,9 @@ from .color import (
     RGB_8BIT_LEVELS,
     circular_dist_deg,
     circular_mean_deg,
+    fit_vonmises_uniform_mixture,
     rgb_to_hsv,
+    vonmises_kappa_from_resultant,
 )
 from .detect import bin_mask
 from .errors import CalibrationError, ImageLoadError
@@ -52,6 +59,16 @@ HUE_TOL_PERCENTILE = 95.0
 SV_MIN_PERCENTILE = 5.0
 PROVISIONAL_AREA_SAFETY = 0.5
 DEGENERATE_HUE_BAND_DEG = 180.0
+
+# Mixture-learning constants, both derived rather than tuned:
+# - 0.5 posterior is the Bayes/MAP decision boundary between the two
+#   mixture components, not an adjustable cutoff.
+# - 0.5 coherent share is the theoretical breakdown point of robust
+#   estimation: past it, signal and contamination are indistinguishable
+#   in principle, and it is the weakest form of the user's claim "this
+#   rectangle shows the lid color".
+COHERENT_POSTERIOR_MIN = 0.5
+COHERENT_MAJORITY_MIN = 0.5
 
 
 @dataclass
@@ -67,24 +84,82 @@ class ColorLearnResult:
 def learn_color_model(
     hue: np.ndarray, sat: np.ndarray, val: np.ndarray, *, bin_id: str = "?"
 ) -> ColorLearnResult:
-    """Learn one bin's color model from pooled sample pixels (1-D arrays)."""
+    """Learn one bin's color model from pooled sample pixels (1-D arrays).
+
+    Robust against junk pixels (overexposed highlights, edge artifacts):
+    a von Mises + uniform mixture separates the coherent color
+    population from scatter, and band and floors are learned from the
+    coherent pixels only. Field measurements showed that plain
+    percentiles break as soon as more than the percentile share of the
+    sample is junk.
+    """
     warnings: list[str] = []
     n_px = int(sat.size)
     if n_px == 0:
         raise CalibrationError(f"bin {bin_id}: no sample pixels")
-    center, resultant = circular_mean_deg(hue)  # raises if all hues NaN
-    valid_hue = hue[~np.isnan(hue)]
-    dist = circular_dist_deg(valid_hue, center)
+    _center0, resultant = circular_mean_deg(hue)  # raises if all hues NaN
+    valid_mask = ~np.isnan(hue)
+    valid_hue = np.asarray(hue, dtype=np.float64)[valid_mask]
+    sat_valid = np.asarray(sat, dtype=np.float64)[valid_mask]
+    val_valid = np.asarray(val, dtype=np.float64)[valid_mask]
+    n_valid = int(valid_hue.size)
+    # chroma = sat · val, since sat = c/maxc and val = maxc.
+    chroma_valid = sat_valid * val_valid
+
+    # Deterministic initialization from the hue histogram. The bin
+    # width is the hue quantization of an 8-bit pixel at the median
+    # chroma of the sample (60°/(255·c)), a structural resolution, not
+    # a chosen granularity.
+    median_chroma = float(np.median(chroma_valid))
+    bin_width = HUE_DEG_PER_SEXTANT / (RGB_8BIT_LEVELS * median_chroma)
+    n_bins = max(int(np.ceil(360.0 / bin_width)), 1)
+    hist, edges = np.histogram(valid_hue, bins=n_bins, range=(0.0, 360.0))
+    peak = int(np.argmax(hist))
+    mu0 = float((edges[peak] + edges[peak + 1]) / 2.0)
+    # Moment start for the mixture weight: under the model, the share
+    # of pixels within 90° (the geometric half-circle boundary) of the
+    # center is w + (1-w)/2, hence w0 = 2·(share − 1/2).
+    within = circular_dist_deg(valid_hue, mu0) < 90.0
+    w0 = 2.0 * (float(within.mean()) - 0.5)
+    if bool(within.any()):
+        _, r_within = circular_mean_deg(valid_hue[within])
+        kappa0 = vonmises_kappa_from_resultant(r_within)
+    else:
+        kappa0 = 0.0
+    # Kappa cap: below the finest representable hue step, concentration
+    # is not measurable (same quantization logic as the tol floor).
+    max_chroma = float(np.max(chroma_valid))
+    finest_quantum_deg = HUE_DEG_PER_SEXTANT / (RGB_8BIT_LEVELS * max_chroma)
+    sigma_min_rad = float(np.deg2rad(finest_quantum_deg / 2.0))
+    kappa_max = 1.0 / (sigma_min_rad * sigma_min_rad)
+
+    fit = fit_vonmises_uniform_mixture(
+        valid_hue,
+        init_center_deg=mu0,
+        init_weight=w0,
+        init_kappa=kappa0,
+        kappa_max=kappa_max,
+    )
+    coherent = fit.posterior >= COHERENT_POSTERIOR_MIN
+    n_coherent = int(coherent.sum())
+    junk_fraction = 1.0 - (n_coherent / n_valid) if n_valid else 1.0
+    if n_coherent <= n_valid * COHERENT_MAJORITY_MIN:
+        raise CalibrationError(
+            f"bin {bin_id}: only {n_coherent} of {n_valid} coherent sample "
+            f"pixels (junk fraction {junk_fraction:.0%}) - the samples have "
+            "no consistent majority color. Re-draw them on a colored lid "
+            "area; grey/black lids cannot be color-calibrated - attach a "
+            "small colored marker to the lid and sample that instead"
+        )
+
+    center = fit.center_deg
+    dist = circular_dist_deg(valid_hue[coherent], center)
     tol = float(np.percentile(dist, HUE_TOL_PERCENTILE))
     if tol <= 0.0:
-        # All pooled pixels share one exact float hue (uniform synthetic
-        # patches). Derive the smallest band that stays non-empty
-        # without admitting any neighboring 8-bit-representable hue:
-        # neighbors of a pixel with chroma c sit ≥ 60°/(255·c) away, so
-        # half the finest quantum among the samples admits none of them.
-        # chroma = sat · val, since sat = c/maxc and val = maxc.
-        max_chroma = float(np.max(sat * val))
-        tol = HUE_DEG_PER_SEXTANT / (RGB_8BIT_LEVELS * max_chroma) / 2.0
+        # All coherent pixels share one exact float hue (uniform
+        # synthetic patches). Half the finest 8-bit hue quantum keeps
+        # the band non-empty without admitting any neighboring value.
+        tol = finest_quantum_deg / 2.0
     if 2.0 * tol >= DEGENERATE_HUE_BAND_DEG:
         raise CalibrationError(
             f"bin {bin_id}: learned hue band ±{tol:.1f}° covers at least half "
@@ -93,16 +168,29 @@ def learn_color_model(
             "grey/black lids cannot be color-calibrated - attach a small "
             "colored marker to the lid and sample that instead"
         )
-    sat_min = float(np.percentile(sat, SV_MIN_PERCENTILE))
-    val_min = float(np.percentile(val, SV_MIN_PERCENTILE))
+    # Floors from the coherent pixels only: junk (overexposed, greyish)
+    # pixels must not drag them toward zero, or the runtime mask would
+    # re-admit exactly the junk the mixture just removed.
+    sat_min = float(np.percentile(sat_valid[coherent], SV_MIN_PERCENTILE))
+    val_min = float(np.percentile(val_valid[coherent], SV_MIN_PERCENTILE))
     # Order-statistics-derived warning (no chosen cutoff): if
     # q/100·(n−1) < 1, the q-th percentile IS the sample minimum, i.e.
     # the sample is too small for the percentile to differ from min.
-    if SV_MIN_PERCENTILE / 100.0 * (n_px - 1) < 1.0:
+    if SV_MIN_PERCENTILE / 100.0 * (n_coherent - 1) < 1.0:
         warnings.append(
-            f"bin {bin_id}: only {n_px} sample pixels - the "
+            f"bin {bin_id}: only {n_coherent} coherent sample pixels - the "
             f"{SV_MIN_PERCENTILE:g}th percentile equals the sample minimum; "
             "draw larger sample rectangles"
+        )
+    # More junk than the percentile convention absorbs by design (the
+    # documented capacity of HUE_TOL_PERCENTILE): model is learned from
+    # the coherent majority, but the sample spot deserves a re-draw.
+    if junk_fraction > (100.0 - HUE_TOL_PERCENTILE) / 100.0:
+        warnings.append(
+            f"bin {bin_id}: {junk_fraction:.0%} of the sample pixels are "
+            "junk (overexposed or off-color); the model was learned from "
+            "the coherent majority - consider re-drawing this sample in "
+            "better light"
         )
     return ColorLearnResult(
         hue_center_deg=center,
@@ -111,7 +199,12 @@ def learn_color_model(
         val_min=val_min,
         stats={
             "n_sample_px": n_px,
-            "n_valid_hue_px": int(valid_hue.size),
+            "n_valid_hue_px": n_valid,
+            "n_coherent_px": n_coherent,
+            "junk_fraction": junk_fraction,
+            "mixture_weight": fit.weight,
+            "kappa": fit.kappa,
+            "em_iterations": fit.n_iter,
             "resultant_r": resultant,
         },
         warnings=warnings,
@@ -184,6 +277,48 @@ def learn_area_threshold(
         },
         warnings=warnings,
     )
+
+
+def derive_quality_gates(
+    gate_samples: list[list[float]],
+) -> dict[str, float] | None:
+    """Quality-gate limits from unlabeled daylight frames.
+
+    Presence labels are human ground truth, but "how bright/clipped do
+    frames get in this yard" is written into every archived daylight
+    frame. Each sample is ``[median_sat, median_val, clip_frac]`` of
+    one frame in capture order. The limit is the observed extremum
+    extended by the median absolute successive difference of the
+    series: the measured frame-to-frame noise scale of that metric,
+    a data-derived slack instead of a knife edge. Returns None when no
+    samples exist.
+
+    Documented limitations: the slack scales with the caller's capture
+    cadence (successive differences of sparser series are larger), and
+    a single anomalous frame (e.g. a camera glitch) widens the derived
+    gates for as long as it stays in the sample window. The integration
+    keeps a one-day rolling window and re-derives after a relearn, so
+    anomalies age out within a day.
+    """
+    if not gate_samples:
+        return None
+    arr = np.asarray(gate_samples, dtype=np.float64)
+    if arr.ndim != 2 or arr.shape[1] != 3:
+        raise CalibrationError(
+            f"gate samples must be [sat, val, clip] triples, got shape {arr.shape}"
+        )
+
+    def slack(series: np.ndarray) -> float:
+        if series.size < 2:
+            return 0.0
+        return float(np.median(np.abs(np.diff(series))))
+
+    sats, vals, clips = arr[:, 0], arr[:, 1], arr[:, 2]
+    return {
+        "daylight_sat_min": max(float(sats.min()) - slack(sats), 0.0),
+        "daylight_val_max": min(float(vals.max()) + slack(vals), 1.0),
+        "overexposure_clip_max": min(float(clips.max()) + slack(clips), 1.0),
+    }
 
 
 def _hue_bands_overlap(a: BinModel, b: BinModel) -> bool:

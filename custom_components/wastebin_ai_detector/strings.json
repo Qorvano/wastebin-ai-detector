@@ -73,7 +73,20 @@
     },
     "sensor": {
       "status": {
-        "name": "Status"
+        "name": "Status",
+        "state": {
+          "no_run_yet": "No analysis yet",
+          "ok": "OK",
+          "hold_greyscale": "Holding: greyscale/IR frame",
+          "hold_overexposure": "Holding: harsher light than calibrated",
+          "hold_greyscale_and_overexposure": "Holding: greyscale and overexposed",
+          "ambiguous_cold_start": "Waiting for a confident frame",
+          "camera_error": "Camera unreachable",
+          "detect_error": "Analysis error",
+          "not_calibrated": "Not calibrated",
+          "watchdog_timeout": "Analysis aborted by watchdog",
+          "previous_run_still_busy": "Previous analysis still running"
+        }
       }
     }
   },

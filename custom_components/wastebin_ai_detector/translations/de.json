@@ -73,7 +73,20 @@
     },
     "sensor": {
       "status": {
-        "name": "Status"
+        "name": "Status",
+        "state": {
+          "no_run_yet": "Noch keine Analyse",
+          "ok": "OK",
+          "hold_greyscale": "Hält: Graustufen-/IR-Bild",
+          "hold_overexposure": "Hält: härteres Licht als kalibriert",
+          "hold_greyscale_and_overexposure": "Hält: Graustufen und überbelichtet",
+          "ambiguous_cold_start": "Wartet auf eindeutiges Bild",
+          "camera_error": "Kamera nicht erreichbar",
+          "detect_error": "Analysefehler",
+          "not_calibrated": "Nicht kalibriert",
+          "watchdog_timeout": "Analyse vom Watchdog abgebrochen",
+          "previous_run_still_busy": "Vorherige Analyse läuft noch"
+        }
       }
     }
   },

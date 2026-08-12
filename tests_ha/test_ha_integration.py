@@ -6,6 +6,7 @@ installed; the pure-core suite stays independent of Home Assistant.
 
 from __future__ import annotations
 
+import asyncio
 import io
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -57,7 +58,10 @@ def _scene_jpeg(
             (YELLOW, 0.30, 0.30, 0.20 * yellow_scale, 0.20 * yellow_scale)
         )
     if blown:
-        rects.append(((1.0, 1.0, 1.0), 0.05, 0.55, 0.90, 0.35))
+        # Small enough that the median saturation stays on the backdrop
+        # (pure overexposure, no greyscale co-trigger), large enough to
+        # clip well beyond any learned limit.
+        rects.append(((1.0, 1.0, 1.0), 0.05, 0.62, 0.45, 0.20))
     scene = make_scene(size=(320, 200), rects=rects, seed=5)
     buffer = io.BytesIO()
     scene.save(buffer, format="JPEG", quality=90)
@@ -361,6 +365,92 @@ async def test_reload_on_ambiguous_frame_stays_unavailable(
         await entry.runtime_data.coordinator.async_refresh()
         await hass.async_block_till_done()
         assert hass.states.get(sensor_id).state == "on"
+
+
+async def test_gates_self_heal_after_one_scan(hass: HomeAssistant) -> None:
+    """First encounter with harsher light holds one scan; the frame's
+    own statistics widen the gates, the next scan is admitted."""
+    entry = MockConfigEntry(domain=DOMAIN, data=ENTRY_DATA, title="Test")
+    entry.add_to_hass(hass)
+    feed = _CameraFeed(_scene_jpeg(with_yellow=True))
+    with patch(
+        "custom_components.wastebin_ai_detector.coordinator.async_get_image",
+        new=feed,
+    ), patch(
+        "custom_components.wastebin_ai_detector.coordinator.is_up",
+        return_value=True,
+    ):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        await _calibrate_yellow(hass)
+
+        registry = er.async_get(hass)
+        sensor_id = registry.async_get_entity_id(
+            "binary_sensor", DOMAIN, f"{entry.entry_id}_gelbe_tonne"
+        )
+        status_id = registry.async_get_entity_id(
+            "sensor", DOMAIN, f"{entry.entry_id}_status"
+        )
+        assert hass.states.get(sensor_id).state == "on"
+
+        # Harsher light than calibrated (a clipped strip away from the
+        # lid): scan 1 holds ...
+        feed.content = _scene_jpeg(with_yellow=True, blown=True)
+        await entry.runtime_data.coordinator.async_refresh()
+        await hass.async_block_till_done()
+        assert hass.states.get(status_id).state.startswith("hold_")
+        assert hass.states.get(sensor_id).state == "on"
+
+        # ... scan 2 with the same light is admitted and analyzed.
+        await entry.runtime_data.coordinator.async_refresh()
+        await hass.async_block_till_done()
+        assert hass.states.get(status_id).state == "ok"
+        assert hass.states.get(sensor_id).state == "on"
+
+
+async def test_watchdog_aborts_hanging_analysis(hass: HomeAssistant) -> None:
+    entry = MockConfigEntry(domain=DOMAIN, data=ENTRY_DATA, title="Test")
+    entry.add_to_hass(hass)
+    feed = _CameraFeed(_scene_jpeg(with_yellow=True))
+    with patch(
+        "custom_components.wastebin_ai_detector.coordinator.async_get_image",
+        new=feed,
+    ):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        await _calibrate_yellow(hass)
+
+    import time as time_mod
+    from datetime import timedelta
+
+    release = asyncio.Event()
+
+    def blocking_detect(*_args, **_kwargs):
+        # Hang the executor phase, the one the watchdog actually
+        # bounds in production; release at test end to free the thread.
+        while not release.is_set():
+            time_mod.sleep(0.05)
+        raise RuntimeError("released")
+
+    coordinator = entry.runtime_data.coordinator
+    coordinator.update_interval = timedelta(seconds=0.3)
+    with patch(
+        "custom_components.wastebin_ai_detector.coordinator.async_get_image",
+        new=feed,
+    ), patch.object(
+        type(coordinator), "_detect_bytes", staticmethod(blocking_detect)
+    ):
+        await coordinator.async_refresh()
+        await hass.async_block_till_done()
+        assert coordinator.last_update_success is False
+        assert coordinator.diagnostics["outcome"] == "watchdog_timeout"
+
+        # The leaked executor thread triggers the single-flight guard.
+        await coordinator.async_refresh()
+        await hass.async_block_till_done()
+        assert coordinator.diagnostics["outcome"] == "previous_run_still_busy"
+    release.set()
+    await hass.async_block_till_done()
 
 
 async def test_forget_image_removes_calibration_data(

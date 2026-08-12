@@ -52,3 +52,18 @@ ATTR_ABSENT = "absent"
 ATTR_AUTO_RELEARN = "auto_relearn"
 
 STORAGE_VERSION = 1
+
+# Closed set of analysis outcomes, shown by the enum status sensor.
+STATUS_OUTCOMES = (
+    "no_run_yet",
+    "ok",
+    "hold_greyscale",
+    "hold_overexposure",
+    "hold_greyscale_and_overexposure",
+    "ambiguous_cold_start",
+    "camera_error",
+    "detect_error",
+    "not_calibrated",
+    "watchdog_timeout",
+    "previous_run_still_busy",
+)

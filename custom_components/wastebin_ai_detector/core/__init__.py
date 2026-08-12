@@ -6,7 +6,14 @@ unchanged by the Home Assistant integration layer.
 """
 
 from .ccl import largest_component_area
-from .color import circular_dist_deg, circular_mean_deg, rgb_to_hsv
+from .color import (
+    MixtureFit,
+    circular_dist_deg,
+    circular_mean_deg,
+    fit_vonmises_uniform_mixture,
+    rgb_to_hsv,
+    vonmises_kappa_from_resultant,
+)
 from .detect import (
     BinResult,
     DetectionResult,
@@ -28,7 +35,12 @@ from .imageio import (
     load_image_rgb_bytes,
     roi_to_pixels,
 )
-from .learn import learn_area_threshold, learn_color_model, learn_profile
+from .learn import (
+    derive_quality_gates,
+    learn_area_threshold,
+    learn_color_model,
+    learn_profile,
+)
 from .profile import (
     SCHEMA_VERSION,
     BinModel,
@@ -62,6 +74,7 @@ __all__ = [
     "DetectionResult",
     "ImageEntry",
     "ImageLoadError",
+    "MixtureFit",
     "Profile",
     "ProfileError",
     "Rect",
@@ -72,9 +85,11 @@ __all__ = [
     "bin_mask",
     "circular_dist_deg",
     "circular_mean_deg",
+    "derive_quality_gates",
     "detect",
     "detect_file",
     "extract_working_roi",
+    "fit_vonmises_uniform_mixture",
     "is_uncertain",
     "largest_component_area",
     "learn_area_threshold",
@@ -95,4 +110,5 @@ __all__ = [
     "store_to_dict",
     "validate_profile",
     "validate_store",
+    "vonmises_kappa_from_resultant",
 ]

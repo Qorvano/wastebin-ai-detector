@@ -34,11 +34,37 @@ from .core import (
     CalibrationStore,
     Profile,
     Roi,
+    derive_quality_gates,
     profile_from_dict,
     profile_to_dict,
     store_from_dict,
     store_to_dict,
 )
+
+
+def widen_profile_gates(
+    profile: Profile, gate_samples: list[list[float]]
+) -> bool:
+    """Widen the profile's light gates from unlabeled frame statistics.
+
+    Widen only: labeled calibration stays the floor, the archive can
+    only extend what counts as known light. Returns True if anything
+    changed.
+    """
+    gates = derive_quality_gates(gate_samples)
+    if gates is None:
+        return False
+    widened = False
+    if gates["daylight_sat_min"] < profile.daylight_sat_min:
+        profile.daylight_sat_min = gates["daylight_sat_min"]
+        widened = True
+    if gates["overexposure_clip_max"] > profile.overexposure_clip_max:
+        profile.overexposure_clip_max = gates["overexposure_clip_max"]
+        widened = True
+    if gates["daylight_val_max"] > profile.daylight_val_max:
+        profile.daylight_val_max = gates["daylight_val_max"]
+        widened = True
+    return widened
 
 
 def archive_dir(hass: HomeAssistant, entry_id: str) -> Path:
@@ -93,6 +119,10 @@ class WastebinStorage:
         # Learning starts enabled: a fresh installation is exactly the
         # phase in which snapshots must be collected.
         self.learning: bool = True
+        # [median_sat, median_val, clip_frac] per analyzed daylight
+        # frame, in capture order; feeds derive_quality_gates so the
+        # light gates widen automatically from unlabeled frames.
+        self.gate_samples: list[list[float]] = []
 
     async def async_load(self) -> None:
         data = await self._store.async_load()
@@ -103,6 +133,10 @@ class WastebinStorage:
         if data.get("profile"):
             self.profile = profile_from_dict(data["profile"])
         self.learning = bool(data.get("learning", True))
+        self.gate_samples = [
+            [float(v) for v in sample]
+            for sample in data.get("gate_samples", [])
+        ]
 
     async def async_save(self) -> None:
         await self._store.async_save(
@@ -112,6 +146,7 @@ class WastebinStorage:
                     profile_to_dict(self.profile) if self.profile else None
                 ),
                 "learning": self.learning,
+                "gate_samples": self.gate_samples,
             }
         )
 
