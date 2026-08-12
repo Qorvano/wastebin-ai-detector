@@ -19,7 +19,12 @@ from .coordinator import LearningCollector, WastebinCoordinator
 from .services import async_setup_services
 from .storage import WastebinStorage, archive_dir
 
-PLATFORMS = [Platform.BINARY_SENSOR, Platform.BUTTON, Platform.SWITCH]
+PLATFORMS = [
+    Platform.BINARY_SENSOR,
+    Platform.BUTTON,
+    Platform.SENSOR,
+    Platform.SWITCH,
+]
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:

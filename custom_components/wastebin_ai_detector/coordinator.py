@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 from dataclasses import replace
 from datetime import datetime, timedelta
+from typing import Any
 
 from homeassistant.components.camera import async_get_image
 from homeassistant.config_entries import ConfigEntry
@@ -77,10 +78,37 @@ class WastebinCoordinator(DataUpdateCoordinator[DetectionResult]):
             entry.options.get(CONF_CONFIRM_SCANS, DEFAULT_CONFIRM_SCANS)
         )
         self._pending_flips: dict[str, int] = {}
+        # Why the last analysis ended the way it did, with the measured
+        # values against the learned limits. Exposed by the always
+        # available status sensor: outcomes must never be invisible.
+        self.diagnostics: dict[str, Any] = {"outcome": "no_run_yet"}
+
+    def _set_diagnostics(
+        self,
+        outcome: str,
+        result: DetectionResult | None = None,
+        **extra: Any,
+    ) -> None:
+        diag: dict[str, Any] = {
+            "outcome": outcome,
+            "at": dt_util.utcnow().isoformat(),
+        }
+        if result is not None:
+            diag["median_sat"] = result.median_sat
+            diag["median_val"] = result.median_val
+            diag["clip_frac"] = result.clip_frac
+        profile = self.storage.profile
+        if profile is not None:
+            diag["limit_daylight_sat_min"] = profile.daylight_sat_min
+            diag["limit_overexposure_clip_max"] = profile.overexposure_clip_max
+            diag["limit_daylight_val_max"] = profile.daylight_val_max
+        diag.update(extra)
+        self.diagnostics = diag
 
     async def _async_update_data(self) -> DetectionResult:
         profile = self.storage.profile
         if profile is None:
+            self._set_diagnostics("not_calibrated")
             raise UpdateFailed(
                 "not calibrated yet: add samples and labels, then call the "
                 f"{DOMAIN}.relearn service"
@@ -88,12 +116,14 @@ class WastebinCoordinator(DataUpdateCoordinator[DetectionResult]):
         try:
             image = await async_get_image(self.hass, self.camera_entity)
         except HomeAssistantError as err:
+            self._set_diagnostics("camera_error", error=str(err))
             raise UpdateFailed(f"camera snapshot failed: {err}") from err
         try:
             result = await self.hass.async_add_executor_job(
                 self._detect_bytes, image.content, profile
             )
         except WastebinError as err:
+            self._set_diagnostics("detect_error", error=str(err))
             raise UpdateFailed(f"detection failed: {err}") from err
         now = dt_util.utcnow()
         if result.grayscale_suspect or result.overexposure_suspect:
@@ -102,6 +132,12 @@ class WastebinCoordinator(DataUpdateCoordinator[DetectionResult]):
             # than publishing a verdict the color signal cannot carry.
             # Both diagnostics are stamped independently; a frame can
             # legitimately trip both gates.
+            reasons = []
+            if result.grayscale_suspect:
+                reasons.append("greyscale")
+            if result.overexposure_suspect:
+                reasons.append("overexposure")
+            outcome = "hold_" + "_and_".join(reasons)
             if result.grayscale_suspect:
                 self.last_greyscale_skip = now
             if result.overexposure_suspect:
@@ -109,6 +145,15 @@ class WastebinCoordinator(DataUpdateCoordinator[DetectionResult]):
             # A gated frame breaks the chain of consecutive confident
             # analyses the confirm_scans option promises.
             self._pending_flips.clear()
+            self._set_diagnostics(
+                outcome,
+                result,
+                held_previous_state=self.data is not None,
+                hint=(
+                    "label a snapshot of these conditions as calibration "
+                    "data to widen the learned quality gates"
+                ),
+            )
             if self.data is not None:
                 return self.data
             raise UpdateFailed(
@@ -117,7 +162,9 @@ class WastebinCoordinator(DataUpdateCoordinator[DetectionResult]):
                 "clean analysis"
             )
         self.last_daylight_update = now
-        return self._apply_stability(result, now)
+        stabilized = self._apply_stability(result, now)
+        self._set_diagnostics("ok", stabilized)
+        return stabilized
 
     def _apply_stability(self, result: DetectionResult, now: datetime) -> DetectionResult:
         """Per-bin acceptance: learned-uncertainty hold plus optional
@@ -130,6 +177,11 @@ class WastebinCoordinator(DataUpdateCoordinator[DetectionResult]):
             # never confidently established anything. Stay unavailable
             # like the quality gates do; the first confident frame is
             # accepted immediately.
+            self._set_diagnostics(
+                "ambiguous_cold_start",
+                result,
+                ambiguous_bins=[b.id for b in result.bins if b.uncertain],
+            )
             raise UpdateFailed(
                 "first analysis is ambiguous for at least one bin; "
                 "waiting for a confident frame"

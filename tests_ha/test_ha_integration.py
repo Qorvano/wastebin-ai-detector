@@ -175,9 +175,14 @@ async def test_setup_before_calibration(hass: HomeAssistant) -> None:
     switch_id = registry.async_get_entity_id(
         "switch", DOMAIN, f"{entry.entry_id}_learning"
     )
-    assert sensor_id and switch_id
+    status_id = registry.async_get_entity_id(
+        "sensor", DOMAIN, f"{entry.entry_id}_status"
+    )
+    assert sensor_id and switch_id and status_id
     assert hass.states.get(sensor_id).state == "unavailable"
     assert hass.states.get(switch_id).state == "on"
+    # The status sensor must explain WHY presence is unavailable.
+    assert hass.states.get(status_id).state == "not_calibrated"
 
 
 async def test_calibration_services_full_cycle(hass: HomeAssistant) -> None:
@@ -257,6 +262,18 @@ async def test_overexposed_frame_holds_state(hass: HomeAssistant) -> None:
         await hass.async_block_till_done()
         assert hass.states.get(sensor_id).state == "on"
         assert entry.runtime_data.coordinator.last_overexposure_skip is not None
+
+        # ... and the status sensor names the reason with its numbers.
+        status_id = registry.async_get_entity_id(
+            "sensor", DOMAIN, f"{entry.entry_id}_status"
+        )
+        status = hass.states.get(status_id)
+        assert status.state.startswith("hold_")
+        assert "overexposure" in status.state
+        assert status.attributes["clip_frac"] > status.attributes[
+            "limit_overexposure_clip_max"
+        ]
+        assert status.attributes["held_previous_state"] is True
 
 
 async def test_confirm_scans_requires_consecutive_evidence(
