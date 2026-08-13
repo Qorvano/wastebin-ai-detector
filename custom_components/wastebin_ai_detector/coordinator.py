@@ -158,7 +158,15 @@ class WastebinCoordinator(DataUpdateCoordinator[DetectionResult]):
         try:
             image = await async_get_image(self.hass, self.camera_entity)
         except HomeAssistantError as err:
-            self._set_diagnostics("camera_error", error=str(err))
+            self._set_diagnostics(
+                "camera_error",
+                error=str(err),
+                hint=(
+                    "if this persists although the camera delivers images "
+                    "elsewhere, reload this integration entry (observed "
+                    "after camera re-registrations)"
+                ),
+            )
             raise UpdateFailed(f"camera snapshot failed: {err}") from err
         try:
             self._executor_busy = True
@@ -258,22 +266,33 @@ class WastebinCoordinator(DataUpdateCoordinator[DetectionResult]):
         """Per-bin acceptance: learned-uncertainty hold plus optional
         k-confirmation for state flips (clear evidence switches with
         the default of 1 immediately)."""
-        if self.data is None and any(b.uncertain for b in result.bins):
-            # Cold start (fresh setup or entry reload) on an ambiguous
-            # frame: publishing its raw threshold verdict would let a
-            # sensor flip across the reload boundary on evidence that
-            # never confidently established anything. Stay unavailable
-            # like the quality gates do; the first confident frame is
-            # accepted immediately.
-            self._set_diagnostics(
-                "ambiguous_cold_start",
-                result,
-                ambiguous_bins=[b.id for b in result.bins if b.uncertain],
-            )
-            raise UpdateFailed(
-                "first analysis is ambiguous for at least one bin; "
-                "waiting for a confident frame"
-            )
+        if self.data is None:
+            ambiguous = [b.id for b in result.bins if b.uncertain]
+            confident = [b for b in result.bins if not b.uncertain]
+            if not confident:
+                # Cold start on a fully ambiguous frame: nothing can be
+                # published without risking a flip across the reload
+                # boundary on evidence that never confidently
+                # established anything.
+                self._set_diagnostics(
+                    "ambiguous_cold_start", result, ambiguous_bins=ambiguous
+                )
+                raise UpdateFailed(
+                    "first analysis is ambiguous for every bin; waiting "
+                    "for a confident frame"
+                )
+            if ambiguous:
+                # Per-bin cold start: confident bins go live NOW; only
+                # the ambiguous ones stay unavailable (their sensors
+                # show nothing rather than a guess) until their own
+                # first confident frame. One chronically ambiguous bin
+                # must not blind the others.
+                for bin_id in ambiguous:
+                    self._pending_flips.pop(bin_id, None)
+                self.last_daylight_update = now
+                for b in confident:
+                    self.last_confident_update[b.id] = now
+                return replace(result, bins=confident)
         previous = {b.id: b for b in self.data.bins} if self.data else {}
         bins = []
         for result_bin in result.bins:
@@ -285,7 +304,11 @@ class WastebinCoordinator(DataUpdateCoordinator[DetectionResult]):
                 self._pending_flips.pop(result_bin.id, None)
                 if prev_bin is not None:
                     result_bin = replace(result_bin, present=prev_bin.present)
-                bins.append(result_bin)
+                    bins.append(result_bin)
+                # No previous state for this bin (it sat out the cold
+                # start): publishing its raw threshold verdict now
+                # would be exactly the guess the cold-start rule
+                # forbids - keep it unpublished until confident.
                 continue
             if prev_bin is None or result_bin.present == prev_bin.present:
                 self._pending_flips.pop(result_bin.id, None)

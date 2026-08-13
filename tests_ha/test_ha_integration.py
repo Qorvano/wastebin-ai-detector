@@ -988,3 +988,69 @@ async def test_set_roi_service_reloads_and_reconciles(
                 },
                 blocking=True,
             )
+
+
+async def test_cold_start_publishes_confident_bins_per_bin(
+    hass: HomeAssistant,
+) -> None:
+    """One chronically ambiguous bin must not blind the others."""
+    from datetime import datetime, timezone
+
+    from custom_components.wastebin_ai_detector.core import (
+        BinResult,
+        DetectionResult,
+    )
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data=ENTRY_DATA_TWO_BINS,
+        title="Test",
+        minor_version=2,
+    )
+    entry.add_to_hass(hass)
+    feed = _CameraFeed(_scene_jpeg(with_yellow=True))
+    with patch(
+        "custom_components.wastebin_ai_detector.coordinator.async_get_image",
+        new=feed,
+    ):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        coordinator = entry.runtime_data.coordinator
+        now = datetime.now(timezone.utc)
+
+        def result(gelb_uncertain, blau_uncertain):
+            return DetectionResult(
+                bins=[
+                    BinResult(
+                        id="gelbe_tonne", name="Gelb", present=True,
+                        area_frac=0.01, min_area_frac=0.001, margin=10.0,
+                        uncertain=gelb_uncertain,
+                    ),
+                    BinResult(
+                        id="blaue_tonne", name="Blau", present=True,
+                        area_frac=0.002, min_area_frac=0.001, margin=2.0,
+                        uncertain=blau_uncertain,
+                    ),
+                ],
+                median_sat=0.4, grayscale_suspect=False,
+                working_size=(160, 100),
+            )
+
+        # Cold start, blue ambiguous: yellow publishes, blue sits out.
+        assert coordinator.data is None
+        published = coordinator._apply_stability(result(False, True), now)
+        assert [b.id for b in published.bins] == ["gelbe_tonne"]
+        coordinator.async_set_updated_data(published)
+
+        # Next frame, blue still ambiguous and without prior state: it
+        # must stay unpublished (no raw-verdict guess), yellow stays.
+        published = coordinator._apply_stability(result(False, True), now)
+        assert [b.id for b in published.bins] == ["gelbe_tonne"]
+        coordinator.async_set_updated_data(published)
+
+        # Blue's first confident frame brings it live immediately.
+        published = coordinator._apply_stability(result(False, False), now)
+        assert {b.id for b in published.bins} == {
+            "gelbe_tonne",
+            "blaue_tonne",
+        }
