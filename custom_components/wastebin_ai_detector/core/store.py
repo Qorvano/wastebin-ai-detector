@@ -34,8 +34,16 @@ from typing import Any
 
 from .errors import CalibrationError, ProfileError
 from .profile import KNOWN_RESAMPLE, REL_EPS, Rect, Roi
+from .region import (
+    Rings,
+    clamp_rings,
+    region_contains,
+    rings_bbox,
+    rings_equal,
+    validate_rings,
+)
 
-STORE_SCHEMA_VERSION = 2
+STORE_SCHEMA_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -78,9 +86,10 @@ class ImageEntry:
     samples: dict[str, list[SampleRect]] = field(default_factory=dict)
     present: list[str] = field(default_factory=list)
     absent: list[str] = field(default_factory=list)
-    # ROI configured at the last set_labels call: a label asserts
-    # "visible / not visible inside THIS crop of THIS frame".
+    # Region configured at the last set_labels call: a label asserts
+    # "visible / not visible inside THIS region of THIS frame".
     label_roi: Roi | None = None
+    label_polygons: Rings | None = None
     # bin id -> bin.appearance_epoch at the last labeling of that bin.
     label_epoch: dict[str, int] = field(default_factory=dict)
     # Scene->frame mapping generation this file was captured under.
@@ -105,6 +114,9 @@ class CalibrationStore:
     # bump but not yet materialized as ImageEntry (entries only come
     # into existence at the first sample/label). Popped on ensure_image.
     capture_epochs: dict[str, int] = field(default_factory=dict)
+    # Optional polygon rings refining the region inside the roi bbox;
+    # None = the whole bbox (exact pre-polygon semantics, fast path).
+    roi_polygons: Rings | None = None
 
     # -- queries ---------------------------------------------------------
 
@@ -229,6 +241,11 @@ class CalibrationStore:
         # the crop it was made under and, per touched bin, the bin's
         # current appearance epoch.
         entry.label_roi = self.roi
+        entry.label_polygons = (
+            None
+            if self.roi_polygons is None
+            else [list(ring) for ring in self.roi_polygons]
+        )
         for bin_id in present + absent:
             decl = self.get_bin(bin_id)
             assert decl is not None  # validated above
@@ -250,6 +267,11 @@ class CalibrationStore:
         if entry is None or not (entry.present or entry.absent):
             return False
         entry.label_roi = self.roi
+        entry.label_polygons = (
+            None
+            if self.roi_polygons is None
+            else [list(ring) for ring in self.roi_polygons]
+        )
         entry.view_epoch = self.view_epoch
         return True
 
@@ -263,6 +285,18 @@ class CalibrationStore:
         new = replace(decl, appearance_epoch=decl.appearance_epoch + 1)
         self.bins[self.bins.index(decl)] = new
         return new.appearance_epoch
+
+    def set_region(self, rings: Rings | None) -> None:
+        """Set the polygon region; the bbox is derived from the rings
+        exactly once here (single source of truth). ``None`` keeps the
+        current bbox as a plain rectangle region."""
+        if rings is None:
+            self.roi_polygons = None
+            return
+        validate_rings(rings)
+        clamped = clamp_rings(rings)
+        self.roi_polygons = clamped
+        self.roi = rings_bbox(clamped)
 
     def bump_view_epoch(self, unmaterialized: list[str]) -> int:
         """Advance the view epoch (camera swapped/re-aimed).
@@ -439,12 +473,24 @@ def learning_view(
                 and (
                     (
                         entry.label_roi is not None
-                        and roi_contains(store.roi, entry.label_roi)
+                        and region_contains(
+                            store.roi,
+                            store.roi_polygons,
+                            entry.label_roi,
+                            entry.label_polygons,
+                            store.working_width,
+                        )
                     )
                     or (
                         bool(all_rects)
                         and all(
-                            image_rect_in_roi(r.rect, store.roi) is not None
+                            region_contains(
+                                store.roi,
+                                store.roi_polygons,
+                                Roi(r.rect.x, r.rect.y, r.rect.w, r.rect.h),
+                                None,
+                                store.working_width,
+                            )
                             for r in all_rects
                         )
                     )
@@ -461,7 +507,13 @@ def learning_view(
             usable = (
                 view_current
                 and entry.label_roi is not None
-                and roi_contains(entry.label_roi, store.roi)
+                and region_contains(
+                    entry.label_roi,
+                    entry.label_polygons,
+                    store.roi,
+                    store.roi_polygons,
+                    store.working_width,
+                )
             )
             if usable:
                 absent.append(bin_id)
@@ -474,6 +526,11 @@ def learning_view(
                 present=present,
                 absent=absent,
                 label_roi=entry.label_roi,
+                label_polygons=(
+                    None
+                    if entry.label_polygons is None
+                    else [list(ring) for ring in entry.label_polygons]
+                ),
                 label_epoch=dict(entry.label_epoch),
                 view_epoch=entry.view_epoch,
             )
@@ -508,6 +565,11 @@ def learning_view(
         images=images,
         schema_version=store.schema_version,
         view_epoch=store.view_epoch,
+        roi_polygons=(
+            None
+            if store.roi_polygons is None
+            else [list(ring) for ring in store.roi_polygons]
+        ),
     )
     return view, warnings
 
@@ -533,6 +595,14 @@ def validate_store(store: CalibrationStore) -> None:
             f"unsupported store schema_version {store.schema_version} "
             f"(supported: {STORE_SCHEMA_VERSION})"
         )
+    if store.roi_polygons is not None:
+        validate_rings(store.roi_polygons)
+        bbox = rings_bbox(store.roi_polygons)
+        if not roi_equal(bbox, store.roi):
+            raise ProfileError(
+                f"region bbox {store.roi} does not match its polygon "
+                f"bounds {bbox} - the bbox is derived from the rings"
+            )
     if store.resample not in KNOWN_RESAMPLE:
         raise ProfileError(f"unknown resample {store.resample!r}")
     if store.working_width is not None and store.working_width <= 0:
@@ -592,6 +662,8 @@ def validate_store(store: CalibrationStore) -> None:
             )
         if entry.label_roi is not None:
             _validate_roi(f"image {entry.path} label_roi", entry.label_roi)
+        if entry.label_polygons is not None:
+            validate_rings(entry.label_polygons)
         for bin_id, epoch in entry.label_epoch.items():
             if not 0 <= epoch <= epoch_of[bin_id]:
                 raise ProfileError(
@@ -712,6 +784,7 @@ def store_to_dict(store: CalibrationStore) -> dict[str, Any]:
     return {
         "schema_version": data["schema_version"],
         "roi": data["roi"],
+        "roi_polygons": data["roi_polygons"],
         "working_width": data["working_width"],
         "resample": data["resample"],
         "view_epoch": data["view_epoch"],
@@ -729,9 +802,22 @@ def _rect_from(data: dict[str, Any]) -> Rect:
     return Rect(**{k: float(data[k]) for k in ("x", "y", "w", "h")})
 
 
+def _rings_from(data: Any) -> Rings | None:
+    if data is None:
+        return None
+    return [
+        [(float(x), float(y)) for x, y in ring]
+        for ring in data
+    ]
+
+
 def store_from_dict(data: dict[str, Any]) -> CalibrationStore:
     if int(data.get("schema_version", 0)) == 1:
         data = migrate_store_dict_v1_to_v2(data)
+    if int(data.get("schema_version", 0)) == 2:
+        # v2 -> v3 is a pure field addition (regions default to the
+        # whole bbox = exact v2 semantics): lossless by construction.
+        data = {**data, "schema_version": STORE_SCHEMA_VERSION}
     try:
         store = CalibrationStore(
             schema_version=int(data["schema_version"]),
@@ -745,6 +831,7 @@ def store_from_dict(data: dict[str, Any]) -> CalibrationStore:
                 str(k): int(v)
                 for k, v in data.get("capture_epochs", {}).items()
             },
+            roi_polygons=_rings_from(data.get("roi_polygons")),
             bins=[
                 BinDecl(
                     id=str(b["id"]),
@@ -775,6 +862,7 @@ def store_from_dict(data: dict[str, Any]) -> CalibrationStore:
                         if e.get("label_roi") is None
                         else _roi_from(e["label_roi"])
                     ),
+                    label_polygons=_rings_from(e.get("label_polygons")),
                     label_epoch={
                         str(k): int(v)
                         for k, v in e.get("label_epoch", {}).items()

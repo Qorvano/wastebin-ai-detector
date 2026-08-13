@@ -40,6 +40,7 @@ from typing import Any
 import numpy as np
 
 from .ccl import largest_component_area
+from .region import region_mask
 from .color import (
     HUE_DEG_PER_SEXTANT,
     RGB_8BIT_LEVELS,
@@ -49,9 +50,9 @@ from .color import (
     rgb_to_hsv,
     vonmises_kappa_from_resultant,
 )
-from .detect import bin_mask, row_duplicate_fraction
+from .detect import bin_mask, row_duplicate_fraction, select_component
 from .errors import CalibrationError, ImageLoadError, RoiError
-from .imageio import extract_working_roi, load_image_rgb, rect_to_pixels
+from .imageio import extract_working_roi, load_image_rgb, rect_to_pixels, roi_to_pixels
 from .profile import BinModel, Profile, Roi
 from .store import (
     CalibrationStore,
@@ -75,6 +76,103 @@ DEGENERATE_HUE_BAND_DEG = 180.0
 #   rectangle shows the lid color".
 COHERENT_POSTERIOR_MIN = 0.5
 COHERENT_MAJORITY_MIN = 0.5
+
+
+def seeded_component(mask: np.ndarray, seed: np.ndarray) -> np.ndarray | None:
+    """The connected component of ``mask`` touching ``seed`` (both 2-D
+    bool). Exact 8-connectivity via iterative dilation-by-shifts until
+    stable - calibration-time only, so the O(diameter) loop is fine.
+    Returns None when mask and seed do not overlap."""
+    current = mask & seed
+    if not bool(current.any()):
+        return None
+    while True:
+        grown = current.copy()
+        grown[1:, :] |= current[:-1, :]
+        grown[:-1, :] |= current[1:, :]
+        grown[:, 1:] |= current[:, :-1]
+        grown[:, :-1] |= current[:, 1:]
+        grown[1:, 1:] |= current[:-1, :-1]
+        grown[1:, :-1] |= current[:-1, 1:]
+        grown[:-1, 1:] |= current[1:, :-1]
+        grown[:-1, :-1] |= current[1:, 1:]
+        grown &= mask
+        if bool((grown == current).all()):
+            return current
+        current = grown
+
+
+def shape_bounds(
+    observations: list[tuple[int, int, int, int]],
+    pooled_aspect_span: float,
+) -> dict[str, float]:
+    """Learned plausibility bounds from (area_px, box_w, box_h, denom)
+    observations of ONE bin, plus the pooled lid-aspect span of ALL
+    bins in this installation.
+
+    Two criteria, both position-invariant by construction:
+    - FILL (area / box area): a lid is a compact solid at any position
+      and any light; hedge fringes are not. Bound = extremum minus
+      max(successive-difference slack, perimeter-pixel floor) - the
+      quality-gate slack convention plus the structural resolution of
+      a discretized blob boundary.
+    - LOG ASPECT: bounds = own extrema widened by the pooled span of
+      lid aspects observed across ALL bins - each bin's lid is a lid
+      seen at a DIFFERENT position, so the pooled span is this
+      installation's measured scale of position/perspective-induced
+      aspect variation (a moved bin must stay plausible; a vertical
+      body streak lies far outside any lid aspect). One-pixel box
+      resolution is the floor.
+
+    Deliberately NO area bound: lid areas vary by orders of magnitude
+    across light regimes (field: factor >100 for blue), and area is
+    already governed by the learned threshold plus ambiguity band.
+    Bounds live in log space so an observation equal to its own
+    extremum can never fall outside through an exp/log round-trip.
+    """
+
+    def slack(series: np.ndarray) -> float:
+        if series.size < 2:
+            return 0.0
+        return float(np.median(np.abs(np.diff(series))))
+
+    aspects, fills, rot_fill_bounds = [], [], []
+    abs_aspect_max = 0.0
+    aspect_floor = fill_floor = 0.0
+    for area_px, box_w, box_h, _denom in observations:
+        log_aspect = math.log(box_w / box_h)
+        aspects.append(log_aspect)
+        fill = area_px / (box_w * box_h)
+        fills.append(fill)
+        # In-plane rotation geometry of a rigid planar shape (derived,
+        # not chosen): rotating a shape whose bbox has aspect a moves
+        # the bbox aspect within [1/a, a] and shrinks the bbox fill by
+        # at most the rectangle factor 2a/(1+a)^2 (worst case at 45°).
+        # A bin turned on its spot must stay plausible.
+        a = math.exp(abs(log_aspect))
+        abs_aspect_max = max(abs_aspect_max, abs(log_aspect))
+        rot_fill_bounds.append(fill * 2.0 * a / ((1.0 + a) ** 2))
+        perimeter = 2.0 * (box_w + box_h)
+        aspect_floor = max(
+            aspect_floor, math.log1p(1.0 / box_w) + math.log1p(1.0 / box_h)
+        )
+        fill_floor = max(fill_floor, perimeter / (box_w * box_h))
+    aspect_arr = np.asarray(aspects, dtype=np.float64)
+    fill_arr = np.asarray(fills, dtype=np.float64)
+    s_aspect = max(slack(aspect_arr), aspect_floor, pooled_aspect_span)
+    s_fill = max(slack(fill_arr), fill_floor)
+    # Aspect band symmetric around square: rotation can carry any
+    # observed aspect through 1 to its transpose, so the band spans
+    # ±(largest observed |log aspect|) plus the widening terms.
+    half_band = abs_aspect_max + s_aspect
+    return {
+        "shape_n": int(aspect_arr.size),
+        "shape_log_aspect_min": -half_band,
+        "shape_log_aspect_max": half_band,
+        "shape_fill_min": max(
+            min(min(rot_fill_bounds), float(fill_arr.min())) - s_fill, 0.0
+        ),
+    }
 
 
 @dataclass
@@ -483,8 +581,101 @@ def learn_profile(
             )
         )
 
-    # 2) Area thresholds on top of the final color models, computed
-    # under the CURRENT ROI only (the exact grid detection runs on).
+    # Region mask per image on the CURRENT region's grid; None = whole
+    # crop (rect fast path). The crop is integer-rounded per frame, so
+    # the mask maps through each frame's actual crop box.
+    poly_cache: dict[str, np.ndarray | None] = {}
+
+    def poly_for(path: str) -> np.ndarray | None:
+        if path not in poly_cache:
+            if store.roi_polygons is None:
+                poly_cache[path] = None
+            else:
+                img = frames[path]
+                sx0, sy0, sx1, sy1 = roi_to_pixels(
+                    store.roi, img.width, img.height
+                )
+                crop = Roi(
+                    x=sx0 / img.width,
+                    y=sy0 / img.height,
+                    w=(sx1 - sx0) / img.width,
+                    h=(sy1 - sy0) / img.height,
+                )
+                _hue, sat, _val = hsv_for(path, store.roi)
+                poly_cache[path] = region_mask(
+                    store.roi_polygons, sat.shape[1], sat.shape[0], crop
+                )
+        return poly_cache[path]
+
+    def masked_bin_mask(entry_path: str, model: BinModel):
+        hue, sat, val = hsv_for(entry_path, store.roi)
+        mask = bin_mask(hue, sat, val, model)
+        poly = poly_for(entry_path)
+        if poly is not None:
+            mask &= poly
+        denom = int(poly.sum()) if poly is not None else mask.size
+        return mask, denom
+
+    # 1.5) Shape models from the PRESENT-labeled images, referenced
+    # exactly through the bin's sample rectangles: the observed shape
+    # is the connected component touching a rect the user drew on the
+    # lid - never "the largest blob", which under harsh light can be a
+    # background object and would poison the learned shape forever.
+    # Present images without current-epoch rects contribute no shape
+    # observation (their area evidence below stays untouched).
+    shape_obs: dict[str, list[tuple[int, int, int, int]]] = {}
+    for model in bins:
+        observations: list[tuple[int, int, int, int]] = []
+        for entry in usable_images:
+            if model.id not in entry.present:
+                continue
+            rects = entry.samples.get(model.id, [])
+            if not rects:
+                continue
+            mask, denom = masked_bin_mask(entry.path, model)
+            height, width = mask.shape
+            seed = np.zeros_like(mask)
+            for sample in rects:
+                grid = image_rect_in_roi(sample.rect, store.roi)
+                if grid is None:
+                    continue
+                try:
+                    x0, y0, x1, y1 = rect_to_pixels(
+                        grid.x, grid.y, grid.w, grid.h, width, height
+                    )
+                except RoiError:
+                    continue
+                seed[y0:y1, x0:x1] = True
+            component = seeded_component(mask, seed)
+            if component is None:
+                continue
+            ys, xs = np.nonzero(component)
+            box_w = int(xs.max()) - int(xs.min()) + 1
+            box_h = int(ys.max()) - int(ys.min()) + 1
+            observations.append((int(component.sum()), box_w, box_h, denom))
+        shape_obs[model.id] = observations
+    # Pooled lid-aspect span across ALL bins: the installation's
+    # measured scale of position-induced aspect variation (each bin is
+    # a lid observed at a different spot).
+    all_aspects = [
+        math.log(w / h)
+        for obs in shape_obs.values()
+        for (_a, w, h, _d) in obs
+    ]
+    pooled_span = (
+        max(all_aspects) - min(all_aspects) if len(all_aspects) >= 2 else 0.0
+    )
+    for model in bins:
+        if shape_obs[model.id]:
+            model.learning_stats.update(
+                shape_bounds(shape_obs[model.id], pooled_span)
+            )
+
+    # 2) Area thresholds on top of the final color AND shape models,
+    # computed under the CURRENT region only, with exactly the
+    # plausible-only component selection detection uses (pipeline
+    # identity: thresholds must be learned on the areas that will be
+    # measured at runtime).
     trained: list[BinModel] = []
     for model in bins:
         pos_areas: list[float] = []
@@ -496,10 +687,24 @@ def learn_profile(
                 target = neg_areas
             else:
                 continue
-            hue, sat, val = hsv_for(entry.path, store.roi)
-            total = sat.shape[0] * sat.shape[1]
-            area = largest_component_area(bin_mask(hue, sat, val, model))
-            target.append(area / total)
+            mask, denom = masked_bin_mask(entry.path, model)
+            selected = select_component(mask, model, denom)
+            area_frac = (selected[0] / denom) if selected else 0.0
+            if target is pos_areas and area_frac <= 0.0:
+                # The shape filter (or the region) leaves no plausible
+                # blob in a present-labeled image: exclude the
+                # observation with a warning instead of hard-failing
+                # the bin (same policy as stale-geometry evidence).
+                warnings.append(
+                    f"bin {model.id}: present-labeled {entry.path} yields "
+                    "no plausible blob under the current region/shape "
+                    "model - observation excluded (the threshold is then "
+                    "learned without this worst case; if this happens for "
+                    "typical frames, widen the region or add samples from "
+                    "such frames)"
+                )
+                continue
+            target.append(area_frac)
         try:
             result = learn_area_threshold(pos_areas, neg_areas, bin_id=model.id)
         except CalibrationError as exc:
@@ -583,6 +788,11 @@ def learn_profile(
         overexposure_clip_max=overexposure_clip_max,
         daylight_val_max=daylight_val_max,
         row_dup_max=row_dup_max,
+        roi_polygons=(
+            None
+            if store.roi_polygons is None
+            else [list(ring) for ring in store.roi_polygons]
+        ),
         daylight_stats=daylight_stats,
         bins=bins,
     )

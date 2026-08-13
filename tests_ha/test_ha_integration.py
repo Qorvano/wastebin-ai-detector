@@ -731,7 +731,7 @@ async def test_v1_storage_data_migrates_with_backup(
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
     calibration = entry.runtime_data.storage.calibration
-    assert calibration.schema_version == 2
+    assert calibration.schema_version == 3
     sample = calibration.get_image("old.jpg").samples["gelbe_tonne"][0]
     assert sample.rect.x == pytest.approx(0.35)
     assert calibration.get_image("old.jpg").label_roi is not None
@@ -788,12 +788,15 @@ async def test_reconf_view_changed_end_to_end(hass: HomeAssistant) -> None:
     with patch(
         "custom_components.wastebin_ai_detector.coordinator.async_get_image",
         new=feed,
+    ), patch(
+        "custom_components.wastebin_ai_detector.coordinator.is_up",
+        return_value=False,
     ):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
         filename = await _calibrate_yellow(hass)
         storage = entry.runtime_data.storage
-        storage.gate_samples = [[0.4, 0.5, 0.01]]
+        storage.gate_samples = [[0.4, 0.5, 0.01, 0.0]]
         assert storage.calibration.view_epoch == 0
         # The mirror exists after the first save and must NOT be
         # treated as an unmaterialized snapshot below.
@@ -1054,3 +1057,95 @@ async def test_cold_start_publishes_confident_bins_per_bin(
             "gelbe_tonne",
             "blaue_tonne",
         }
+
+
+async def test_set_roi_polygon_flows_into_store_and_profile(
+    hass: HomeAssistant,
+) -> None:
+    entry = MockConfigEntry(
+        domain=DOMAIN, data=ENTRY_DATA, title="Test", minor_version=2
+    )
+    entry.add_to_hass(hass)
+    feed = _CameraFeed(_scene_jpeg(with_yellow=True))
+    with patch(
+        "custom_components.wastebin_ai_detector.coordinator.async_get_image",
+        new=feed,
+    ):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        await _calibrate_yellow(hass)
+        # A pentagon (a rectangle ring would normalize to the rect
+        # fast path, tested below).
+        ring = [
+            [0.1, 0.1],
+            [0.5, 0.05],
+            [0.9, 0.1],
+            [0.9, 0.95],
+            [0.1, 0.95],
+        ]
+        response = await hass.services.async_call(
+            DOMAIN,
+            "set_roi",
+            {"polygons": [ring]},
+            blocking=True,
+            return_response=True,
+        )
+        assert response["polygons"] == [ring]
+        # bbox derived server-side from the ring.
+        assert response["roi"]["x"] == pytest.approx(0.1)
+        assert response["roi"]["h"] == pytest.approx(0.9)
+        await hass.async_block_till_done(wait_background_tasks=True)
+
+        storage = entry.runtime_data.storage
+        assert storage.calibration.roi_polygons is not None
+        assert storage.calibration.roi.x == pytest.approx(0.1)
+        # Background relearn carried the region into the profile.
+        assert storage.profile.roi_polygons is not None
+        # Sensor still works and the status sensor exposes the region
+        # for the card's prefill.
+        assert hass.states.get("binary_sensor.test_gelbe_tonne").state == "on"
+        registry = er.async_get(hass)
+        status_id = registry.async_get_entity_id(
+            "sensor", DOMAIN, f"{entry.entry_id}_status"
+        )
+        region = hass.states.get(status_id).attributes["region"]
+        assert region["polygons"] == [ring]
+        assert region["bbox"]["x"] == pytest.approx(0.1)
+
+        # The reconfigure number form must NOT clear the polygon when
+        # submitted unchanged (no-op guard).
+        result = await _start_reconfigure(hass, entry)
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {"next_step_id": "reconf_area"}
+        )
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {
+                CONF_ROI_X: entry.data[CONF_ROI_X],
+                CONF_ROI_Y: entry.data[CONF_ROI_Y],
+                CONF_ROI_W: entry.data[CONF_ROI_W],
+                CONF_ROI_H: entry.data[CONF_ROI_H],
+                CONF_WORKING_WIDTH: entry.data[CONF_WORKING_WIDTH],
+            },
+        )
+        assert result["reason"] == "reconfigure_successful"
+        await hass.async_block_till_done(wait_background_tasks=True)
+        from custom_components.wastebin_ai_detector.const import (
+            CONF_ROI_POLYGONS,
+        )
+
+        assert entry.data.get(CONF_ROI_POLYGONS) == [ring]
+
+        # A ring that IS its own bbox rectangle normalizes to the rect
+        # fast path (polygons None).
+        rect_ring = [[0.2, 0.2], [0.8, 0.2], [0.8, 0.8], [0.2, 0.8]]
+        response = await hass.services.async_call(
+            DOMAIN,
+            "set_roi",
+            {"polygons": [rect_ring]},
+            blocking=True,
+            return_response=True,
+        )
+        assert response["polygons"] is None
+        await hass.async_block_till_done(wait_background_tasks=True)
+        assert entry.data.get(CONF_ROI_POLYGONS) is None

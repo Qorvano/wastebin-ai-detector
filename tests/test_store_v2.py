@@ -594,3 +594,152 @@ class TestBlobLocalization:
             assert area == expected
             assert 0 <= x0 < x1 <= 60 and 0 <= y0 < y1 <= 40
             assert x0 <= cx < x1 and y0 <= cy < y1
+
+
+class TestPolygonRegion:
+    """v0.5.0: polygon region end-to-end through learn and detect."""
+
+    def _region_store(self, tmp_path: Path) -> CalibrationStore:
+        from wastebin_ai_detector.core import rect_as_rings
+
+        store = CalibrationStore(
+            roi=ROI_LEARN,
+            working_width=160,
+            resample="bilinear",
+            bins=[BinDecl("gelb", "Gelbe Tonne")],
+        )
+        for name, seed in (("a.png", 0), ("b.png", 3)):
+            _write_scene(tmp_path / name, seed=seed)
+            store.add_sample(name, "gelb", Rect(*inner_rect(RECT_YELLOW)))
+            store.set_labels(name, present=["gelb"])
+        return store
+
+    def test_rect_ring_region_is_bit_identical_to_rect(self, tmp_path):
+        from wastebin_ai_detector.core import detect_file, rect_as_rings
+
+        store = self._region_store(tmp_path)
+        plain, _ = learn_profile(store, tmp_path / "store.json")
+        store.set_region(rect_as_rings(ROI_LEARN))
+        ringed, _ = learn_profile(store, tmp_path / "store.json")
+        gelb_a = next(b for b in plain.bins if b.id == "gelb")
+        gelb_b = next(b for b in ringed.bins if b.id == "gelb")
+        # Same denominator (full bbox), same thresholds.
+        assert gelb_a.min_area_frac == gelb_b.min_area_frac
+        ra = detect_file(tmp_path / "a.png", plain)
+        rb = detect_file(tmp_path / "a.png", ringed)
+        assert ra.bins[0].area_frac == rb.bins[0].area_frac
+
+    def test_polygon_excludes_background_region(self, tmp_path):
+        """A distractor patch of lid color outside the polygon must not
+        count - the hedge-fringe field case."""
+        from scenes import make_scene
+
+        store = CalibrationStore(
+            roi=Roi(0.0, 0.0, 1.0, 1.0),
+            working_width=160,
+            resample="bilinear",
+            bins=[BinDecl("gelb", "Gelbe Tonne")],
+        )
+        # Scene: real lid at RECT_YELLOW, decoy of the same color at
+        # the far right (outside the polygon drawn below).
+        DECOY = (0.75, 0.30, 0.10, 0.10)
+        for name, seed in (("a.png", 0), ("b.png", 3)):
+            make_scene(
+                size=(320, 200),
+                rects=[(YELLOW, *RECT_YELLOW), (YELLOW, *DECOY)],
+                seed=seed,
+            ).save(tmp_path / name, format="PNG")
+            store.add_sample(name, "gelb", Rect(*inner_rect(RECT_YELLOW)))
+            store.set_labels(name, present=["gelb"])
+        # Polygon around the lid area only (generous, decoy outside).
+        store.set_region([[(0.2, 0.2), (0.6, 0.2), (0.6, 0.6), (0.2, 0.6)]])
+        profile, _ = learn_profile(store, tmp_path / "store.json")
+        from wastebin_ai_detector.core import detect_file
+
+        # Lid present: detected from inside the region.
+        res = detect_file(tmp_path / "a.png", profile)
+        assert res.bins[0].present is True
+        # Lid gone, decoy stays: nothing inside the region -> absent.
+        make_scene(
+            size=(320, 200), rects=[(YELLOW, *DECOY)], seed=7
+        ).save(tmp_path / "gone.png", format="PNG")
+        res = detect_file(tmp_path / "gone.png", profile)
+        assert res.bins[0].area_frac == 0.0
+        assert res.bins[0].present is False
+
+    def test_v2_store_dict_loads_as_v3(self):
+        data = store_to_dict(_store(Roi(0.1, 0.1, 0.8, 0.8)))
+        data["schema_version"] = 2
+        for e in data["images"]:
+            e.pop("label_polygons", None)
+        data.pop("roi_polygons", None)
+        loaded = store_from_dict(data)
+        assert loaded.schema_version == 3
+        assert loaded.roi_polygons is None
+
+    def test_polygon_region_containment_in_learning_view(self):
+        store = _store(Roi(0.0, 0.0, 1.0, 1.0))
+        store.set_region([[(0.1, 0.1), (0.9, 0.1), (0.9, 0.9), (0.1, 0.9)]])
+        store.add_sample("img.jpg", "gelb", Rect(0.3, 0.3, 0.1, 0.1))
+        store.set_labels("img.jpg", present=["gelb"], absent=["blau"])
+        view, _ = learning_view(store)
+        entry = view.get_image("img.jpg")
+        assert entry.present == ["gelb"] and entry.absent == ["blau"]
+        # Shrink the polygon so the rect falls outside: label region no
+        # longer contained, rect outside -> present set aside; current
+        # region still inside label region -> absent stays.
+        store.set_region([[(0.5, 0.5), (0.9, 0.5), (0.9, 0.9), (0.5, 0.9)]])
+        view, _ = learning_view(store)
+        entry = view.get_image("img.jpg")
+        assert entry.present == []
+        assert entry.absent == ["blau"]
+
+
+class TestShapePlausibility:
+    def test_hedge_fringe_and_streak_rejected_lid_accepted(self, tmp_path):
+        """Field regression: ragged low-fill fringe and a tall vertical
+        streak of lid color must not stand in for the lid."""
+        import numpy as np
+
+        from scenes import make_scene
+        from wastebin_ai_detector.core import detect_file
+
+        store = CalibrationStore(
+            roi=Roi(0.0, 0.0, 1.0, 1.0),
+            working_width=160,
+            resample="bilinear",
+            bins=[BinDecl("gelb", "Gelbe Tonne")],
+        )
+        for name, seed in (("a.png", 0), ("b.png", 3)):
+            _write_scene(tmp_path / name, seed=seed)
+            store.add_sample(name, "gelb", Rect(*inner_rect(RECT_YELLOW)))
+            store.set_labels(name, present=["gelb"])
+        profile, _ = learn_profile(store, tmp_path / "store.json")
+        gelb = profile.bins[0]
+        assert gelb.learning_stats["shape_n"] == 2
+
+        # Tall narrow streak (like the sunlit black-bin body edge).
+        make_scene(
+            size=(320, 200), rects=[(YELLOW, 0.40, 0.10, 0.025, 0.70)], seed=9
+        ).save(tmp_path / "streak.png", format="PNG")
+        res = detect_file(tmp_path / "streak.png", profile)
+        assert res.bins[0].area_frac == 0.0, "streak must be implausible"
+
+        # Ragged fringe: scattered small patches of lid color (leaves).
+        rng_rects = [
+            (YELLOW, 0.30 + 0.05 * i, 0.25 + 0.04 * (i % 3), 0.012, 0.012)
+            for i in range(8)
+        ]
+        make_scene(size=(320, 200), rects=rng_rects, seed=11).save(
+            tmp_path / "fringe.png", format="PNG"
+        )
+        res = detect_file(tmp_path / "fringe.png", profile)
+        # Each patch is a tiny component; even the largest is far from
+        # lid fill/aspect... but tiny squares are compact, so the guard
+        # here is that their AREA is below the threshold - the fill
+        # criterion targets connected ragged fringes instead:
+        assert res.bins[0].present is False
+
+        # The real lid still passes.
+        res = detect_file(tmp_path / "a.png", profile)
+        assert res.bins[0].present is True

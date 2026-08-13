@@ -18,6 +18,7 @@ from homeassistant.util import slugify
 
 from .const import (
     CONF_BIN_ACTIVE,
+    CONF_ROI_POLYGONS,
     CONF_BIN_NAME,
     CONF_BINS,
     CONF_CAMERA,
@@ -210,6 +211,7 @@ class WastebinConfigFlow(ConfigFlow, domain=DOMAIN):
             d = other.data
             if (
                 d.get(CONF_CAMERA) == camera
+                and d.get(CONF_ROI_POLYGONS) is None
                 and d.get(CONF_ROI_X) == x
                 and d.get(CONF_ROI_Y) == y
                 and d.get(CONF_ROI_W) == w
@@ -328,18 +330,37 @@ class WastebinConfigFlow(ConfigFlow, domain=DOMAIN):
             ):
                 errors["base"] = "duplicate_detector"
             else:
-                return self._finish_reconfigure(
-                    entry,
-                    data_updates={
-                        CONF_ROI_X: user_input[CONF_ROI_X],
-                        CONF_ROI_Y: user_input[CONF_ROI_Y],
-                        CONF_ROI_W: user_input[CONF_ROI_W],
-                        CONF_ROI_H: user_input[CONF_ROI_H],
-                        CONF_WORKING_WIDTH: int(
-                            user_input[CONF_WORKING_WIDTH]
-                        ),
-                    },
+                unchanged = (
+                    entry.data[CONF_ROI_X] == user_input[CONF_ROI_X]
+                    and entry.data[CONF_ROI_Y] == user_input[CONF_ROI_Y]
+                    and entry.data[CONF_ROI_W] == user_input[CONF_ROI_W]
+                    and entry.data[CONF_ROI_H] == user_input[CONF_ROI_H]
+                    and entry.data[CONF_WORKING_WIDTH]
+                    == int(user_input[CONF_WORKING_WIDTH])
                 )
+                if unchanged:
+                    # No-op guard: submitting the unchanged numbers must
+                    # not clear a drawn polygon region.
+                    return self.async_abort(reason="reconfigure_successful")
+                rect_changed = not (
+                    entry.data[CONF_ROI_X] == user_input[CONF_ROI_X]
+                    and entry.data[CONF_ROI_Y] == user_input[CONF_ROI_Y]
+                    and entry.data[CONF_ROI_W] == user_input[CONF_ROI_W]
+                    and entry.data[CONF_ROI_H] == user_input[CONF_ROI_H]
+                )
+                updates = {
+                    CONF_ROI_X: user_input[CONF_ROI_X],
+                    CONF_ROI_Y: user_input[CONF_ROI_Y],
+                    CONF_ROI_W: user_input[CONF_ROI_W],
+                    CONF_ROI_H: user_input[CONF_ROI_H],
+                    CONF_WORKING_WIDTH: int(user_input[CONF_WORKING_WIDTH]),
+                }
+                if rect_changed:
+                    # Editing the RECT numbers deliberately sets a plain
+                    # rectangle region (documented in the step text);
+                    # a working-width-only change keeps a drawn polygon.
+                    updates[CONF_ROI_POLYGONS] = None
+                return self._finish_reconfigure(entry, data_updates=updates)
         return self.async_show_form(
             step_id="reconf_area",
             data_schema=vol.Schema(

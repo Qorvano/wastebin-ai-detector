@@ -83,17 +83,13 @@ def largest_component_area(mask: np.ndarray) -> int:
     return best
 
 
-def largest_component_region(
+def component_regions(
     mask: np.ndarray,
-) -> tuple[int, tuple[int, int, int, int], tuple[float, float]] | None:
-    """Area, bounding box and centroid of the largest True component.
-
-    Returns ``(area_px, (x0, y0, x1, y1), (cx, cy))`` with the box
-    half-open in mask pixel coordinates and the centroid as float pixel
-    coordinates, or None for an all-False mask. Same runs/union-find
-    scheme and 8-connectivity as :func:`largest_component_area` (which
-    stays untouched for its callers); this variant additionally carries
-    per-component extent and first moments through the merges.
+) -> list[tuple[int, tuple[int, int, int, int], tuple[float, float]]]:
+    """All 8-connected components as (area, half-open box, centroid),
+    sorted by area descending. Same runs/union-find scheme as
+    :func:`largest_component_area` (untouched for its callers), with
+    per-component extent and first moments carried through the merges.
     """
     mask = np.asarray(mask)
     if mask.ndim != 2:
@@ -175,14 +171,22 @@ def largest_component_region(
             cur_runs.append((b0, b1, root))
         prev_runs = cur_runs
 
-    best = -1
-    for i in range(len(parent)):
-        if find(i) == i and (best < 0 or size[i] > size[best]):
-            best = i
-    if best < 0 or size[best] == 0:
-        return None
-    return (
-        size[best],
-        (min_x[best], min_y[best], max_x[best] + 1, max_y[best] + 1),
-        (sum_x[best] / size[best], sum_y[best] / size[best]),
-    )
+    regions = [
+        (
+            size[i],
+            (min_x[i], min_y[i], max_x[i] + 1, max_y[i] + 1),
+            (sum_x[i] / size[i], sum_y[i] / size[i]),
+        )
+        for i in range(len(parent))
+        if find(i) == i and size[i] > 0
+    ]
+    regions.sort(key=lambda r: r[0], reverse=True)
+    return regions
+
+
+def largest_component_region(
+    mask: np.ndarray,
+) -> tuple[int, tuple[int, int, int, int], tuple[float, float]] | None:
+    """Largest component's (area, half-open box, centroid), or None."""
+    regions = component_regions(mask)
+    return regions[0] if regions else None

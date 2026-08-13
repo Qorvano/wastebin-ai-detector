@@ -10,6 +10,7 @@ list, working width) or learned from the user's calibration images.
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -85,6 +86,9 @@ class Profile:
     # adjacent rows (encoder error concealment repeats rows on broken
     # keyframes). Same permissive-default pattern as above.
     row_dup_max: float = 1.0
+    # Optional polygon region (rings, image-relative) refining the roi
+    # bbox; None = whole bbox (pre-polygon semantics).
+    roi_polygons: list | None = None
 
 
 def validate_profile(profile: Profile) -> None:
@@ -131,6 +135,45 @@ def validate_profile(profile: Profile) -> None:
                 raise ProfileError(f"bin {b.id}: {name} outside [0, 1]: {value}")
         if not 0.0 < b.min_area_frac <= 1.0:
             raise ProfileError(f"bin {b.id}: min_area_frac outside (0, 1]: {b.min_area_frac}")
+        # Shape stats feed the plausibility filter in detection: a
+        # hand-edited profile must not smuggle in values that crash or
+        # silently blind a bin.
+        shape_n = b.learning_stats.get("shape_n")
+        if shape_n is not None:
+            if isinstance(shape_n, bool) or not isinstance(shape_n, int):
+                raise ProfileError(
+                    f"bin {b.id}: learning_stats.shape_n is not an int"
+                )
+            if shape_n < 0:
+                raise ProfileError(f"bin {b.id}: negative shape_n")
+            if shape_n >= 2:
+                required = (
+                    "shape_log_aspect_min",
+                    "shape_log_aspect_max",
+                    "shape_fill_min",
+                )
+                for key in required:
+                    value = b.learning_stats.get(key)
+                    if (
+                        isinstance(value, bool)
+                        or not isinstance(value, (int, float))
+                        or not math.isfinite(float(value))
+                    ):
+                        raise ProfileError(
+                            f"bin {b.id}: learning_stats.{key} missing or "
+                            f"not a finite number: {value!r}"
+                        )
+                if (
+                    b.learning_stats["shape_log_aspect_min"]
+                    > b.learning_stats["shape_log_aspect_max"]
+                ):
+                    raise ProfileError(
+                        f"bin {b.id}: shape aspect bounds inverted"
+                    )
+                if not 0.0 <= float(b.learning_stats["shape_fill_min"]) <= 1.0:
+                    raise ProfileError(
+                        f"bin {b.id}: shape_fill_min outside [0, 1]"
+                    )
         # These two stats feed the ambiguity interval in detection, so
         # hand-edited profiles must not smuggle in broken values.
         for key in ("min_pos_area_frac", "max_neg_area_frac"):
@@ -159,6 +202,7 @@ def profile_to_dict(profile: Profile) -> dict[str, Any]:
         "overexposure_clip_max": data["overexposure_clip_max"],
         "daylight_val_max": data["daylight_val_max"],
         "row_dup_max": data["row_dup_max"],
+        "roi_polygons": data["roi_polygons"],
         "daylight_stats": data["daylight_stats"],
         "bins": data["bins"],
     }
@@ -177,6 +221,14 @@ def profile_from_dict(data: dict[str, Any]) -> Profile:
             overexposure_clip_max=float(data.get("overexposure_clip_max", 1.0)),
             daylight_val_max=float(data.get("daylight_val_max", 1.0)),
             row_dup_max=float(data.get("row_dup_max", 1.0)),
+            roi_polygons=(
+                None
+                if data.get("roi_polygons") is None
+                else [
+                    [(float(x), float(y)) for x, y in ring]
+                    for ring in data["roi_polygons"]
+                ]
+            ),
             daylight_stats=dict(data.get("daylight_stats", {})),
             bins=[
                 BinModel(

@@ -21,6 +21,9 @@ CONF_CONFIRM_SCANS = "confirm_scans"
 # into the store's view_epoch on setup.
 CONF_VIEW_GENERATION = "view_generation"
 CONF_BIN_ACTIVE = "active"
+# Optional polygon region (list of rings, image-relative [x, y] pairs)
+# refining the roi bbox; absent/None = plain rectangle region.
+CONF_ROI_POLYGONS = "roi_polygons"
 
 # Config DEFAULTS. These are user-changeable schema defaults (a
 # legitimate value source), not hidden in-code thresholds:

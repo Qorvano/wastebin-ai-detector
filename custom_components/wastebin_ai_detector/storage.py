@@ -27,6 +27,7 @@ from homeassistant.helpers.storage import Store
 
 from .const import (
     CONF_BIN_ACTIVE,
+    CONF_ROI_POLYGONS,
     CONF_BINS,
     CONF_ROI_H,
     CONF_ROI_W,
@@ -45,6 +46,7 @@ from .core import (
     derive_quality_gates,
     profile_from_dict,
     profile_to_dict,
+    rings_equal,
     roi_equal,
     store_from_dict,
     store_to_dict,
@@ -53,6 +55,7 @@ from .core import (
 _LOGGER = logging.getLogger(__name__)
 
 V1_BACKUP_NAME = "calibration_v1_backup.json"
+V2_BACKUP_NAME = "calibration_v2_backup.json"
 STORE_MIRROR_NAME = "store.json"
 
 
@@ -159,8 +162,19 @@ def reconcile_store_with_entry(
         # Gate samples are per-crop frame statistics with a documented
         # one-day rolling window - ephemeral, not training data. Under
         # a new crop they would widen the next profile's gates with
-        # numbers from the old view.
+        # numbers from the old view. (A polygon-only change below does
+        # NOT clear them: the gates deliberately keep running on the
+        # unchanged bbox crop.)
         storage.gate_samples = []
+        changed = True
+    entry_rings = entry.data.get(CONF_ROI_POLYGONS)
+    entry_rings = (
+        None
+        if entry_rings is None
+        else [[(float(x), float(y)) for x, y in ring] for ring in entry_rings]
+    )
+    if not rings_equal(store.roi_polygons, entry_rings):
+        store.roi_polygons = entry_rings
         changed = True
     working_width = int(entry.data[CONF_WORKING_WIDTH])
     if store.working_width != working_width:
@@ -235,12 +249,19 @@ class WastebinStorage:
             return
         if data.get("calibration"):
             raw = data["calibration"]
-            if int(raw.get("schema_version", 0)) == 1:
+            version = int(raw.get("schema_version", 0))
+            if version == 1:
                 # One-time insurance before the first migrated save: the
                 # original v1 dict lands next to the images, so even a
                 # buggy migration can never destroy evidence.
                 await self._hass.async_add_executor_job(
-                    self._write_v1_backup, raw
+                    self._write_backup, V1_BACKUP_NAME, raw
+                )
+            elif version == 2:
+                # Same insurance for the v2 -> v3 upgrade: a downgrade
+                # to a pre-polygon release has no read path for v3.
+                await self._hass.async_add_executor_job(
+                    self._write_backup, V2_BACKUP_NAME, raw
                 )
             self.calibration = store_from_dict(raw)
         if data.get("profile"):
@@ -264,8 +285,8 @@ class WastebinStorage:
         )
         await self._preserve_divergent_mirror()
 
-    def _write_v1_backup(self, raw: dict) -> None:
-        target = archive_dir(self._hass, self._entry.entry_id) / V1_BACKUP_NAME
+    def _write_backup(self, name: str, raw: dict) -> None:
+        target = archive_dir(self._hass, self._entry.entry_id) / name
         if target.exists():
             return
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -273,7 +294,7 @@ class WastebinStorage:
             json.dumps(raw, indent=2, ensure_ascii=False) + "\n",
             encoding="utf-8",
         )
-        _LOGGER.info("v1 calibration backup written to %s", target)
+        _LOGGER.info("calibration backup written to %s", target)
 
     def _write_mirror(self, payload: str) -> None:
         target = store_anchor(self._hass, self._entry.entry_id)

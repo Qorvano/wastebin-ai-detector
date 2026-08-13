@@ -5,7 +5,7 @@ package can be exercised offline (calibration CLI, tests) and is reused
 unchanged by the Home Assistant integration layer.
 """
 
-from .ccl import largest_component_area, largest_component_region
+from .ccl import component_regions, largest_component_area, largest_component_region
 from .color import (
     MixtureFit,
     circular_dist_deg,
@@ -22,6 +22,8 @@ from .detect import (
     detect_file,
     is_uncertain,
     row_duplicate_fraction,
+    select_component,
+    shape_plausible,
 )
 from .errors import (
     CalibrationError,
@@ -41,6 +43,8 @@ from .learn import (
     learn_area_threshold,
     learn_color_model,
     learn_profile,
+    seeded_component,
+    shape_bounds,
 )
 from .profile import (
     REL_EPS,
@@ -54,6 +58,15 @@ from .profile import (
     profile_to_dict,
     save_profile,
     validate_profile,
+)
+from .region import (
+    polygon_mask,
+    rect_as_rings,
+    region_contains,
+    region_mask,
+    rings_bbox,
+    rings_equal,
+    validate_rings,
 )
 from .store import (
     BinDecl,
@@ -101,6 +114,18 @@ __all__ = [
     "learn_color_model",
     "learn_profile",
     "learning_view",
+    "component_regions",
+    "polygon_mask",
+    "rect_as_rings",
+    "region_contains",
+    "region_mask",
+    "rings_bbox",
+    "rings_equal",
+    "seeded_component",
+    "select_component",
+    "shape_bounds",
+    "shape_plausible",
+    "validate_rings",
     "load_image_rgb",
     "load_image_rgb_bytes",
     "load_profile",

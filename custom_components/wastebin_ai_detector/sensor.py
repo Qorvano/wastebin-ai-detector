@@ -17,7 +17,15 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import DOMAIN, STATUS_OUTCOMES
+from .const import (
+    CONF_ROI_H,
+    CONF_ROI_POLYGONS,
+    CONF_ROI_W,
+    CONF_ROI_X,
+    CONF_ROI_Y,
+    DOMAIN,
+    STATUS_OUTCOMES,
+)
 from .coordinator import WastebinCoordinator
 
 if TYPE_CHECKING:
@@ -48,6 +56,7 @@ class WastebinStatusSensor(
         self, coordinator: WastebinCoordinator, entry: WastebinConfigEntry
     ) -> None:
         super().__init__(coordinator)
+        self._entry = entry
         self._attr_unique_id = f"{entry.entry_id}_status"
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, entry.entry_id)},
@@ -71,4 +80,16 @@ class WastebinStatusSensor(
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        return dict(self.coordinator.diagnostics)
+        attributes = dict(self.coordinator.diagnostics)
+        # The configured region (authoritative entry.data): the
+        # calibration card prefills its polygon editor from this.
+        attributes["region"] = {
+            "bbox": {
+                "x": self._entry.data[CONF_ROI_X],
+                "y": self._entry.data[CONF_ROI_Y],
+                "w": self._entry.data[CONF_ROI_W],
+                "h": self._entry.data[CONF_ROI_H],
+            },
+            "polygons": self._entry.data.get(CONF_ROI_POLYGONS),
+        }
+        return attributes

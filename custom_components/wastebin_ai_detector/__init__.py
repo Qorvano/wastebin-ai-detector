@@ -30,7 +30,7 @@ from homeassistant.loader import async_get_integration
 
 from .const import CONF_BIN_ACTIVE, CONF_BINS, DOMAIN
 from .coordinator import LearningCollector, WastebinCoordinator
-from .core import roi_equal, store_to_dict
+from .core import rings_equal, roi_equal, store_to_dict
 from .services import async_relearn, async_setup_services
 from .storage import (
     WastebinStorage,
@@ -180,6 +180,8 @@ def _profile_stale(storage: WastebinStorage) -> bool:
         return False
     store = storage.calibration
     if not roi_equal(profile.roi, store.roi):
+        return True
+    if not rings_equal(profile.roi_polygons, store.roi_polygons):
         return True
     if profile.working_width != store.working_width:
         return True

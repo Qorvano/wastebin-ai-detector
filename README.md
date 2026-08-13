@@ -102,6 +102,38 @@ Downgrade note: once a store was saved by v0.3.3 (schema v2), older
 versions cannot read it; the original v1 store is kept as
 `calibration_v1_backup.json` in the archive folder.
 
+## Polygon region and shape plausibility (v0.5.0)
+
+The region of interest can now be a free-form contour (any number of
+points, drawn on the calibration card): draw it generously around
+every spot where bins can EVER stand - hedges, gates and pavement
+outside the contour can no longer produce false matches. Existing
+rectangle setups keep working unchanged and can be refined into a
+contour at any time; nothing is lost in either direction (the previous
+store is kept as `calibration_v2_backup.json` in the archive folder;
+older releases cannot read the new store format).
+
+Detection additionally learns each lid's blob SHAPE (compactness and
+aspect, with rotation-geometry safety margins) from your own
+calibration images: a ragged hedge fringe or a tall sunlit streak of
+lid color is rejected as geometrically implausible even inside the
+region, so "no plausible blob" now honestly means absent.
+
+Card config gains two keys:
+
+```yaml
+type: custom:wastebin-calibration-card
+camera: camera.backyard
+status_entity: sensor.backyard_status   # region prefill for the editor
+bins:
+  - id: gelbe_tonne
+    name: Gelbe Tonne
+```
+
+In the card, "Draw region" replaces the rectangle mode: tap to add
+points, tap the first point to close, drag points to adjust, then
+apply - the relearn runs automatically and keeps all evidence.
+
 ## Calibration card (v0.4.0)
 
 The integration ships a Lovelace card (registered automatically, no

@@ -13,10 +13,68 @@ from typing import Any
 import numpy as np
 from PIL import Image
 
-from .ccl import largest_component_region
+import math
+
+from .ccl import component_regions
 from .color import RGB_8BIT_LEVELS, circular_dist_deg, rgb_to_hsv
 from .imageio import extract_working_roi, load_image_rgb, roi_to_pixels
 from .profile import BinModel, Profile, Roi, validate_profile
+from .region import region_mask
+
+# Singular-vs-plural rule (same convention as the color-floor warning):
+# with fewer than two shape observations there is no between-sample
+# variation to learn bounds from, so the plausibility filter stays
+# inactive rather than guessing.
+SHAPE_MIN_OBSERVATIONS = 2
+
+
+def shape_plausible(
+    model: BinModel,
+    area_frac: float,
+    box: tuple[int, int, int, int],
+    area_px: int,
+) -> bool:
+    """Is this component geometrically plausible as the bin's lid?
+
+    Bounds are learned per bin from the calibration images (extremum
+    plus the established successive-difference slack, computed at learn
+    time and stored in learning_stats). The filter is inactive until
+    enough shape observations exist - then any component is plausible,
+    which is exactly the pre-3b behavior.
+    """
+    stats = model.learning_stats
+    if int(stats.get("shape_n", 0)) < SHAPE_MIN_OBSERVATIONS:
+        return True
+    x0, y0, x1, y1 = box
+    box_w, box_h = x1 - x0, y1 - y0
+    if box_w <= 0 or box_h <= 0 or area_frac <= 0.0:
+        return False
+    # Log-space comparison with the learned bounds: same computation as
+    # at learn time, so an observation can never fall outside its own
+    # extremum through a floating-point round-trip. Deliberately no
+    # area criterion (see shape_bounds).
+    log_aspect = math.log(box_w / box_h)
+    fill = area_px / (box_w * box_h)
+    return (
+        stats["shape_log_aspect_min"] <= log_aspect <= stats["shape_log_aspect_max"]
+        and fill >= stats["shape_fill_min"]
+    )
+
+
+def select_component(
+    mask, model: BinModel, denom: int
+) -> tuple[int, tuple[int, int, int, int], tuple[float, float]] | None:
+    """The LARGEST PLAUSIBLE component of a bin's color mask.
+
+    Shared by detection and area learning (pipeline identity: learned
+    thresholds must be computed on exactly the areas detection sees).
+    No plausible component means no evidence: honest zero, so a hedge
+    fringe or a sunlit body streak can no longer stand in for a lid.
+    """
+    for area, box, centroid in component_regions(mask):
+        if shape_plausible(model, area / denom, box, area):
+            return area, box, centroid
+    return None
 
 
 def is_uncertain(area_frac: float, learning_stats: dict[str, Any]) -> bool:
@@ -175,6 +233,22 @@ def _mask_box_to_image(
     )
 
 
+def _cached_region_mask(profile: Profile, width: int, height: int, crop: Roi):
+    """Per-profile mask cache; a relearn creates a new Profile object,
+    so the cache's lifetime is exactly the profile's - no eviction
+    parameter needed, it only grows per distinct frame geometry."""
+    if profile.roi_polygons is None:
+        return None
+    cache = getattr(profile, "_region_mask_cache", None)
+    if cache is None:
+        cache = {}
+        object.__setattr__(profile, "_region_mask_cache", cache)
+    key = (width, height, crop)
+    if key not in cache:
+        cache[key] = region_mask(profile.roi_polygons, width, height, crop)
+    return cache[key]
+
+
 def detect(img: Image.Image, profile: Profile) -> DetectionResult:
     """Run detection on an already-loaded PIL image."""
     validate_profile(profile)
@@ -195,18 +269,27 @@ def detect(img: Image.Image, profile: Profile) -> DetectionResult:
         w=(src_x1 - src_x0) / img.width,
         h=(src_y1 - src_y0) / img.height,
     )
+    # Polygon region: mask applied to the COLOR masks (never to the RGB
+    # pixels - the frame gates below must keep seeing the full crop),
+    # denominator = pixels of the monitored region. None = whole crop,
+    # the exact pre-polygon fast path.
+    poly = _cached_region_mask(profile, width, height, actual_roi)
+    denom = int(poly.sum()) if poly is not None else total
     results: list[BinResult] = []
     for model in profile.bins:
-        region = largest_component_region(bin_mask(hue, sat, val, model))
-        if region is None:
+        mask = bin_mask(hue, sat, val, model)
+        if poly is not None:
+            mask &= poly
+        selected = select_component(mask, model, denom)
+        if selected is None:
             area, bbox, centroid = 0, None, None
         else:
-            area, box_px, centroid_px = region
+            area, box_px, centroid_px = selected
             bbox = _mask_box_to_image(box_px, width, height, actual_roi)
             centroid = _mask_point_to_image(
                 centroid_px, width, height, actual_roi
             )
-        frac = area / total
+        frac = area / denom
         results.append(
             BinResult(
                 id=model.id,

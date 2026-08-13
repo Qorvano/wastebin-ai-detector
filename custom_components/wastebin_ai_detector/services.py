@@ -30,6 +30,7 @@ from homeassistant.exceptions import ServiceValidationError
 import homeassistant.helpers.config_validation as cv
 
 from .const import (
+    CONF_ROI_POLYGONS,
     CONF_ROI_H,
     CONF_ROI_W,
     CONF_ROI_X,
@@ -59,13 +60,19 @@ from .const import (
 from .core import (
     REL_EPS,
     CalibrationError,
+    ProfileError,
     Rect,
+    Roi,
     WastebinError,
     learn_profile,
+    rect_as_rings,
+    rings_bbox,
+    rings_equal,
     roi_rect_to_image_rect,
     store_from_dict,
     store_to_dict,
 )
+from .core.region import clamp_rings, validate_rings
 from .storage import store_anchor, widen_profile_gates
 
 
@@ -167,21 +174,62 @@ def _valid_roi_payload(data: dict) -> dict:
     return data
 
 
+def _valid_polygons(value: Any) -> list[list[list[float]]]:
+    """Schema validator: a list of rings of [x, y] pairs, all finite
+    and inside the unit frame (structural check; even-odd handles any
+    geometry beyond that)."""
+    try:
+        rings = [
+            [(float(x), float(y)) for x, y in ring] for ring in value
+        ]
+    except (TypeError, ValueError) as exc:
+        raise vol.Invalid(f"polygons must be [[[x, y], ...], ...]: {exc}")
+    for ring in rings:
+        for x, y in ring:
+            if not (math.isfinite(x) and math.isfinite(y)):
+                raise vol.Invalid("polygon coordinates must be finite")
+    try:
+        validate_rings(rings)
+    except ProfileError as exc:
+        raise vol.Invalid(str(exc))
+    return [[list(v) for v in ring] for ring in rings]
+
+
 SET_ROI_SCHEMA = vol.Schema(
     vol.All(
         {
             **_ENTRY_SCHEMA,
-            vol.Required(CONF_ROI_X): vol.Coerce(float),
-            vol.Required(CONF_ROI_Y): vol.Coerce(float),
-            vol.Required(CONF_ROI_W): vol.Coerce(float),
-            vol.Required(CONF_ROI_H): vol.Coerce(float),
+            # Either a polygon region (bbox derived server-side) or the
+            # four rectangle fields; polygons win when both are given.
+            vol.Optional("polygons"): _valid_polygons,
+            vol.Optional(CONF_ROI_X): vol.Coerce(float),
+            vol.Optional(CONF_ROI_Y): vol.Coerce(float),
+            vol.Optional(CONF_ROI_W): vol.Coerce(float),
+            vol.Optional(CONF_ROI_H): vol.Coerce(float),
             vol.Optional(CONF_WORKING_WIDTH): vol.All(
                 vol.Coerce(int), vol.Range(min=1)
             ),
         },
-        _valid_roi_payload,
+        lambda data: (
+            data
+            if "polygons" in data
+            else _valid_roi_payload_required(data)
+        ),
     )
 )
+
+
+def _valid_roi_payload_required(data: dict) -> dict:
+    missing = [
+        k
+        for k in (CONF_ROI_X, CONF_ROI_Y, CONF_ROI_W, CONF_ROI_H)
+        if k not in data
+    ]
+    if missing:
+        raise vol.Invalid(
+            "either polygons or all four roi_* fields are required"
+        )
+    return _valid_roi_payload(data)
 
 
 def _get_entry(hass: HomeAssistant, call: ServiceCall) -> ConfigEntry:
@@ -347,21 +395,84 @@ def async_setup_services(hass: HomeAssistant) -> None:
         evidence is untouched by design.
         """
         entry = _get_entry(hass, call)
-        updates = {
-            CONF_ROI_X: call.data[CONF_ROI_X],
-            CONF_ROI_Y: call.data[CONF_ROI_Y],
-            CONF_ROI_W: call.data[CONF_ROI_W],
-            CONF_ROI_H: call.data[CONF_ROI_H],
-        }
+        if "polygons" in call.data:
+            rings = clamp_rings(
+                [
+                    [(float(x), float(y)) for x, y in ring]
+                    for ring in call.data["polygons"]
+                ]
+            )
+            try:
+                bbox = rings_bbox(rings)
+            except ProfileError as err:
+                raise ServiceValidationError(str(err)) from err
+            # A ring that IS the bbox rectangle normalizes to the rect
+            # fast path (None): keeps every pre-polygon fast path and
+            # the analytic containment active for effectively
+            # rectangular regions.
+            if rings_equal(rings, rect_as_rings(bbox)):
+                stored_rings = None
+            else:
+                stored_rings = [[[x, y] for x, y in ring] for ring in rings]
+            updates = {
+                CONF_ROI_X: bbox.x,
+                CONF_ROI_Y: bbox.y,
+                CONF_ROI_W: bbox.w,
+                CONF_ROI_H: bbox.h,
+                CONF_ROI_POLYGONS: stored_rings,
+            }
+        else:
+            updates = {
+                CONF_ROI_X: call.data[CONF_ROI_X],
+                CONF_ROI_Y: call.data[CONF_ROI_Y],
+                CONF_ROI_W: call.data[CONF_ROI_W],
+                CONF_ROI_H: call.data[CONF_ROI_H],
+                CONF_ROI_POLYGONS: None,
+            }
         if CONF_WORKING_WIDTH in call.data:
             updates[CONF_WORKING_WIDTH] = call.data[CONF_WORKING_WIDTH]
+        # No-op guard: identical effective configuration must not force
+        # a reload (and, for pre-polygon entries, must not rewrite
+        # entry.data just to add a roi_polygons: None key).
+        if all(
+            entry.data.get(k) == v
+            for k, v in updates.items()
+            if k != CONF_ROI_POLYGONS
+        ) and rings_equal(
+            entry.data.get(CONF_ROI_POLYGONS),
+            updates.get(CONF_ROI_POLYGONS),
+        ):
+            return {
+                "roi": {
+                    "x": updates[CONF_ROI_X],
+                    "y": updates[CONF_ROI_Y],
+                    "w": updates[CONF_ROI_W],
+                    "h": updates[CONF_ROI_H],
+                },
+                "polygons": updates.get(CONF_ROI_POLYGONS),
+                "note": "region unchanged; nothing to do",
+            }
+
+        def _effective_rings(data: dict):
+            rings = data.get(CONF_ROI_POLYGONS)
+            if rings is not None:
+                return [[(float(x), float(y)) for x, y in r] for r in rings]
+            return rect_as_rings(
+                Roi(
+                    float(data[CONF_ROI_X]),
+                    float(data[CONF_ROI_Y]),
+                    float(data[CONF_ROI_W]),
+                    float(data[CONF_ROI_H]),
+                )
+            )
+
+        new_rings = _effective_rings(updates)
         for other in hass.config_entries.async_entries(DOMAIN):
             if other.entry_id == entry.entry_id:
                 continue
             d = other.data
-            if d.get(CONF_CAMERA) == entry.data[CONF_CAMERA] and all(
-                d.get(k) == updates[k]
-                for k in (CONF_ROI_X, CONF_ROI_Y, CONF_ROI_W, CONF_ROI_H)
+            if d.get(CONF_CAMERA) == entry.data[CONF_CAMERA] and rings_equal(
+                _effective_rings(d), new_rings
             ):
                 raise ServiceValidationError(
                     "another entry already watches the same camera and region"
@@ -376,6 +487,7 @@ def async_setup_services(hass: HomeAssistant) -> None:
                 "w": updates[CONF_ROI_W],
                 "h": updates[CONF_ROI_H],
             },
+            "polygons": updates.get(CONF_ROI_POLYGONS),
             "note": (
                 "entry reloads now; the profile is relearned under the "
                 "new region in the background"
