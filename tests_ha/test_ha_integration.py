@@ -483,8 +483,19 @@ async def test_forget_image_removes_calibration_data(
         await hass.services.async_call(
             DOMAIN, "forget_image", {"filename": filename}, blocking=True
         )
+        # Soft semantics: nothing is deleted, the entry is excluded
+        # from learning and can be restored.
+        entry_after = entry.runtime_data.storage.calibration.get_image(
+            filename
+        )
+        assert entry_after is not None and entry_after.excluded is True
+        assert entry_after.samples["gelbe_tonne"]
+        await hass.services.async_call(
+            DOMAIN, "restore_image", {"filename": filename}, blocking=True
+        )
         assert (
-            entry.runtime_data.storage.calibration.get_image(filename) is None
+            entry.runtime_data.storage.calibration.get_image(filename).excluded
+            is False
         )
 
 
@@ -500,3 +511,366 @@ async def test_relearn_without_data_fails_cleanly(hass: HomeAssistant) -> None:
         await hass.services.async_call(
             DOMAIN, "relearn", {}, blocking=True, return_response=True
         )
+
+
+ENTRY_DATA_TWO_BINS = {
+    **ENTRY_DATA,
+    CONF_BINS: [
+        {"id": "gelbe_tonne", "name": "Gelbe Tonne", "active": True},
+        {"id": "blaue_tonne", "name": "Blaue Tonne", "active": True},
+    ],
+}
+
+
+async def _start_reconfigure(hass: HomeAssistant, entry) -> dict:
+    return await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": "reconfigure", "entry_id": entry.entry_id},
+    )
+
+
+async def test_reconfigure_area_updates_store_and_relearns(
+    hass: HomeAssistant,
+) -> None:
+    """ROI edit: entry.data -> store reconcile, samples survive, the
+    profile is recomputed under the new region in the background."""
+    entry = MockConfigEntry(
+        domain=DOMAIN, data=ENTRY_DATA, title="Test", minor_version=2
+    )
+    entry.add_to_hass(hass)
+    feed = _CameraFeed(_scene_jpeg(with_yellow=True))
+    with patch(
+        "custom_components.wastebin_ai_detector.coordinator.async_get_image",
+        new=feed,
+    ):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        await _calibrate_yellow(hass)
+        storage = entry.runtime_data.storage
+        sample_before = storage.calibration.images[0].samples["gelbe_tonne"][0]
+        profile_roi_before = storage.profile.roi
+
+        result = await _start_reconfigure(hass, entry)
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {"next_step_id": "reconf_area"}
+        )
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {
+                CONF_ROI_X: 0.1,
+                CONF_ROI_Y: 0.1,
+                CONF_ROI_W: 0.8,
+                CONF_ROI_H: 0.8,
+                CONF_WORKING_WIDTH: 160,
+            },
+        )
+        assert result["type"] is FlowResultType.ABORT
+        assert result["reason"] == "reconfigure_successful"
+        await hass.async_block_till_done(wait_background_tasks=True)
+
+        storage = entry.runtime_data.storage
+        assert storage.calibration.roi.x == pytest.approx(0.1)
+        # The sample rect is image-anchored and untouched by the edit.
+        entry_after = storage.calibration.images[0]
+        assert entry_after.samples["gelbe_tonne"][0] == sample_before
+        # Background relearn recomputed the profile under the new ROI.
+        assert storage.profile.roi != profile_roi_before
+        assert storage.profile.roi.x == pytest.approx(0.1)
+        state = hass.states.get(
+            "binary_sensor.test_gelbe_tonne"
+        )
+        assert state is not None and state.state == "on"
+
+
+async def test_reconfigure_retire_and_reactivate_bin(
+    hass: HomeAssistant,
+) -> None:
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data=ENTRY_DATA_TWO_BINS,
+        title="Test",
+        minor_version=2,
+    )
+    entry.add_to_hass(hass)
+    feed = _CameraFeed(_scene_jpeg(with_yellow=True))
+    with patch(
+        "custom_components.wastebin_ai_detector.coordinator.async_get_image",
+        new=feed,
+    ):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        await _calibrate_yellow(hass)
+        assert hass.states.get("binary_sensor.test_blaue_tonne") is not None
+
+        result = await _start_reconfigure(hass, entry)
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {"next_step_id": "reconf_retire_bin"}
+        )
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {"bin": "blaue_tonne"}
+        )
+        assert result["reason"] == "reconfigure_successful"
+        await hass.async_block_till_done()
+
+        # Entity gone, evidence and declaration kept.
+        registry = er.async_get(hass)
+        assert (
+            registry.async_get_entity_id(
+                "binary_sensor", DOMAIN, f"{entry.entry_id}_blaue_tonne"
+            )
+            is None
+        )
+        storage = entry.runtime_data.storage
+        blau = storage.calibration.get_bin("blaue_tonne")
+        assert blau is not None and blau.active is False
+        # The yellow sensor keeps working.
+        assert hass.states.get("binary_sensor.test_gelbe_tonne").state == "on"
+
+        result = await _start_reconfigure(hass, entry)
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {"next_step_id": "reconf_reactivate_bin"}
+        )
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {"bin": "blaue_tonne"}
+        )
+        assert result["reason"] == "reconfigure_successful"
+        await hass.async_block_till_done()
+        assert entry.runtime_data.storage.calibration.get_bin(
+            "blaue_tonne"
+        ).active
+        assert hass.states.get("binary_sensor.test_blaue_tonne") is not None
+
+
+async def test_reconfigure_add_bin_does_not_break_relearn(
+    hass: HomeAssistant,
+) -> None:
+    entry = MockConfigEntry(
+        domain=DOMAIN, data=ENTRY_DATA, title="Test", minor_version=2
+    )
+    entry.add_to_hass(hass)
+    feed = _CameraFeed(_scene_jpeg(with_yellow=True))
+    with patch(
+        "custom_components.wastebin_ai_detector.coordinator.async_get_image",
+        new=feed,
+    ):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        await _calibrate_yellow(hass)
+
+        result = await _start_reconfigure(hass, entry)
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {"next_step_id": "reconf_add_bin"}
+        )
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {"name": "Schwarze Tonne"}
+        )
+        assert result["reason"] == "reconfigure_successful"
+        await hass.async_block_till_done()
+
+        # The new bin has no samples: its sensor exists but is
+        # unavailable; relearn still works for the calibrated bin.
+        assert (
+            hass.states.get("binary_sensor.test_schwarze_tonne").state
+            == "unavailable"
+        )
+        response = await hass.services.async_call(
+            DOMAIN, "relearn", {}, blocking=True, return_response=True
+        )
+        assert "schwarze_tonne" in response["untrained"]
+        assert hass.states.get("binary_sensor.test_gelbe_tonne").state == "on"
+
+
+async def test_v1_storage_data_migrates_with_backup(
+    hass: HomeAssistant, tmp_path
+) -> None:
+    """A stored v1 calibration dict loads via migration; the original
+    is backed up next to the images before the first migrated save."""
+    from custom_components.wastebin_ai_detector.storage import (
+        V1_BACKUP_NAME,
+        archive_dir,
+    )
+
+    entry = MockConfigEntry(
+        domain=DOMAIN, data=ENTRY_DATA, title="Test", minor_version=2
+    )
+    entry.add_to_hass(hass)
+    v1_calibration = {
+        "schema_version": 1,
+        "roi": {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0},
+        "working_width": 160,
+        "resample": "bilinear",
+        "bins": [{"id": "gelbe_tonne", "name": "Gelbe Tonne"}],
+        "images": [
+            {
+                "path": "old.jpg",
+                "samples": {
+                    "gelbe_tonne": [{"x": 0.35, "y": 0.35, "w": 0.1, "h": 0.1}]
+                },
+                "present": ["gelbe_tonne"],
+                "absent": [],
+            }
+        ],
+    }
+    hass_storage_key = f"{DOMAIN}.{entry.entry_id}"
+    from homeassistant.helpers.storage import Store
+
+    store = Store(hass, 1, hass_storage_key)
+    await store.async_save(
+        {
+            "calibration": v1_calibration,
+            "profile": None,
+            "learning": True,
+            "gate_samples": [],
+        }
+    )
+    feed = _CameraFeed(_scene_jpeg(with_yellow=True))
+    with patch(
+        "custom_components.wastebin_ai_detector.coordinator.async_get_image",
+        new=feed,
+    ):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+    calibration = entry.runtime_data.storage.calibration
+    assert calibration.schema_version == 2
+    sample = calibration.get_image("old.jpg").samples["gelbe_tonne"][0]
+    assert sample.rect.x == pytest.approx(0.35)
+    assert calibration.get_image("old.jpg").label_roi is not None
+    backup = archive_dir(hass, entry.entry_id) / V1_BACKUP_NAME
+    assert backup.exists()
+
+
+async def test_reconfirm_images_service(hass: HomeAssistant) -> None:
+    entry = MockConfigEntry(
+        domain=DOMAIN, data=ENTRY_DATA, title="Test", minor_version=2
+    )
+    entry.add_to_hass(hass)
+    feed = _CameraFeed(_scene_jpeg(with_yellow=True))
+    with patch(
+        "custom_components.wastebin_ai_detector.coordinator.async_get_image",
+        new=feed,
+    ):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        filename = await _calibrate_yellow(hass)
+        storage = entry.runtime_data.storage
+        # Simulate a view bump: labels go stale, reconfirm revives them.
+        storage.calibration.bump_view_epoch([])
+        response = await hass.services.async_call(
+            DOMAIN,
+            "reconfirm_images",
+            {"filenames": [filename, "does_not_exist.jpg"]},
+            blocking=True,
+            return_response=True,
+        )
+        assert response["confirmed"] == [filename]
+        assert response["skipped_unlabeled"] == []
+        assert response["unknown"] == ["does_not_exist.jpg"]
+        assert (
+            storage.calibration.get_image(filename).view_epoch
+            == storage.calibration.view_epoch
+        )
+
+
+async def test_reconf_view_changed_end_to_end(hass: HomeAssistant) -> None:
+    """The 'camera re-aimed' flow must bump the store's view epoch via
+    reconcile, clear the gate samples, keep non-snapshot files out of
+    capture_epochs, and set aside the old area evidence."""
+    from custom_components.wastebin_ai_detector.storage import (
+        STORE_MIRROR_NAME,
+        archive_dir,
+    )
+
+    entry = MockConfigEntry(
+        domain=DOMAIN, data=ENTRY_DATA, title="Test", minor_version=2
+    )
+    entry.add_to_hass(hass)
+    feed = _CameraFeed(_scene_jpeg(with_yellow=True))
+    with patch(
+        "custom_components.wastebin_ai_detector.coordinator.async_get_image",
+        new=feed,
+    ):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        filename = await _calibrate_yellow(hass)
+        storage = entry.runtime_data.storage
+        storage.gate_samples = [[0.4, 0.5, 0.01]]
+        assert storage.calibration.view_epoch == 0
+        # The mirror exists after the first save and must NOT be
+        # treated as an unmaterialized snapshot below.
+        assert (archive_dir(hass, entry.entry_id) / STORE_MIRROR_NAME).exists()
+
+        result = await _start_reconfigure(hass, entry)
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {"next_step_id": "reconf_view_changed"}
+        )
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {}
+        )
+        assert result["type"] is FlowResultType.ABORT
+        assert result["reason"] == "reconfigure_successful"
+        await hass.async_block_till_done()
+
+        storage = entry.runtime_data.storage
+        store = storage.calibration
+        assert store.view_epoch == 1
+        assert storage.gate_samples == []
+        assert STORE_MIRROR_NAME not in store.capture_epochs
+        # The labeled image was materialized before the bump: its own
+        # epoch stays 0 and its labels are now set aside by the view.
+        assert store.get_image(filename).view_epoch == 0
+        from custom_components.wastebin_ai_detector.core import (
+            learning_view,
+        )
+
+        view, _warnings = learning_view(store)
+        assert view.get_image(filename).present == []
+        # The profile is scene-stale now and marked as such.
+        from custom_components.wastebin_ai_detector import _profile_stale
+
+        assert _profile_stale(storage) is True
+
+
+async def test_closed_storage_never_writes_and_removal_exports(
+    hass: HomeAssistant,
+) -> None:
+    from custom_components.wastebin_ai_detector.storage import (
+        STORE_MIRROR_NAME,
+        archive_dir,
+    )
+
+    entry = MockConfigEntry(
+        domain=DOMAIN, data=ENTRY_DATA, title="Test", minor_version=2
+    )
+    entry.add_to_hass(hass)
+    feed = _CameraFeed(_scene_jpeg(with_yellow=True))
+    with patch(
+        "custom_components.wastebin_ai_detector.coordinator.async_get_image",
+        new=feed,
+    ):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        filename = await _calibrate_yellow(hass)
+        storage = entry.runtime_data.storage
+
+        # A fenced (superseded) instance must not write: poison the
+        # in-memory store, mark closed, save - the persisted state must
+        # keep the calibration entry.
+        storage.mark_closed()
+        storage.calibration.images.clear()
+        await storage.async_save()
+        from homeassistant.helpers.storage import Store
+
+        raw = await Store(
+            hass, 1, f"{DOMAIN}.{entry.entry_id}"
+        ).async_load()
+        assert raw["calibration"]["images"], "fenced write must be discarded"
+
+        # Removal exports the store next to the images first.
+        assert await hass.config_entries.async_remove(entry.entry_id)
+        await hass.async_block_till_done()
+        mirror = archive_dir(hass, entry.entry_id) / STORE_MIRROR_NAME
+        assert mirror.exists()
+        import json as _json
+
+        exported = _json.loads(mirror.read_text(encoding="utf-8"))
+        assert any(e["path"] == filename for e in exported["images"])

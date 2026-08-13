@@ -1,12 +1,19 @@
-"""Domain services: capture, sample, label, relearn.
+"""Domain services: capture, sample, label, relearn, lifecycle.
 
 These are the scriptable calibration API. The upcoming calibration
 card is a thin UI over exactly these services, so everything the card
 will do can already be done today from Developer Tools or automations.
+
+Payload SHAPE validation lives in the registered vol schemas: shape
+errors then fail in core's schema phase and reach every transport as a
+clean invalid-input error. Only STATE-dependent validation (unknown
+entry, unknown bin, unknown image) stays inside the handlers as
+ServiceValidationError.
 """
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import voluptuous as vol
@@ -27,6 +34,7 @@ from .const import (
     ATTR_BIN,
     ATTR_ENTRY_ID,
     ATTR_FILENAME,
+    ATTR_FILENAMES,
     ATTR_PRESENT,
     ATTR_RECT,
     ATTR_SPACE,
@@ -35,19 +43,54 @@ from .const import (
     SERVICE_CAPTURE,
     SERVICE_FORGET_IMAGE,
     SERVICE_LABEL_IMAGE,
+    SERVICE_MARK_BIN_CHANGED,
+    SERVICE_RECONFIRM_IMAGES,
     SERVICE_RELEARN,
+    SERVICE_RESTORE_IMAGE,
 )
-from pathlib import Path
-
 from .core import (
+    REL_EPS,
     CalibrationError,
     Rect,
     WastebinError,
     learn_profile,
+    roi_rect_to_image_rect,
     store_from_dict,
     store_to_dict,
 )
 from .storage import store_anchor, widen_profile_gates
+
+
+def _plain_filename(value: Any) -> str:
+    """Schema validator: a bare archive file name, no path components.
+
+    Service input reaches filesystem paths via the calibration store;
+    a path component or absolute path would escape the archive.
+    """
+    name = cv.string(value)
+    if not name or Path(name).name != name or name in (".", ".."):
+        raise vol.Invalid(
+            "filename must be a plain file name from the calibration archive"
+        )
+    return name
+
+
+def _unit_rect(value: list[float]) -> list[float]:
+    """Schema validator: [x, y, w, h] inside the unit frame, non-empty."""
+    x, y, w, h = value
+    if (
+        w <= 0.0
+        or h <= 0.0
+        or x < -REL_EPS
+        or y < -REL_EPS
+        or x + w > 1.0 + REL_EPS
+        or y + h > 1.0 + REL_EPS
+    ):
+        raise vol.Invalid(
+            "rect must be [x, y, w, h] with positive size inside [0, 1]"
+        )
+    return value
+
 
 _ENTRY_SCHEMA = {vol.Optional(ATTR_ENTRY_ID): cv.string}
 
@@ -56,10 +99,10 @@ CAPTURE_SCHEMA = vol.Schema(_ENTRY_SCHEMA)
 ADD_SAMPLE_SCHEMA = vol.Schema(
     {
         **_ENTRY_SCHEMA,
-        vol.Required(ATTR_FILENAME): cv.string,
+        vol.Required(ATTR_FILENAME): _plain_filename,
         vol.Required(ATTR_BIN): cv.string,
         vol.Required(ATTR_RECT): vol.All(
-            [vol.Coerce(float)], vol.Length(min=4, max=4)
+            [vol.Coerce(float)], vol.Length(min=4, max=4), _unit_rect
         ),
         vol.Optional(ATTR_SPACE, default="image"): vol.In(("image", "roi")),
     }
@@ -68,7 +111,7 @@ ADD_SAMPLE_SCHEMA = vol.Schema(
 LABEL_SCHEMA = vol.Schema(
     {
         **_ENTRY_SCHEMA,
-        vol.Required(ATTR_FILENAME): cv.string,
+        vol.Required(ATTR_FILENAME): _plain_filename,
         vol.Optional(ATTR_PRESENT, default=[]): [cv.string],
         vol.Optional(ATTR_ABSENT, default=[]): [cv.string],
         vol.Optional(ATTR_AUTO_RELEARN, default=True): cv.boolean,
@@ -77,10 +120,26 @@ LABEL_SCHEMA = vol.Schema(
 
 RELEARN_SCHEMA = vol.Schema(_ENTRY_SCHEMA)
 
-FORGET_SCHEMA = vol.Schema(
+FILENAME_SCHEMA = vol.Schema(
     {
         **_ENTRY_SCHEMA,
-        vol.Required(ATTR_FILENAME): cv.string,
+        vol.Required(ATTR_FILENAME): _plain_filename,
+    }
+)
+
+RECONFIRM_SCHEMA = vol.Schema(
+    {
+        **_ENTRY_SCHEMA,
+        vol.Required(ATTR_FILENAMES): vol.All(
+            [_plain_filename], vol.Length(min=1)
+        ),
+    }
+)
+
+MARK_BIN_CHANGED_SCHEMA = vol.Schema(
+    {
+        **_ENTRY_SCHEMA,
+        vol.Required(ATTR_BIN): cv.string,
     }
 )
 
@@ -108,48 +167,37 @@ def _get_entry(hass: HomeAssistant, call: ServiceCall) -> ConfigEntry:
     )
 
 
-def _validated_filename(filename: str) -> str:
-    """Reject anything that is not a plain archive file name.
-
-    Service input reaches filesystem paths via the calibration store;
-    a path component or absolute path would escape the archive.
-    """
-    if (
-        not filename
-        or Path(filename).name != filename
-        or filename in (".", "..")
-    ):
-        raise ServiceValidationError(
-            f"filename must be a plain file name from the calibration "
-            f"archive, got {filename!r}"
-        )
-    return filename
-
-
-async def _async_relearn(hass: HomeAssistant, entry: ConfigEntry) -> dict[str, Any]:
+async def async_relearn(hass: HomeAssistant, entry: ConfigEntry) -> dict[str, Any]:
+    """Recompute the profile from the store; shared by services and setup."""
     runtime = entry.runtime_data
     storage = runtime.storage
-    # Deep snapshot: the live store is mutable from concurrent service
-    # calls while the executor thread iterates it. The dict round-trip
-    # is lossless and hands the learner an isolated copy.
-    calibration = store_from_dict(store_to_dict(storage.calibration))
-    try:
-        profile, warnings = await hass.async_add_executor_job(
-            learn_profile,
-            calibration,
-            store_anchor(hass, entry.entry_id),
-        )
-    except WastebinError as err:
-        raise ServiceValidationError(f"relearn failed: {err}") from err
-    # The labeled set defines the gates' floor; the unlabeled archive
-    # statistics may only widen them (they know the full daily light
-    # range, labels usually do not).
-    widen_profile_gates(profile, storage.gate_samples)
-    storage.profile = profile
-    await storage.async_save()
+    async with runtime.relearn_lock:
+        # Deep snapshot: the live store is mutable from concurrent
+        # service calls while the executor thread iterates it. The dict
+        # round-trip is lossless and hands the learner an isolated copy.
+        calibration = store_from_dict(store_to_dict(storage.calibration))
+        try:
+            profile, warnings = await hass.async_add_executor_job(
+                learn_profile,
+                calibration,
+                store_anchor(hass, entry.entry_id),
+            )
+        except WastebinError as err:
+            raise ServiceValidationError(f"relearn failed: {err}") from err
+        # The labeled set defines the gates' floor; the unlabeled archive
+        # statistics may only widen them (they know the full daily light
+        # range, labels usually do not).
+        widen_profile_gates(profile, storage.gate_samples)
+        storage.profile = profile
+        storage.profile_view_epoch = calibration.view_epoch
+        await storage.async_save()
     await runtime.coordinator.async_request_refresh()
+    trained_ids = {b.id for b in profile.bins}
     return {
         "warnings": warnings,
+        "untrained": sorted(
+            set(calibration.active_bin_ids()) - trained_ids
+        ),
         "bins": {
             b.id: {
                 "min_area_frac": b.min_area_frac,
@@ -173,13 +221,12 @@ def async_setup_services(hass: HomeAssistant) -> None:
     async def handle_add_sample(call: ServiceCall) -> None:
         entry = _get_entry(hass, call)
         storage = entry.runtime_data.storage
-        filename = _validated_filename(call.data[ATTR_FILENAME])
         rect = Rect(*call.data[ATTR_RECT])
         try:
-            if call.data[ATTR_SPACE] == "image":
-                rect = storage.calibration.image_rect_to_roi_rect(rect)
+            if call.data[ATTR_SPACE] == "roi":
+                rect = roi_rect_to_image_rect(rect, storage.calibration.roi)
             storage.calibration.add_sample(
-                filename, call.data[ATTR_BIN], rect
+                call.data[ATTR_FILENAME], call.data[ATTR_BIN], rect
             )
         except CalibrationError as err:
             raise ServiceValidationError(str(err)) from err
@@ -188,10 +235,9 @@ def async_setup_services(hass: HomeAssistant) -> None:
     async def handle_label(call: ServiceCall) -> ServiceResponse:
         entry = _get_entry(hass, call)
         storage = entry.runtime_data.storage
-        filename = _validated_filename(call.data[ATTR_FILENAME])
         try:
             storage.calibration.set_labels(
-                filename,
+                call.data[ATTR_FILENAME],
                 present=call.data[ATTR_PRESENT],
                 absent=call.data[ATTR_ABSENT],
             )
@@ -201,7 +247,7 @@ def async_setup_services(hass: HomeAssistant) -> None:
         if not call.data[ATTR_AUTO_RELEARN]:
             return {"relearn": "skipped"}
         try:
-            result = await _async_relearn(hass, entry)
+            result = await async_relearn(hass, entry)
         except ServiceValidationError as err:
             # Labeling must never fail because the set is not learnable
             # yet (e.g. first label, no samples for another bin).
@@ -210,17 +256,67 @@ def async_setup_services(hass: HomeAssistant) -> None:
 
     async def handle_relearn(call: ServiceCall) -> ServiceResponse:
         entry = _get_entry(hass, call)
-        return await _async_relearn(hass, entry)
+        return await async_relearn(hass, entry)
 
     async def handle_forget(call: ServiceCall) -> None:
         entry = _get_entry(hass, call)
         storage = entry.runtime_data.storage
-        filename = _validated_filename(call.data[ATTR_FILENAME])
-        if not storage.calibration.forget_image(filename):
+        if not storage.calibration.forget_image(call.data[ATTR_FILENAME]):
             raise ServiceValidationError(
-                f"no calibration entry for {filename!r}"
+                f"no calibration entry for {call.data[ATTR_FILENAME]!r}"
             )
         await storage.async_save()
+
+    async def handle_restore(call: ServiceCall) -> None:
+        entry = _get_entry(hass, call)
+        storage = entry.runtime_data.storage
+        if not storage.calibration.restore_image(call.data[ATTR_FILENAME]):
+            raise ServiceValidationError(
+                f"no calibration entry for {call.data[ATTR_FILENAME]!r}"
+            )
+        await storage.async_save()
+
+    async def handle_reconfirm(call: ServiceCall) -> ServiceResponse:
+        entry = _get_entry(hass, call)
+        storage = entry.runtime_data.storage
+        confirmed: list[str] = []
+        skipped: list[str] = []
+        unknown: list[str] = []
+        for name in call.data[ATTR_FILENAMES]:
+            if storage.calibration.get_image(name) is None:
+                # A typo must not masquerade as "merely unlabeled".
+                unknown.append(name)
+            elif storage.calibration.confirm_image_view(name):
+                confirmed.append(name)
+            else:
+                skipped.append(name)
+        if confirmed:
+            await storage.async_save()
+        return {
+            "confirmed": confirmed,
+            "skipped_unlabeled": skipped,
+            "unknown": unknown,
+        }
+
+    async def handle_mark_bin_changed(call: ServiceCall) -> ServiceResponse:
+        entry = _get_entry(hass, call)
+        storage = entry.runtime_data.storage
+        try:
+            epoch = storage.calibration.mark_bin_appearance_changed(
+                call.data[ATTR_BIN]
+            )
+        except CalibrationError as err:
+            raise ServiceValidationError(str(err)) from err
+        await storage.async_save()
+        return {
+            "bin": call.data[ATTR_BIN],
+            "appearance_epoch": epoch,
+            "hint": (
+                "existing samples and present-labels for this bin are now "
+                "dormant (kept in the store); draw new samples on the new "
+                "lid, label fresh snapshots, then run relearn"
+            ),
+        }
 
     hass.services.async_register(
         DOMAIN,
@@ -247,5 +343,22 @@ def async_setup_services(hass: HomeAssistant) -> None:
         supports_response=SupportsResponse.OPTIONAL,
     )
     hass.services.async_register(
-        DOMAIN, SERVICE_FORGET_IMAGE, handle_forget, schema=FORGET_SCHEMA
+        DOMAIN, SERVICE_FORGET_IMAGE, handle_forget, schema=FILENAME_SCHEMA
+    )
+    hass.services.async_register(
+        DOMAIN, SERVICE_RESTORE_IMAGE, handle_restore, schema=FILENAME_SCHEMA
+    )
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_RECONFIRM_IMAGES,
+        handle_reconfirm,
+        schema=RECONFIRM_SCHEMA,
+        supports_response=SupportsResponse.OPTIONAL,
+    )
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_MARK_BIN_CHANGED,
+        handle_mark_bin_changed,
+        schema=MARK_BIN_CHANGED_SCHEMA,
+        supports_response=SupportsResponse.OPTIONAL,
     )

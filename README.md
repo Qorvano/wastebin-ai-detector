@@ -76,6 +76,32 @@ python tools/calibrate.py learn --store calib.json --profile profile.json
 python tools/calibrate.py detect --profile profile.json --image snap2.jpg --json
 ```
 
+## Dynamic reconfiguration (v0.3.3)
+
+Everything set up once can be changed later without losing a single
+piece of training data - Settings > Devices & Services > Reconfigure:
+
+- **Change camera** (with an honest "same field of view?" question) or
+  mark the camera as **re-aimed** after it was bumped.
+- **Edit the region of interest**: sample rectangles are stored
+  relative to the full frame and survive; labels made under a smaller
+  region stay usable when it grows.
+- **Add, retire and reactivate bins**: retiring removes the sensor but
+  keeps all evidence; a reactivated bin returns with its full history.
+- Evidence is never deleted: `forget_image` only excludes (reversible
+  via `restore_image`), `reconfirm_images` re-asserts labels after a
+  reconfiguration, `mark_bin_appearance_changed` handles a municipality
+  lid-color swap by putting old color evidence to sleep instead of
+  erasing it.
+- The calibration store is mirrored as `store.json` next to the
+  archived snapshots on every save, so the archive folder stays
+  self-contained (movable, CLI-usable, recoverable). Removing the
+  integration exports the store there first.
+
+Downgrade note: once a store was saved by v0.3.3 (schema v2), older
+versions cannot read it; the original v1 store is kept as
+`calibration_v1_backup.json` in the archive folder.
+
 ## Roadmap
 
 - **Phase 2:** Home Assistant config flow, guided calibration, one

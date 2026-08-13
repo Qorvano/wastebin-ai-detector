@@ -10,7 +10,7 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import CONF_BINS, DOMAIN
+from .const import CONF_BIN_ACTIVE, CONF_BINS, DOMAIN
 from .coordinator import WastebinCoordinator
 
 if TYPE_CHECKING:
@@ -23,9 +23,12 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     coordinator = entry.runtime_data.coordinator
+    # Retired bins keep their calibration data but get no entity; the
+    # stable unique_id restores the identity on reactivation.
     async_add_entities(
         WastebinPresenceSensor(coordinator, entry, b["id"], b["name"])
         for b in entry.data[CONF_BINS]
+        if b.get(CONF_BIN_ACTIVE, True)
     )
 
 

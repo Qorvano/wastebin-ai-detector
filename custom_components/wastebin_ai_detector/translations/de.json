@@ -26,15 +26,76 @@
           "name": "Name der Tonne (z. B. Gelbe Tonne)",
           "add_another": "Weitere Tonne hinzufügen"
         }
+      },
+      "reconfigure": {
+        "title": "Detektor umkonfigurieren",
+        "menu_options": {
+          "reconf_camera": "Kamera-Entität wechseln",
+          "reconf_area": "Bildbereich / Analysebreite ändern",
+          "reconf_view_changed": "Kamera wurde neu ausgerichtet (Blickfeld geändert)",
+          "reconf_add_bin": "Tonne hinzufügen",
+          "reconf_retire_bin": "Tonne stilllegen",
+          "reconf_reactivate_bin": "Stillgelegte Tonne reaktivieren"
+        }
+      },
+      "reconf_camera": {
+        "title": "Kamera wechseln",
+        "description": "Alle Trainingsdaten bleiben erhalten. Beantworten Sie die Blickfeld-Frage ehrlich: Zeigt die neue Kamera einen anderen Bildausschnitt, dürfen alte Geometrie-Belege nicht mit neuen Bildern vermischt werden.",
+        "data": {
+          "camera_entity": "Kamera-Entität",
+          "view_unchanged": "Gleiche Halterung und identischer Bildausschnitt"
+        }
+      },
+      "reconf_view_changed": {
+        "title": "Kamera neu ausgerichtet",
+        "description": "Markiert die Szenen-Zuordnung als geändert (z. B. nach einem Stoß gegen die Kamera, wenn sie sich nicht exakt gleich ausrichten ließ). Alle gespeicherten Daten bleiben erhalten; Flächen-Belege der alten Sicht ruhen, Farb-Samples bleiben aktiv. Beschriften Sie danach einige frische Aufnahmen."
+      },
+      "reconf_area": {
+        "title": "Bildbereich ändern",
+        "description": "Sample-Rechtecke sind relativ zum Vollbild gespeichert und überstehen diese Änderung. Beschriftungen aus einem kleineren Bereich bleiben beim Vergrößern nutzbar; nach Verkleinern oder Verschieben zeigen die Relearn-Warnungen zurückgestellte Beschriftungen.",
+        "data": {
+          "roi_x": "Linke Kante des Bereichs (0-1)",
+          "roi_y": "Obere Kante des Bereichs (0-1)",
+          "roi_w": "Breite des Bereichs (0-1)",
+          "roi_h": "Höhe des Bereichs (0-1)",
+          "working_width": "Analysebreite"
+        }
+      },
+      "reconf_add_bin": {
+        "title": "Tonne hinzufügen",
+        "description": "Die neue Tonne erscheint als Sensor, bleibt aber nicht verfügbar, bis Sie Deckel-Samples zeichnen und neu lernen lassen. Die übrigen Tonnen arbeiten währenddessen weiter.",
+        "data": {
+          "name": "Name der Tonne"
+        }
+      },
+      "reconf_retire_bin": {
+        "title": "Tonne stilllegen",
+        "description": "Die Sensor-Entität dieser Tonne wird entfernt - prüfen Sie Automationen, die sie verwenden. ALLE Trainingsdaten bleiben erhalten und kehren bei Reaktivierung zurück.",
+        "data": {
+          "bin": "Tonne"
+        }
+      },
+      "reconf_reactivate_bin": {
+        "title": "Tonne reaktivieren",
+        "description": "Die Tonne kehrt mit ihrer vollständigen Trainingshistorie zurück. Hat sich die Deckelfarbe seit der Stilllegung geändert, rufen Sie danach den Dienst mark_bin_appearance_changed auf (die Historie bleibt ruhend erhalten).",
+        "data": {
+          "bin": "Tonne"
+        }
       }
     },
     "error": {
       "invalid_roi": "Der Bereich muss innerhalb des Bildes liegen (x+w und y+h höchstens 1, Größen über 0).",
       "invalid_name": "Bitte geben Sie einen Namen ein.",
-      "duplicate_bin": "Eine Tonne mit diesem Namen existiert bereits."
+      "duplicate_bin": "Eine Tonne mit diesem Namen existiert bereits.",
+      "duplicate_detector": "Ein anderer Eintrag überwacht bereits dieselbe Kamera mit demselben Bereich.",
+      "bin_retired": "Eine stillgelegte Tonne mit diesem Namen existiert - nutzen Sie stattdessen \"Stillgelegte Tonne reaktivieren\".",
+      "last_active_bin": "Die letzte aktive Tonne kann nicht stillgelegt werden."
     },
     "abort": {
-      "already_configured": "Für diese Kamera und diesen Bereich ist bereits ein Detektor eingerichtet."
+      "already_configured": "Für diese Kamera und diesen Bereich ist bereits ein Detektor eingerichtet.",
+      "reconfigure_successful": "Umkonfiguration gespeichert.",
+      "no_retired_bins": "Es gibt keine stillgelegten Tonnen.",
+      "no_active_bins": "Es gibt keine aktiven Tonnen."
     }
   },
   "selector": {
@@ -174,6 +235,48 @@
         "filename": {
           "name": "Dateiname",
           "description": "Dateiname des zu vergessenden Bildes."
+        }
+      }
+    },
+    "restore_image": {
+      "name": "Bild wiederherstellen",
+      "description": "Nimmt ein zuvor ausgeschlossenes Bild wieder ins Training auf (forget_image löscht nie, es schließt nur aus).",
+      "fields": {
+        "entry_id": {
+          "name": "Eintrag",
+          "description": "Konfigurationseintrag (bei nur einem Eintrag optional)."
+        },
+        "filename": {
+          "name": "Dateiname",
+          "description": "Dateiname im Archiv."
+        }
+      }
+    },
+    "reconfirm_images": {
+      "name": "Bilder erneut bestätigen",
+      "description": "Bestätigt vorhandene Beschriftungen nach einer Umkonfiguration unter dem aktuellen Bereich und Blickfeld, ohne die Beschriftungen zu ändern. Nur für Bilder verwenden, die Sie visuell erneut geprüft haben.",
+      "fields": {
+        "entry_id": {
+          "name": "Eintrag",
+          "description": "Konfigurationseintrag (bei nur einem Eintrag optional)."
+        },
+        "filenames": {
+          "name": "Dateinamen",
+          "description": "Liste von Archiv-Dateinamen."
+        }
+      }
+    },
+    "mark_bin_appearance_changed": {
+      "name": "Geändertes Tonnen-Aussehen melden",
+      "description": "Der physische Deckel hat sich geändert (z. B. Farbtausch durch die Kommune). Vorhandene Samples und Anwesend-Beschriftungen dieser Tonne ruhen künftig, bleiben aber erhalten; zeichnen Sie danach neue Samples und beschriften Sie frische Aufnahmen.",
+      "fields": {
+        "entry_id": {
+          "name": "Eintrag",
+          "description": "Konfigurationseintrag (bei nur einem Eintrag optional)."
+        },
+        "bin": {
+          "name": "Tonne",
+          "description": "Tonnen-ID (Slug)."
         }
       }
     }

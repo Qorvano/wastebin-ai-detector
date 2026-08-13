@@ -1,0 +1,475 @@
+"""Schema v2: migration, learning view, epochs, dynamic reconfiguration.
+
+Every rule here is exercised against MULTIPLE geometries (grown,
+shrunken, shifted, mirrored-asymmetric ROIs) - a rule that only holds
+for one configuration is a bug by project convention.
+"""
+
+from __future__ import annotations
+
+from dataclasses import replace
+from pathlib import Path
+
+import pytest
+
+from scenes import BLUE, BROWN, YELLOW, inner_rect, make_scene
+from wastebin_ai_detector.core import (
+    BinDecl,
+    CalibrationError,
+    CalibrationStore,
+    ImageEntry,
+    ProfileError,
+    Rect,
+    Roi,
+    SampleRect,
+    learn_profile,
+    learning_view,
+    roi_rect_to_image_rect,
+    store_from_dict,
+    store_to_dict,
+    validate_store,
+)
+
+FIELD_ROI = {"x": 0.24, "y": 0.18, "w": 0.42, "h": 0.78}
+
+
+def _v1_store_dict() -> dict:
+    """A v1 store dict shaped like the real field store."""
+    return {
+        "schema_version": 1,
+        "roi": dict(FIELD_ROI),
+        "working_width": 640,
+        "resample": "bilinear",
+        "bins": [
+            {"id": "gelbe_tonne", "name": "Gelbe Tonne"},
+            {"id": "blaue_tonne", "name": "Blaue Tonne"},
+        ],
+        "images": [
+            {
+                "path": "a.jpg",
+                "samples": {
+                    "gelbe_tonne": [
+                        {"x": 0.5, "y": 0.5, "w": 0.1, "h": 0.1},
+                        # Flush with the ROI edge: x + w == 1.0 exactly.
+                        {"x": 0.9, "y": 0.0, "w": 0.1, "h": 0.2},
+                    ]
+                },
+                "present": ["gelbe_tonne"],
+                "absent": ["blaue_tonne"],
+            },
+            {"path": "b.jpg", "samples": {}, "present": [], "absent": []},
+        ],
+    }
+
+
+class TestMigrationV1V2:
+    def test_rects_move_to_exact_image_space(self):
+        store = store_from_dict(_v1_store_dict())
+        roi = Roi(**FIELD_ROI)
+        sample = store.get_image("a.jpg").samples["gelbe_tonne"][0]
+        # Affine: x_img = roi.x + 0.5 * roi.w, etc.
+        assert sample.rect.x == pytest.approx(0.24 + 0.5 * 0.42, abs=1e-12)
+        assert sample.rect.y == pytest.approx(0.18 + 0.5 * 0.78, abs=1e-12)
+        assert sample.rect.w == pytest.approx(0.5 * 0.42 * 0.2, abs=1e-12)
+        assert sample.roi == roi
+        assert sample.epoch == 0
+
+    def test_edge_flush_rect_survives_and_validates(self):
+        store = store_from_dict(_v1_store_dict())
+        edge = store.get_image("a.jpg").samples["gelbe_tonne"][1]
+        assert edge.rect.x + edge.rect.w <= 1.0
+        validate_store(store)
+
+    def test_labels_get_roi_and_epoch_stamps(self):
+        store = store_from_dict(_v1_store_dict())
+        entry = store.get_image("a.jpg")
+        assert entry.label_roi == Roi(**FIELD_ROI)
+        assert entry.label_epoch == {"gelbe_tonne": 0, "blaue_tonne": 0}
+        assert store.get_image("b.jpg").label_roi is None
+
+    def test_migration_is_idempotent(self):
+        once = store_from_dict(_v1_store_dict())
+        twice = store_from_dict(store_to_dict(once))
+        assert once == twice
+
+    def test_v2_roundtrip_preserves_everything(self):
+        store = store_from_dict(_v1_store_dict())
+        store.forget_image("b.jpg")
+        store.mark_bin_appearance_changed("gelbe_tonne")
+        loaded = store_from_dict(store_to_dict(store))
+        assert loaded == store
+
+    def test_unknown_version_still_rejected(self):
+        bad = _v1_store_dict() | {"schema_version": 3}
+        with pytest.raises(ProfileError):
+            store_from_dict(bad)
+
+
+def _store(roi: Roi, view_epoch: int = 0) -> CalibrationStore:
+    return CalibrationStore(
+        roi=roi,
+        working_width=320,
+        resample="bilinear",
+        bins=[BinDecl("gelb", "Gelbe Tonne"), BinDecl("blau", "Blaue Tonne")],
+        view_epoch=view_epoch,
+    )
+
+
+# Several base geometries: the rules must hold for every one of them.
+GEOMETRIES = [
+    Roi(0.24, 0.18, 0.42, 0.78),
+    Roi(0.0, 0.0, 1.0, 1.0),
+    Roi(0.5, 0.05, 0.45, 0.4),
+]
+
+
+class TestLearningViewContainment:
+    @pytest.mark.parametrize(
+        "base", [g for g in GEOMETRIES if g != Roi(0.0, 0.0, 1.0, 1.0)]
+    )
+    def test_growing_roi_keeps_present_drops_absent(self, base):
+        store = _store(base)
+        store.add_sample("img.jpg", "gelb", Rect(base.x, base.y, 0.05, 0.05))
+        store.set_labels("img.jpg", present=["gelb"], absent=["blau"])
+        # Grow to the full frame: strictly contains every base ROI.
+        store.roi = Roi(0.0, 0.0, 1.0, 1.0)
+        view, warnings = learning_view(store)
+        entry = view.get_image("img.jpg")
+        assert entry.present == ["gelb"]
+        # The newly covered strip may contain the blue bin: absent
+        # claims must not extend beyond the labeled crop.
+        assert entry.absent == []
+        assert any("absent labels set aside" in w for w in warnings)
+
+    @pytest.mark.parametrize("base", GEOMETRIES)
+    def test_shrinking_roi_keeps_absent_gates_present_by_rects(self, base):
+        store = _store(base)
+        # Sample rect in the upper-left corner of the base ROI.
+        inner = Rect(
+            base.x + 0.02 * base.w,
+            base.y + 0.02 * base.h,
+            0.1 * base.w,
+            0.1 * base.h,
+        )
+        store.add_sample("img.jpg", "gelb", inner)
+        store.set_labels("img.jpg", present=["gelb"], absent=["blau"])
+        # Shrink to the upper-left quadrant: still contains the rect.
+        store.roi = Roi(base.x, base.y, base.w / 2, base.h / 2)
+        view, _ = learning_view(store)
+        entry = view.get_image("img.jpg")
+        assert entry.present == ["gelb"]  # rect proves the lid location
+        assert entry.absent == ["blau"]  # subset of a bin-free region
+        # Shrink to the LOWER-right quadrant: rect now outside.
+        store.roi = Roi(
+            base.x + base.w / 2, base.y + base.h / 2, base.w / 2, base.h / 2
+        )
+        view, warnings = learning_view(store)
+        entry = view.get_image("img.jpg")
+        assert entry.present == []
+        assert entry.absent == ["blau"]
+        assert any("present labels set aside" in w for w in warnings)
+
+    def test_present_without_rects_needs_containment(self):
+        store = _store(Roi(0.2, 0.2, 0.5, 0.5))
+        store.set_labels("img.jpg", present=["gelb"])
+        store.roi = Roi(0.25, 0.25, 0.3, 0.3)  # shrunk: no proof left
+        view, _ = learning_view(store)
+        assert view.get_image("img.jpg").present == []
+
+    def test_view_epoch_mismatch_excludes_area_evidence(self):
+        store = _store(Roi(0.2, 0.2, 0.5, 0.5))
+        store.add_sample("img.jpg", "gelb", Rect(0.3, 0.3, 0.1, 0.1))
+        store.set_labels("img.jpg", present=["gelb"], absent=["blau"])
+        store.bump_view_epoch([])
+        view, warnings = learning_view(store)
+        entry = view.get_image("img.jpg")
+        assert entry.present == [] and entry.absent == []
+        # Color samples survive the view change (hue is geometry-free).
+        assert entry.samples["gelb"]
+        assert store.confirm_image_view("img.jpg") is True
+        view, _ = learning_view(store)
+        entry = view.get_image("img.jpg")
+        assert entry.present == ["gelb"] and entry.absent == ["blau"]
+
+
+class TestAppearanceEpochs:
+    def test_bump_dormants_samples_and_present_not_absent(self):
+        store = _store(Roi(0.1, 0.1, 0.8, 0.8))
+        store.add_sample("img.jpg", "gelb", Rect(0.3, 0.3, 0.1, 0.1))
+        store.set_labels("img.jpg", present=["gelb"])
+        store.set_labels("neg.jpg", absent=["gelb"])
+        assert store.mark_bin_appearance_changed("gelb") == 1
+        view, warnings = learning_view(store)
+        assert "gelb" not in view.get_image("img.jpg").samples
+        assert view.get_image("img.jpg").present == []
+        # Background stays background under any lid color.
+        assert view.get_image("neg.jpg").absent == ["gelb"]
+        assert any("appearance epoch" in w for w in warnings)
+
+    def test_epoch_revert_reactivates_old_evidence(self):
+        store = _store(Roi(0.1, 0.1, 0.8, 0.8))
+        store.add_sample("img.jpg", "gelb", Rect(0.3, 0.3, 0.1, 0.1))
+        store.set_labels("img.jpg", present=["gelb"])
+        store.mark_bin_appearance_changed("gelb")
+        decl = store.get_bin("gelb")
+        store.bins[store.bins.index(decl)] = replace(decl, appearance_epoch=0)
+        view, _ = learning_view(store)
+        assert view.get_image("img.jpg").samples["gelb"]
+        assert view.get_image("img.jpg").present == ["gelb"]
+
+    def test_new_samples_after_bump_are_current(self):
+        store = _store(Roi(0.1, 0.1, 0.8, 0.8))
+        store.add_sample("img.jpg", "gelb", Rect(0.3, 0.3, 0.1, 0.1))
+        store.mark_bin_appearance_changed("gelb")
+        store.add_sample("img2.jpg", "gelb", Rect(0.4, 0.4, 0.1, 0.1))
+        view, _ = learning_view(store)
+        assert "gelb" not in view.get_image("img.jpg").samples
+        assert view.get_image("img2.jpg").samples["gelb"][0].epoch == 1
+
+
+class TestBinLifecycle:
+    def test_retired_bin_contributes_nothing_but_keeps_data(self):
+        store = _store(Roi(0.1, 0.1, 0.8, 0.8))
+        store.add_sample("img.jpg", "gelb", Rect(0.3, 0.3, 0.1, 0.1))
+        store.set_labels("img.jpg", present=["gelb"], absent=["blau"])
+        gelb = store.get_bin("gelb")
+        store.bins[store.bins.index(gelb)] = replace(gelb, active=False)
+        validate_store(store)  # retired still counts as declared
+        view, _ = learning_view(store)
+        assert view.bin_ids() == ["blau"]
+        assert "gelb" not in view.get_image("img.jpg").samples
+        assert view.get_image("img.jpg").present == []
+        # The persistent store still has everything.
+        assert store.get_image("img.jpg").samples["gelb"]
+        assert store.get_image("img.jpg").present == ["gelb"]
+
+    def test_sampling_or_labeling_retired_bin_rejected(self):
+        store = _store(Roi(0.1, 0.1, 0.8, 0.8))
+        gelb = store.get_bin("gelb")
+        store.bins[store.bins.index(gelb)] = replace(gelb, active=False)
+        with pytest.raises(CalibrationError):
+            store.add_sample("img.jpg", "gelb", Rect(0.3, 0.3, 0.1, 0.1))
+        with pytest.raises(CalibrationError):
+            store.set_labels("img.jpg", present=["gelb"])
+
+
+class TestCaptureEpochs:
+    def test_unmaterialized_files_keep_their_capture_epoch(self):
+        store = _store(Roi(0.1, 0.1, 0.8, 0.8))
+        store.bump_view_epoch(["old_capture.jpg"])
+        # Materialized AFTER the bump, but captured before it.
+        store.set_labels("old_capture.jpg", present=["gelb"])
+        assert store.get_image("old_capture.jpg").view_epoch == 0
+        assert "old_capture.jpg" not in store.capture_epochs
+        # A genuinely new capture gets the current epoch.
+        store.set_labels("new_capture.jpg", present=["gelb"])
+        assert store.get_image("new_capture.jpg").view_epoch == 1
+
+    def test_capture_epoch_of_existing_entry_untouched(self):
+        store = _store(Roi(0.1, 0.1, 0.8, 0.8))
+        store.set_labels("img.jpg", present=["gelb"])
+        store.bump_view_epoch(["img.jpg"])
+        assert store.get_image("img.jpg").view_epoch == 0
+        assert "img.jpg" not in store.capture_epochs
+
+
+class TestSampleOutsideRoi:
+    def test_out_of_roi_sample_gets_full_frame_grid(self):
+        store = _store(Roi(0.4, 0.4, 0.3, 0.3))
+        store.add_sample("img.jpg", "gelb", Rect(0.05, 0.05, 0.1, 0.1))
+        sample = store.get_image("img.jpg").samples["gelb"][0]
+        assert sample.roi == Roi(0.0, 0.0, 1.0, 1.0)
+        validate_store(store)
+
+    def test_in_roi_sample_gets_current_roi_grid(self):
+        store = _store(Roi(0.4, 0.4, 0.3, 0.3))
+        store.add_sample("img.jpg", "gelb", Rect(0.45, 0.45, 0.1, 0.1))
+        assert store.get_image("img.jpg").samples["gelb"][0].roi == Roi(
+            0.4, 0.4, 0.3, 0.3
+        )
+
+
+ROI_LEARN = Roi(0.25, 0.25, 0.5, 0.5)
+RECT_YELLOW = (0.30, 0.30, 0.10, 0.10)
+RECT_BLUE = (0.45, 0.35, 0.10, 0.10)
+
+
+def _write_scene(path: Path, with_yellow: bool = True, seed: int = 0) -> None:
+    rects = [(BLUE, *RECT_BLUE)]
+    if with_yellow:
+        rects.append((YELLOW, *RECT_YELLOW))
+    make_scene(size=(320, 200), rects=rects, seed=seed).save(path, format="PNG")
+
+
+class TestLearnProfileDynamic:
+    def _base_store(self, tmp_path: Path) -> CalibrationStore:
+        store = CalibrationStore(
+            roi=ROI_LEARN,
+            working_width=160,
+            resample="bilinear",
+            bins=[
+                BinDecl("gelb", "Gelbe Tonne"),
+                BinDecl("blau", "Blaue Tonne"),
+            ],
+        )
+        for name, seed in (("a.png", 0), ("b.png", 3)):
+            _write_scene(tmp_path / name, seed=seed)
+            for bin_id, rect in (("gelb", RECT_YELLOW), ("blau", RECT_BLUE)):
+                store.add_sample(name, bin_id, Rect(*inner_rect(rect)))
+            store.set_labels(name, present=["gelb", "blau"])
+        _write_scene(tmp_path / "neg.png", with_yellow=False, seed=7)
+        store.add_sample("neg.png", "blau", Rect(*inner_rect(RECT_BLUE)))
+        store.set_labels("neg.png", present=["blau"], absent=["gelb"])
+        return store
+
+    def test_bin_without_samples_degrades_not_fails(self, tmp_path):
+        store = self._base_store(tmp_path)
+        store.bins.append(BinDecl("schwarz", "Schwarze Tonne"))
+        profile, warnings = learn_profile(store, tmp_path / "store.json")
+        assert {b.id for b in profile.bins} == {"gelb", "blau"}
+        assert any(
+            "schwarz" in w and "untrained" in w for w in warnings
+        )
+
+    def test_all_bins_untrained_raises(self, tmp_path):
+        store = CalibrationStore(
+            roi=ROI_LEARN,
+            working_width=160,
+            resample="bilinear",
+            bins=[BinDecl("gelb", "Gelbe Tonne")],
+        )
+        _write_scene(tmp_path / "a.png")
+        store.set_labels("a.png", present=["gelb"])  # labels but no samples
+        with pytest.raises(CalibrationError):
+            learn_profile(store, tmp_path / "store.json")
+
+    def test_roi_change_recomputes_thresholds_consistently(self, tmp_path):
+        store = self._base_store(tmp_path)
+        anchor = tmp_path / "store.json"
+        before, _ = learn_profile(store, anchor)
+        # Grow the ROI to the full frame: all present labels stay
+        # usable (containment), areas are recomputed under the larger
+        # denominator, detection profile stays coherent.
+        store.roi = Roi(0.0, 0.0, 1.0, 1.0)
+        after, warnings = learn_profile(store, anchor)
+        assert {b.id for b in after.bins} == {"gelb", "blau"}
+        gelb_before = next(b for b in before.bins if b.id == "gelb")
+        gelb_after = next(b for b in after.bins if b.id == "gelb")
+        # Same blob, four times the reference area: fractions shrink.
+        assert (
+            gelb_after.learning_stats["min_pos_area_frac"]
+            < gelb_before.learning_stats["min_pos_area_frac"]
+        )
+        assert after.roi == Roi(0.0, 0.0, 1.0, 1.0)
+
+    def test_out_of_roi_sample_feeds_color_model(self, tmp_path):
+        # Yellow lid OUTSIDE the configured ROI: the sample must still
+        # produce a color model (full-frame grid) even though area
+        # learning for that bin has no usable positive inside the ROI.
+        store = CalibrationStore(
+            # Contains the blue lid (0.45-0.55, 0.35-0.45) but not the
+            # yellow one (0.30-0.40, 0.30-0.40).
+            roi=Roi(0.42, 0.30, 0.5, 0.5),
+            working_width=160,
+            resample="bilinear",
+            bins=[
+                BinDecl("gelb", "Gelbe Tonne"),
+                BinDecl("blau", "Blaue Tonne"),
+            ],
+        )
+        for name, seed in (("a.png", 0), ("b.png", 3)):
+            _write_scene(tmp_path / name, seed=seed)
+            store.add_sample(name, "gelb", Rect(*inner_rect(RECT_YELLOW)))
+            store.add_sample(name, "blau", Rect(*inner_rect(RECT_BLUE)))
+            store.set_labels(name, present=["blau"])
+        profile, warnings = learn_profile(store, tmp_path / "store.json")
+        # Blue is trainable (inside ROI); yellow degrades to untrained
+        # on the AREA side but its color samples were extractable.
+        assert {b.id for b in profile.bins} == {"blau"}
+        assert any("gelb" in w and "untrained" in w for w in warnings)
+
+    def test_differing_aspect_ratios_warn(self, tmp_path):
+        store = self._base_store(tmp_path)
+        _write_scene(tmp_path / "c.png", seed=9)
+        # Same scene content, different frame aspect (320x200 vs 320x240).
+        make_scene(
+            size=(320, 240),
+            rects=[(YELLOW, *RECT_YELLOW), (BLUE, *RECT_BLUE)],
+            seed=9,
+        ).save(tmp_path / "c.png", format="PNG")
+        store.add_sample("c.png", "gelb", Rect(*inner_rect(RECT_YELLOW)))
+        store.set_labels("c.png", present=["gelb"])
+        _profile, warnings = learn_profile(store, tmp_path / "store.json")
+        assert any("aspect" in w for w in warnings)
+
+
+class TestReviewFindings:
+    """Regressions for the confirmed adversarial-review findings."""
+
+    def test_migration_drops_zero_area_rects_only(self):
+        data = _v1_store_dict()
+        data["images"][0]["samples"]["gelbe_tonne"].append(
+            {"x": 1.0, "y": 0.2, "w": 0.0, "h": 0.1}  # v1 edge-clamp artifact
+        )
+        store = store_from_dict(data)  # must not raise
+        rects = store.get_image("a.jpg").samples["gelbe_tonne"]
+        assert len(rects) == 2  # the two real rects survive
+        assert all(r.rect.w > 0 and r.rect.h > 0 for r in rects)
+
+    def test_confirm_image_view_keeps_appearance_epochs_dormant(self):
+        store = _store(Roi(0.1, 0.1, 0.8, 0.8))
+        store.add_sample("img.jpg", "gelb", Rect(0.3, 0.3, 0.1, 0.1))
+        store.set_labels("img.jpg", present=["gelb"])
+        store.mark_bin_appearance_changed("gelb")
+        store.bump_view_epoch([])
+        assert store.confirm_image_view("img.jpg") is True
+        entry = store.get_image("img.jpg")
+        # View and ROI are re-asserted, the appearance epoch is NOT:
+        # the archived pixels still show the old lid.
+        assert entry.view_epoch == store.view_epoch
+        assert entry.label_epoch["gelb"] == 0
+        view, _ = learning_view(store)
+        assert view.get_image("img.jpg").present == []
+
+    def test_stale_epoch_rect_outside_roi_vetoes_present_label(self):
+        store = _store(Roi(0.0, 0.0, 1.0, 1.0))
+        # Old-color rect on the lid's left edge, then a recolor bump
+        # and a fresh rect on the lid center plus a fresh label.
+        store.add_sample("img.jpg", "gelb", Rect(0.05, 0.4, 0.1, 0.1))
+        store.mark_bin_appearance_changed("gelb")
+        store.add_sample("img.jpg", "gelb", Rect(0.4, 0.4, 0.1, 0.1))
+        store.set_labels("img.jpg", present=["gelb"])
+        # Shrink so the old rect (proving lid extent) falls outside.
+        store.roi = Roi(0.3, 0.3, 0.5, 0.5)
+        view, _ = learning_view(store)
+        assert view.get_image("img.jpg").present == []
+        # Growing back over both rects revives the label.
+        store.roi = Roi(0.0, 0.0, 1.0, 1.0)
+        view, _ = learning_view(store)
+        assert view.get_image("img.jpg").present == ["gelb"]
+
+
+class TestViewScopedStatistics:
+    def test_gates_and_aspect_ignore_stale_view_frames(self, tmp_path):
+        store = CalibrationStore(
+            roi=ROI_LEARN,
+            working_width=160,
+            resample="bilinear",
+            bins=[BinDecl("gelb", "Gelbe Tonne")],
+        )
+        # Old-view frame with a very different aspect and content.
+        make_scene(
+            size=(320, 240), rects=[(YELLOW, *RECT_YELLOW)], seed=1
+        ).save(tmp_path / "old.png", format="PNG")
+        store.add_sample("old.png", "gelb", Rect(*inner_rect(RECT_YELLOW)))
+        store.bump_view_epoch([])
+        for name, seed in (("a.png", 0), ("b.png", 3)):
+            _write_scene(tmp_path / name, seed=seed)
+            store.add_sample(name, "gelb", Rect(*inner_rect(RECT_YELLOW)))
+            store.set_labels(name, present=["gelb"])
+        profile, warnings = learn_profile(store, tmp_path / "store.json")
+        # No cross-format accusation: the old aspect belongs to a
+        # correctly marked older view.
+        assert not any("aspect" in w for w in warnings)
+        # Gate statistics come from the two current-view frames only.
+        assert profile.daylight_stats["n_images"] == 2

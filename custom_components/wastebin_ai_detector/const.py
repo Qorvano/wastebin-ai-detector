@@ -16,6 +16,11 @@ CONF_BIN_NAME = "name"
 CONF_SCAN_INTERVAL = "scan_interval_minutes"
 CONF_CAPTURE_INTERVAL = "capture_interval_minutes"
 CONF_CONFIRM_SCANS = "confirm_scans"
+# Monotone counter in entry.data: bumped when the user declares the
+# scene->frame mapping changed (camera swapped/re-aimed); reconciled
+# into the store's view_epoch on setup.
+CONF_VIEW_GENERATION = "view_generation"
+CONF_BIN_ACTIVE = "active"
 
 # Config DEFAULTS. These are user-changeable schema defaults (a
 # legitimate value source), not hidden in-code thresholds:
@@ -41,9 +46,13 @@ SERVICE_CAPTURE = "capture_snapshot"
 SERVICE_ADD_SAMPLE = "add_sample"
 SERVICE_LABEL_IMAGE = "label_image"
 SERVICE_FORGET_IMAGE = "forget_image"
+SERVICE_RESTORE_IMAGE = "restore_image"
+SERVICE_RECONFIRM_IMAGES = "reconfirm_images"
+SERVICE_MARK_BIN_CHANGED = "mark_bin_appearance_changed"
 
 ATTR_ENTRY_ID = "entry_id"
 ATTR_FILENAME = "filename"
+ATTR_FILENAMES = "filenames"
 ATTR_BIN = "bin"
 ATTR_RECT = "rect"
 ATTR_SPACE = "space"

@@ -26,15 +26,76 @@
           "name": "Bin name (e.g. Yellow bin)",
           "add_another": "Add another bin"
         }
+      },
+      "reconfigure": {
+        "title": "Reconfigure detector",
+        "menu_options": {
+          "reconf_camera": "Change camera entity",
+          "reconf_area": "Change region of interest / working width",
+          "reconf_view_changed": "Camera was re-aimed (view changed)",
+          "reconf_add_bin": "Add a bin",
+          "reconf_retire_bin": "Retire a bin",
+          "reconf_reactivate_bin": "Reactivate a retired bin"
+        }
+      },
+      "reconf_camera": {
+        "title": "Change camera",
+        "description": "All training data is kept. Answer the view question honestly: if the new camera shows a different field of view, old geometry evidence must not mix with new frames.",
+        "data": {
+          "camera_entity": "Camera entity",
+          "view_unchanged": "Same mounting and identical field of view"
+        }
+      },
+      "reconf_view_changed": {
+        "title": "Camera re-aimed",
+        "description": "Marks the scene mapping as changed (for example after the camera was bumped and could not be re-aligned exactly). All stored evidence is kept; area evidence from the old view goes dormant, color samples stay active. Label a few fresh snapshots afterwards."
+      },
+      "reconf_area": {
+        "title": "Change region of interest",
+        "description": "Sample rectangles are stored relative to the full frame and survive this change. Labels made under a smaller region stay usable when the region grows; after shrinking or moving it, check the relearn warnings for set-aside labels.",
+        "data": {
+          "roi_x": "Region left edge (0-1)",
+          "roi_y": "Region top edge (0-1)",
+          "roi_w": "Region width (0-1)",
+          "roi_h": "Region height (0-1)",
+          "working_width": "Analysis width"
+        }
+      },
+      "reconf_add_bin": {
+        "title": "Add a bin",
+        "description": "The new bin appears as a sensor but stays unavailable until you draw lid samples and relearn. Other bins keep working meanwhile.",
+        "data": {
+          "name": "Bin name"
+        }
+      },
+      "reconf_retire_bin": {
+        "title": "Retire a bin",
+        "description": "The bin's sensor entity is removed - check automations that use it. ALL its training data is kept and comes back on reactivation.",
+        "data": {
+          "bin": "Bin"
+        }
+      },
+      "reconf_reactivate_bin": {
+        "title": "Reactivate a bin",
+        "description": "The bin returns with its full training history. If its lid color changed since retirement, call the mark_bin_appearance_changed service afterwards for a fresh color start (history is kept dormant).",
+        "data": {
+          "bin": "Bin"
+        }
       }
     },
     "error": {
       "invalid_roi": "The region must lie inside the image (x+w and y+h at most 1, sizes above 0).",
       "invalid_name": "Please enter a name.",
-      "duplicate_bin": "A bin with this name already exists."
+      "duplicate_bin": "A bin with this name already exists.",
+      "duplicate_detector": "Another entry already watches the same camera and region.",
+      "bin_retired": "A retired bin with this name exists - use \"Reactivate a retired bin\" instead.",
+      "last_active_bin": "The last active bin cannot be retired."
     },
     "abort": {
-      "already_configured": "A detector for this camera and region is already configured."
+      "already_configured": "A detector for this camera and region is already configured.",
+      "reconfigure_successful": "Reconfiguration saved.",
+      "no_retired_bins": "There are no retired bins.",
+      "no_active_bins": "There are no active bins."
     }
   },
   "selector": {
@@ -174,6 +235,48 @@
         "filename": {
           "name": "Filename",
           "description": "Archived snapshot filename to forget."
+        }
+      }
+    },
+    "restore_image": {
+      "name": "Restore image",
+      "description": "Puts a previously forgotten image back into training (forget_image never deletes, it only excludes).",
+      "fields": {
+        "entry_id": {
+          "name": "Entry",
+          "description": "Config entry (optional with a single entry)."
+        },
+        "filename": {
+          "name": "File name",
+          "description": "Archive file name."
+        }
+      }
+    },
+    "reconfirm_images": {
+      "name": "Re-confirm images",
+      "description": "Re-asserts existing labels under the current region and view after a reconfiguration, without changing the labels. Only do this for images you have visually re-checked.",
+      "fields": {
+        "entry_id": {
+          "name": "Entry",
+          "description": "Config entry (optional with a single entry)."
+        },
+        "filenames": {
+          "name": "File names",
+          "description": "List of archive file names."
+        }
+      }
+    },
+    "mark_bin_appearance_changed": {
+      "name": "Mark bin appearance changed",
+      "description": "The physical lid changed (for example the municipality swapped the color). Existing samples and present-labels of this bin go dormant but are kept; draw new samples and label fresh snapshots afterwards.",
+      "fields": {
+        "entry_id": {
+          "name": "Entry",
+          "description": "Config entry (optional with a single entry)."
+        },
+        "bin": {
+          "name": "Bin",
+          "description": "Bin id (slug)."
         }
       }
     }

@@ -9,8 +9,9 @@ Subcommands:
   detect  run detection on an image with a learned profile
 
 Coordinates: the ROI is image-relative (0..1). Sample rectangles are
-stored ROI-relative; pass ``--space image`` to enter them relative to
-the full image instead (they are converted, pure geometry).
+stored image-relative (schema v2, invariant under ROI edits); pass
+``--space roi`` to enter them relative to the current ROI instead
+(they are converted, pure geometry).
 """
 
 from __future__ import annotations
@@ -43,6 +44,7 @@ from wastebin_ai_detector.core import (  # noqa: E402
     learn_profile,
     load_profile,
     load_store,
+    roi_rect_to_image_rect,
     save_profile,
     save_store,
 )
@@ -79,22 +81,40 @@ def cmd_init(args: argparse.Namespace) -> int:
     return 0
 
 
+def _load_store_with_backup(store_path: Path):
+    """Load a store; if it is still schema v1 on disk, keep a one-time
+    backup next to it before any command can overwrite it as v2."""
+    try:
+        raw = json.loads(store_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return load_store(store_path)
+    if int(raw.get("schema_version", 0)) == 1:
+        backup = store_path.with_suffix(store_path.suffix + ".v1.bak")
+        if not backup.exists():
+            backup.write_text(
+                json.dumps(raw, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            print(f"v1 store backed up to {backup}")
+    return load_store(store_path)
+
+
 def cmd_sample(args: argparse.Namespace) -> int:
     store_path = Path(args.store)
-    store = load_store(store_path)
+    store = _load_store_with_backup(store_path)
     rect = Rect(*args.rect)
-    if args.space == "image":
-        rect = store.image_rect_to_roi_rect(rect)
+    if args.space == "roi":
+        rect = roi_rect_to_image_rect(rect, store.roi)
     image = _store_relative_image(store_path, Path(args.image))
     store.add_sample(image, args.bin, rect)
     save_store(store, store_path)
-    print(f"sample added: {image} / {args.bin} / rect(roi)={rect}")
+    print(f"sample added: {image} / {args.bin} / rect(image)={rect}")
     return 0
 
 
 def cmd_label(args: argparse.Namespace) -> int:
     store_path = Path(args.store)
-    store = load_store(store_path)
+    store = _load_store_with_backup(store_path)
     image = _store_relative_image(store_path, Path(args.image))
     store.set_labels(image, present=args.present, absent=args.absent)
     save_store(store, store_path)

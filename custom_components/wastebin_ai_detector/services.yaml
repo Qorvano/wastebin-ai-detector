@@ -86,3 +86,42 @@ forget_image:
       example: "20260811_131029.jpg"
       selector:
         text:
+
+restore_image:
+  fields:
+    entry_id:
+      required: false
+      selector:
+        config_entry:
+          integration: wastebin_ai_detector
+    filename:
+      required: true
+      example: "20260811_131029.jpg"
+      selector:
+        text:
+
+reconfirm_images:
+  fields:
+    entry_id:
+      required: false
+      selector:
+        config_entry:
+          integration: wastebin_ai_detector
+    filenames:
+      required: true
+      example: "[20260811_131029.jpg, 20260811_140102.jpg]"
+      selector:
+        object:
+
+mark_bin_appearance_changed:
+  fields:
+    entry_id:
+      required: false
+      selector:
+        config_entry:
+          integration: wastebin_ai_detector
+    bin:
+      required: true
+      example: "gelbe_tonne"
+      selector:
+        text:

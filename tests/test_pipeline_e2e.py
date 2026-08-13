@@ -103,7 +103,7 @@ def _build_store(tmp_path: Path, fmt: str = "PNG", qualities: tuple = ()):
             store.add_sample(
                 p_all.name,
                 bin_id,
-                store.image_rect_to_roi_rect(Rect(*inner_rect(rect))),
+                Rect(*inner_rect(rect)),
             )
         store.set_labels(p_all.name, present=["gelb", "blau", "braun"])
     for p_missing in missing_paths:
@@ -111,7 +111,7 @@ def _build_store(tmp_path: Path, fmt: str = "PNG", qualities: tuple = ()):
             store.add_sample(
                 p_missing.name,
                 bin_id,
-                store.image_rect_to_roi_rect(Rect(*inner_rect(rect))),
+                Rect(*inner_rect(rect)),
             )
         store.set_labels(p_missing.name, present=["blau", "braun"], absent=["gelb"])
     store_path = tmp_path / "store.json"

@@ -50,10 +50,16 @@ from .color import (
     vonmises_kappa_from_resultant,
 )
 from .detect import bin_mask
-from .errors import CalibrationError, ImageLoadError
+from .errors import CalibrationError, ImageLoadError, RoiError
 from .imageio import extract_working_roi, load_image_rgb, rect_to_pixels
-from .profile import BinModel, Profile
-from .store import CalibrationStore, resolve_image_path, validate_store
+from .profile import BinModel, Profile, Roi
+from .store import (
+    CalibrationStore,
+    image_rect_in_roi,
+    learning_view,
+    resolve_image_path,
+    validate_store,
+)
 
 HUE_TOL_PERCENTILE = 95.0
 SV_MIN_PERCENTILE = 5.0
@@ -330,28 +336,77 @@ def _hue_bands_overlap(a: BinModel, b: BinModel) -> bool:
 def learn_profile(
     store: CalibrationStore, store_path: str | Path
 ) -> tuple[Profile, list[str]]:
-    """Full recomputation: store → profile. Returns (profile, warnings)."""
-    validate_store(store)
-    warnings: list[str] = []
+    """Full recomputation: store → profile. Returns (profile, warnings).
 
-    # One pass through the single shared pipeline per image. Images
-    # whose file vanished from the archive are skipped with a loud
-    # warning instead of poisoning every future relearn: the store may
-    # legitimately outlive individual snapshot files.
-    hsv_by_image: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+    The store is first passed through :func:`learning_view`, which
+    decides - purely geometrically and via epoch stamps - which stored
+    evidence counts under the CURRENT configuration. A bin whose
+    evidence is not learnable right now degrades to "untrained"
+    (warning, absent from the profile, its sensor stays unavailable)
+    instead of failing the whole relearn; the hard error remains only
+    when nothing at all is learnable.
+    """
+    validate_store(store)
+    store, warnings = learning_view(store)
+    if not store.bins:
+        raise CalibrationError("store declares no active bins")
+
+    # One full-frame load per image; ROI grids are extracted on demand
+    # per (image, roi) pair below. Images whose file vanished from the
+    # archive are skipped with a loud warning instead of poisoning
+    # every future relearn: the store may legitimately outlive
+    # individual snapshot files.
+    frames: dict[str, np.ndarray] = {}
     usable_images: list = []
+    # Aspect ratios only of CURRENT-view frames: older-view images stay
+    # in the set for their color samples and may legitimately have a
+    # different format after a marked camera swap.
+    aspects: set[tuple[int, int]] = set()
     for entry in store.images:
         try:
             img = load_image_rgb(resolve_image_path(store_path, entry.path))
         except ImageLoadError as exc:
             warnings.append(f"skipping calibration image: {exc}")
             continue
-        arr = extract_working_roi(img, store.roi, store.working_width, store.resample)
-        hsv_by_image[entry.path] = rgb_to_hsv(arr)
+        frames[entry.path] = img
+        if entry.view_epoch == store.view_epoch:
+            width, height = img.size
+            divisor = math.gcd(width, height)
+            aspects.add((width // divisor, height // divisor))
         usable_images.append(entry)
+    # Exact, threshold-free cross-check: relative coordinates are only
+    # comparable between frames of identical aspect ratio. Mixed
+    # aspects inside one view epoch mean the camera (or its stream
+    # format) changed without the view being marked as changed.
+    if len(aspects) > 1:
+        warnings.append(
+            "calibration images have differing aspect ratios "
+            f"({sorted(aspects)}) - was the camera changed without "
+            "marking the view as changed? Area evidence across formats "
+            "is not comparable"
+        )
 
-    # 1) Color models from pooled sample rectangles.
+    hsv_cache: dict[
+        tuple[str, Roi], tuple[np.ndarray, np.ndarray, np.ndarray]
+    ] = {}
+
+    def hsv_for(path: str, roi: Roi) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        key = (path, roi)
+        if key not in hsv_cache:
+            arr = extract_working_roi(
+                frames[path], roi, store.working_width, store.resample
+            )
+            hsv_cache[key] = rgb_to_hsv(arr)
+        return hsv_cache[key]
+
+    # 1) Color models from pooled sample rectangles. Every rect is
+    # extracted through its own draw-time ROI grid (SampleRect.roi):
+    # the pixels the user marked stay the pixels that are learned, no
+    # matter how often the ROI changes afterwards. Color statistics
+    # tolerate mixing extraction grids (hue does not depend on the
+    # crop); area learning below never does.
     bins: list[BinModel] = []
+    untrained: dict[str, str] = {}
     for decl in store.bins:
         hue_parts: list[np.ndarray] = []
         sat_parts: list[np.ndarray] = []
@@ -362,25 +417,44 @@ def learn_profile(
             if not rects:
                 continue
             n_sample_images += 1
-            hue, sat, val = hsv_by_image[entry.path]
-            height, width = sat.shape
-            for rect in rects:
-                x0, y0, x1, y1 = rect_to_pixels(
-                    rect.x, rect.y, rect.w, rect.h, width, height
-                )
+            for sample in rects:
+                grid = image_rect_in_roi(sample.rect, sample.roi)
+                if grid is None:  # guarded by validate_store already
+                    continue
+                hue, sat, val = hsv_for(entry.path, sample.roi)
+                height, width = sat.shape
+                try:
+                    x0, y0, x1, y1 = rect_to_pixels(
+                        grid.x, grid.y, grid.w, grid.h, width, height
+                    )
+                except RoiError as exc:
+                    # A rect that rounds to zero pixels on its grid
+                    # carries no evidence: skip it instead of aborting
+                    # the whole relearn.
+                    warnings.append(
+                        f"bin {decl.id}: skipping sample rect in "
+                        f"{entry.path} - {exc}"
+                    )
+                    continue
                 hue_parts.append(hue[y0:y1, x0:x1].ravel())
                 sat_parts.append(sat[y0:y1, x0:x1].ravel())
                 val_parts.append(val[y0:y1, x0:x1].ravel())
-        if not hue_parts:
-            raise CalibrationError(
-                f"bin {decl.id}: no sample rectangles in any calibration image"
+        try:
+            if not hue_parts:
+                raise CalibrationError(
+                    f"bin {decl.id}: no usable sample rectangles in any "
+                    "calibration image"
+                )
+            color = learn_color_model(
+                np.concatenate(hue_parts),
+                np.concatenate(sat_parts),
+                np.concatenate(val_parts),
+                bin_id=decl.id,
             )
-        color = learn_color_model(
-            np.concatenate(hue_parts),
-            np.concatenate(sat_parts),
-            np.concatenate(val_parts),
-            bin_id=decl.id,
-        )
+        except CalibrationError as exc:
+            untrained[decl.id] = str(exc)
+            warnings.append(f"bin {decl.id}: untrained - {exc}")
+            continue
         warnings.extend(color.warnings)
         color.stats["n_sample_images"] = n_sample_images
         # Singular-vs-plural condition, not a tuned cutoff: percentile
@@ -407,7 +481,9 @@ def learn_profile(
             )
         )
 
-    # 2) Area thresholds on top of the final color models.
+    # 2) Area thresholds on top of the final color models, computed
+    # under the CURRENT ROI only (the exact grid detection runs on).
+    trained: list[BinModel] = []
     for model in bins:
         pos_areas: list[float] = []
         neg_areas: list[float] = []
@@ -418,14 +494,26 @@ def learn_profile(
                 target = neg_areas
             else:
                 continue
-            hue, sat, val = hsv_by_image[entry.path]
+            hue, sat, val = hsv_for(entry.path, store.roi)
             total = sat.shape[0] * sat.shape[1]
             area = largest_component_area(bin_mask(hue, sat, val, model))
             target.append(area / total)
-        result = learn_area_threshold(pos_areas, neg_areas, bin_id=model.id)
+        try:
+            result = learn_area_threshold(pos_areas, neg_areas, bin_id=model.id)
+        except CalibrationError as exc:
+            untrained[model.id] = str(exc)
+            warnings.append(f"bin {model.id}: untrained - {exc}")
+            continue
         warnings.extend(result.warnings)
         model.min_area_frac = result.min_area_frac
         model.learning_stats.update(result.stats)
+        trained.append(model)
+    bins = trained
+    if not bins:
+        raise CalibrationError(
+            "no bin could be trained: "
+            + "; ".join(f"{b}: {reason}" for b, reason in untrained.items())
+        )
 
     # 3) Daylight quality gates (all calibration images are daylight by
     # contract - documented calibration rule). Alongside the saturation
@@ -439,8 +527,14 @@ def learn_profile(
     median_sats: list[float] = []
     clip_fracs: list[float] = []
     median_vals: list[float] = []
+    # Gate statistics only from CURRENT-view frames: the current ROI
+    # crop of an old-view frame depicts a different scene region, and
+    # its light statistics would poison the gates (same reasoning as
+    # clearing gate_samples on a view bump).
     for e in usable_images:
-        _hue, sat, val = hsv_by_image[e.path]
+        if e.view_epoch != store.view_epoch:
+            continue
+        _hue, sat, val = hsv_for(e.path, store.roi)
         median_sats.append(float(np.median(sat)))
         clip_fracs.append(float(np.mean(val >= clip_floor)))
         median_vals.append(float(np.median(val)))

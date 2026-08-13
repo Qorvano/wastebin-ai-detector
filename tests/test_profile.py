@@ -9,14 +9,15 @@ from wastebin_ai_detector.core import (
     BinModel,
     CalibrationError,
     CalibrationStore,
+    learning_view,
+    load_profile,
+    load_store,
     Profile,
+    profile_from_dict,
+    profile_to_dict,
     ProfileError,
     Rect,
     Roi,
-    load_profile,
-    load_store,
-    profile_from_dict,
-    profile_to_dict,
     save_profile,
     save_store,
     validate_store,
@@ -117,13 +118,23 @@ def test_store_conflicting_labels_rejected():
         store.set_labels("x.png", present=["gelb"], absent=["gelb"])
 
 
-def test_store_forget_image():
+def test_store_forget_image_is_soft_and_reversible():
     store = _valid_store()
     store.add_sample("img1.png", "gelb", Rect(0.1, 0.1, 0.2, 0.2))
     store.set_labels("img1.png", present=["gelb"])
     assert store.forget_image("img1.png") is True
-    assert store.get_image("img1.png") is None
-    assert store.forget_image("img1.png") is False
+    entry = store.get_image("img1.png")
+    # Nothing is deleted: the entry keeps samples and labels and is
+    # merely excluded from learning until restored.
+    assert entry is not None and entry.excluded is True
+    assert entry.present == ["gelb"] and entry.samples["gelb"]
+    view, _warnings = learning_view(store)
+    assert view.get_image("img1.png") is None
+    assert store.restore_image("img1.png") is True
+    assert store.get_image("img1.png").excluded is False
+    view, _warnings = learning_view(store)
+    assert view.get_image("img1.png") is not None
+    assert store.forget_image("missing.png") is False
 
 
 def test_store_relabel_moves_bin():
