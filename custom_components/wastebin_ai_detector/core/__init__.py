@@ -21,6 +21,7 @@ from .detect import (
     detect,
     detect_file,
     is_uncertain,
+    row_duplicate_fraction,
 )
 from .errors import (
     CalibrationError,
@@ -118,6 +119,7 @@ __all__ = [
     "roi_equal",
     "roi_rect_to_image_rect",
     "roi_to_pixels",
+    "row_duplicate_fraction",
     "RoiError",
     "SampleRect",
     "save_profile",

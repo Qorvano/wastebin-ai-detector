@@ -49,7 +49,7 @@ from .color import (
     rgb_to_hsv,
     vonmises_kappa_from_resultant,
 )
-from .detect import bin_mask
+from .detect import bin_mask, row_duplicate_fraction
 from .errors import CalibrationError, ImageLoadError, RoiError
 from .imageio import extract_working_roi, load_image_rgb, rect_to_pixels
 from .profile import BinModel, Profile, Roi
@@ -309,9 +309,10 @@ def derive_quality_gates(
     if not gate_samples:
         return None
     arr = np.asarray(gate_samples, dtype=np.float64)
-    if arr.ndim != 2 or arr.shape[1] != 3:
+    if arr.ndim != 2 or arr.shape[1] != 4:
         raise CalibrationError(
-            f"gate samples must be [sat, val, clip] triples, got shape {arr.shape}"
+            "gate samples must be [sat, val, clip, row_dup] quadruples, "
+            f"got shape {arr.shape}"
         )
 
     def slack(series: np.ndarray) -> float:
@@ -319,11 +320,12 @@ def derive_quality_gates(
             return 0.0
         return float(np.median(np.abs(np.diff(series))))
 
-    sats, vals, clips = arr[:, 0], arr[:, 1], arr[:, 2]
+    sats, vals, clips, dups = arr[:, 0], arr[:, 1], arr[:, 2], arr[:, 3]
     return {
         "daylight_sat_min": max(float(sats.min()) - slack(sats), 0.0),
         "daylight_val_max": min(float(vals.max()) + slack(vals), 1.0),
         "overexposure_clip_max": min(float(clips.max()) + slack(clips), 1.0),
+        "row_dup_max": min(float(dups.max()) + slack(dups), 1.0),
     }
 
 
@@ -527,6 +529,7 @@ def learn_profile(
     median_sats: list[float] = []
     clip_fracs: list[float] = []
     median_vals: list[float] = []
+    row_dups: list[float] = []
     # Gate statistics only from CURRENT-view frames: the current ROI
     # crop of an old-view frame depicts a different scene region, and
     # its light statistics would poison the gates (same reasoning as
@@ -538,17 +541,26 @@ def learn_profile(
         median_sats.append(float(np.median(sat)))
         clip_fracs.append(float(np.mean(val >= clip_floor)))
         median_vals.append(float(np.median(val)))
+        row_dups.append(
+            row_duplicate_fraction(
+                extract_working_roi(
+                    frames[e.path], store.roi, store.working_width, store.resample
+                )
+            )
+        )
     if not median_sats:
         raise CalibrationError("store contains no usable calibration images")
     daylight_sat_min = min(median_sats)
     overexposure_clip_max = max(clip_fracs)
     daylight_val_max = max(median_vals)
+    row_dup_max = max(row_dups)
     daylight_stats = {
         "n_images": len(median_sats),
         "min_median_sat": daylight_sat_min,
         "median_of_medians": float(np.median(np.asarray(median_sats))),
         "max_clip_frac": overexposure_clip_max,
         "max_median_val": daylight_val_max,
+        "max_row_dup_frac": row_dup_max,
     }
 
     # 4) Ambiguity diagnosis: overlapping learned hue bands.
@@ -570,6 +582,7 @@ def learn_profile(
         daylight_sat_min=daylight_sat_min,
         overexposure_clip_max=overexposure_clip_max,
         daylight_val_max=daylight_val_max,
+        row_dup_max=row_dup_max,
         daylight_stats=daylight_stats,
         bins=bins,
     )

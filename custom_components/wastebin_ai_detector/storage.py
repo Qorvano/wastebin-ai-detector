@@ -78,6 +78,9 @@ def widen_profile_gates(
     if gates["daylight_val_max"] > profile.daylight_val_max:
         profile.daylight_val_max = gates["daylight_val_max"]
         widened = True
+    if gates["row_dup_max"] > profile.row_dup_max:
+        profile.row_dup_max = gates["row_dup_max"]
+        widened = True
     return widened
 
 
@@ -243,9 +246,14 @@ class WastebinStorage:
         if data.get("profile"):
             self.profile = profile_from_dict(data["profile"])
         self.learning = bool(data.get("learning", True))
+        # Pre-0.3.4 samples were [sat, val, clip] triples; the window is
+        # an ephemeral one-day diagnostic and regenerates from live
+        # frames, so old-format entries are simply dropped (the already
+        # widened profile gates are persisted separately).
         self.gate_samples = [
             [float(v) for v in sample]
             for sample in data.get("gate_samples", [])
+            if len(sample) == 4
         ]
         # Legacy stores (pre-2.3) carry no marker: assume the profile
         # matches the loaded view so the upgrade itself never flags a

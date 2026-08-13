@@ -39,6 +39,46 @@ def is_uncertain(area_frac: float, learning_stats: dict[str, Any]) -> bool:
     return lo < area_frac < hi
 
 
+def row_duplicate_fraction(arr: np.ndarray) -> float:
+    """Fraction of adjacent working-image row pairs that are duplicates.
+
+    Broken video keyframes are concealed by repeating the last decoded
+    row downward (vertical smear); such frames have plausible color
+    statistics but carry no scene content below the break. Two rows
+    whose mean absolute channel difference is at most one 8-bit quantum
+    are indistinguishable from encoder row repetition - the same
+    quantization derivation as the clip floor, not a chosen value.
+
+    A pair counts as duplicated only when EVERY signal column matches
+    within one quantum (maximum, not mean): true row repetition is
+    columnwise identical, while merely smooth image regions always
+    carry at least one column of residual texture above a quantum - a
+    mean would blur that distinction on heavily compressed frames.
+
+    Clipped pixels are excluded from the comparison: saturation makes
+    them identical by construction of the sensor limit, so a blown
+    highlight region says nothing about smear (and an overexposed but
+    genuine frame must stay a case for the overexposure gate, not this
+    one). A row pair with no unclipped column carries no signal and is
+    excluded from the statistic entirely.
+    """
+    if arr.shape[0] < 2:
+        return 0.0
+    quantum = 1.0 / RGB_8BIT_LEVELS
+    clip_floor = 1.0 - quantum
+    upper, lower = arr[:-1], arr[1:]
+    # A pixel is clipped when its brightest channel sits at the sensor
+    # ceiling (same definition as clip_frac).
+    signal = (upper.max(axis=2) < clip_floor) | (lower.max(axis=2) < clip_floor)
+    pair_has_signal = signal.any(axis=1)
+    if not bool(pair_has_signal.any()):
+        return 0.0
+    diff = np.abs(upper - lower).mean(axis=2)
+    col_max = np.where(signal, diff, 0.0).max(axis=1)
+    dup = (col_max <= quantum) & pair_has_signal
+    return float(dup.sum() / pair_has_signal.sum())
+
+
 def bin_mask(
     hue: np.ndarray, sat: np.ndarray, val: np.ndarray, model: BinModel
 ) -> np.ndarray:
@@ -83,6 +123,8 @@ class DetectionResult:
     median_val: float = 0.0
     clip_frac: float = 0.0
     overexposure_suspect: bool = False
+    row_dup_frac: float = 0.0
+    frame_integrity_suspect: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -90,8 +132,10 @@ class DetectionResult:
             "median_sat": self.median_sat,
             "median_val": self.median_val,
             "clip_frac": self.clip_frac,
+            "row_dup_frac": self.row_dup_frac,
             "grayscale_suspect": self.grayscale_suspect,
             "overexposure_suspect": self.overexposure_suspect,
+            "frame_integrity_suspect": self.frame_integrity_suspect,
             "working_size": list(self.working_size),
         }
 
@@ -122,11 +166,17 @@ def detect(img: Image.Image, profile: Profile) -> DetectionResult:
     # Same derivation as in the learner: one 8-bit quantum below full
     # brightness marks a pixel as clipped or about to clip.
     clip_frac = float(np.mean(val >= 1.0 - 1.0 / RGB_8BIT_LEVELS))
+    row_dup_frac = row_duplicate_fraction(arr)
     return DetectionResult(
         bins=results,
         median_sat=median_sat,
         median_val=median_val,
         clip_frac=clip_frac,
+        row_dup_frac=row_dup_frac,
+        # More duplicated rows than any calibrated frame ever showed:
+        # the frame is likely a smeared/truncated keyframe, its color
+        # statistics describe garbage, not the scene.
+        frame_integrity_suspect=row_dup_frac > profile.row_dup_max,
         # Below the least-saturated daylight calibration image → likely
         # an IR/greyscale night frame; color detection is unreliable.
         grayscale_suspect=median_sat < profile.daylight_sat_min,

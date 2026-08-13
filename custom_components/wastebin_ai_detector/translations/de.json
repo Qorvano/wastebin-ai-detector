@@ -146,7 +146,8 @@
           "detect_error": "Analysefehler",
           "not_calibrated": "Nicht kalibriert",
           "watchdog_timeout": "Analyse vom Watchdog abgebrochen",
-          "previous_run_still_busy": "Vorherige Analyse läuft noch"
+          "previous_run_still_busy": "Vorherige Analyse läuft noch",
+          "hold_frame_integrity": "Hält: beschädigtes Kamerabild"
         }
       }
     }

@@ -81,6 +81,10 @@ class Profile:
     # never fire until the next relearn fills in real learned maxima.
     overexposure_clip_max: float = 1.0
     daylight_val_max: float = 1.0
+    # Frame-integrity gate: maximum observed fraction of duplicated
+    # adjacent rows (encoder error concealment repeats rows on broken
+    # keyframes). Same permissive-default pattern as above.
+    row_dup_max: float = 1.0
 
 
 def validate_profile(profile: Profile) -> None:
@@ -102,6 +106,7 @@ def validate_profile(profile: Profile) -> None:
     for name, value in (
         ("overexposure_clip_max", profile.overexposure_clip_max),
         ("daylight_val_max", profile.daylight_val_max),
+        ("row_dup_max", profile.row_dup_max),
     ):
         if not 0.0 <= value <= 1.0:
             raise ProfileError(f"{name} outside [0, 1]: {value}")
@@ -153,6 +158,7 @@ def profile_to_dict(profile: Profile) -> dict[str, Any]:
         "daylight_sat_min": data["daylight_sat_min"],
         "overexposure_clip_max": data["overexposure_clip_max"],
         "daylight_val_max": data["daylight_val_max"],
+        "row_dup_max": data["row_dup_max"],
         "daylight_stats": data["daylight_stats"],
         "bins": data["bins"],
     }
@@ -170,6 +176,7 @@ def profile_from_dict(data: dict[str, Any]) -> Profile:
             daylight_sat_min=float(data["daylight_sat_min"]),
             overexposure_clip_max=float(data.get("overexposure_clip_max", 1.0)),
             daylight_val_max=float(data.get("daylight_val_max", 1.0)),
+            row_dup_max=float(data.get("row_dup_max", 1.0)),
             daylight_stats=dict(data.get("daylight_stats", {})),
             bins=[
                 BinModel(

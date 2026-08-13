@@ -473,3 +473,58 @@ class TestViewScopedStatistics:
         assert not any("aspect" in w for w in warnings)
         # Gate statistics come from the two current-view frames only.
         assert profile.daylight_stats["n_images"] == 2
+
+
+class TestFrameIntegrity:
+    """v0.3.4: smeared/truncated keyframes must be caught by the
+    learned row-duplication gate (field incident 2026-08-12)."""
+
+    @staticmethod
+    def _smear(path: Path, source: Path, keep_top: float) -> None:
+        """Replicate the last kept row downward, like ffmpeg error
+        concealment on a truncated keyframe."""
+        import numpy as np
+        from PIL import Image
+
+        arr = np.array(Image.open(source).convert("RGB"))
+        cut = max(int(arr.shape[0] * keep_top), 1)
+        arr[cut:] = arr[cut - 1]
+        Image.fromarray(arr).save(path, format="PNG")
+
+    def test_smear_frame_flagged_clean_frame_not(self, tmp_path):
+        from wastebin_ai_detector.core import detect_file
+
+        store = CalibrationStore(
+            roi=ROI_LEARN,
+            working_width=160,
+            resample="bilinear",
+            bins=[BinDecl("gelb", "Gelbe Tonne")],
+        )
+        for name, seed in (("a.png", 0), ("b.png", 3)):
+            _write_scene(tmp_path / name, seed=seed)
+            store.add_sample(name, "gelb", Rect(*inner_rect(RECT_YELLOW)))
+            store.set_labels(name, present=["gelb"])
+        profile, _ = learn_profile(store, tmp_path / "store.json")
+        # Noisy synthetic scenes have (near) zero duplicated rows.
+        assert profile.row_dup_max < 0.5
+        assert profile.daylight_stats["max_row_dup_frac"] == profile.row_dup_max
+
+        clean = detect_file(tmp_path / "a.png", profile)
+        assert clean.frame_integrity_suspect is False
+
+        self._smear(tmp_path / "smear.png", tmp_path / "a.png", keep_top=0.15)
+        smeared = detect_file(tmp_path / "smear.png", profile)
+        assert smeared.row_dup_frac > profile.row_dup_max
+        assert smeared.frame_integrity_suspect is True
+
+    def test_row_duplicate_fraction_bounds(self):
+        import numpy as np
+
+        from wastebin_ai_detector.core import row_duplicate_fraction
+
+        rng = np.random.default_rng(11)
+        noisy = rng.uniform(0.0, 1.0, (50, 40, 3))
+        assert row_duplicate_fraction(noisy) == 0.0
+        flat = np.tile(noisy[0:1], (50, 1, 1))
+        assert row_duplicate_fraction(flat) == 1.0
+        assert row_duplicate_fraction(noisy[:1]) == 0.0  # single row

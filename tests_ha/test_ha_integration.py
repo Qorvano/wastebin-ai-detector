@@ -874,3 +874,62 @@ async def test_closed_storage_never_writes_and_removal_exports(
 
         exported = _json.loads(mirror.read_text(encoding="utf-8"))
         assert any(e["path"] == filename for e in exported["images"])
+
+
+def _smear_jpeg(base: bytes, keep_top: float = 0.15) -> bytes:
+    """Corrupted-keyframe stand-in: rows below the cut repeat the last
+    real row, exactly like ffmpeg error concealment."""
+    import numpy as np
+    from PIL import Image
+
+    arr = np.array(Image.open(io.BytesIO(base)).convert("RGB"))
+    cut = max(int(arr.shape[0] * keep_top), 1)
+    arr[cut:] = arr[cut - 1]
+    buffer = io.BytesIO()
+    Image.fromarray(arr).save(buffer, format="JPEG", quality=90)
+    return buffer.getvalue()
+
+
+async def test_smeared_frame_holds_and_is_never_absorbed(
+    hass: HomeAssistant,
+) -> None:
+    entry = MockConfigEntry(
+        domain=DOMAIN, data=ENTRY_DATA, title="Test", minor_version=2
+    )
+    entry.add_to_hass(hass)
+    clean = _scene_jpeg(with_yellow=True)
+    feed = _CameraFeed(clean)
+    with patch(
+        "custom_components.wastebin_ai_detector.coordinator.async_get_image",
+        new=feed,
+    ), patch(
+        "custom_components.wastebin_ai_detector.coordinator.is_up",
+        return_value=True,
+    ):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        await _calibrate_yellow(hass)
+        coordinator = entry.runtime_data.coordinator
+        assert hass.states.get("binary_sensor.test_gelbe_tonne").state == "on"
+        samples_before = len(entry.runtime_data.storage.gate_samples)
+
+        feed.content = _smear_jpeg(clean)
+        await coordinator.async_refresh()
+        await hass.async_block_till_done()
+
+        assert coordinator.diagnostics["outcome"] == "hold_frame_integrity"
+        assert (
+            coordinator.diagnostics["row_dup_frac"]
+            > coordinator.diagnostics["limit_row_dup_max"]
+        )
+        # State held, nothing absorbed (the gate must never learn the
+        # pathology as normal light).
+        assert hass.states.get("binary_sensor.test_gelbe_tonne").state == "on"
+        assert (
+            len(entry.runtime_data.storage.gate_samples) == samples_before
+        )
+
+        feed.content = clean
+        await coordinator.async_refresh()
+        await hass.async_block_till_done()
+        assert coordinator.diagnostics["outcome"] == "ok"

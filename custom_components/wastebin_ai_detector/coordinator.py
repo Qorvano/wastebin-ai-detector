@@ -32,6 +32,8 @@ from homeassistant.helpers.update_coordinator import (
 from homeassistant.util import dt as dt_util
 
 from .const import (
+    CONF_BIN_ACTIVE,
+    CONF_BINS,
     CONF_CAMERA,
     CONF_CAPTURE_INTERVAL,
     CONF_CONFIRM_SCANS,
@@ -74,7 +76,13 @@ class WastebinCoordinator(DataUpdateCoordinator[DetectionResult]):
         self.last_daylight_update: datetime | None = None
         self.last_greyscale_skip: datetime | None = None
         self.last_overexposure_skip: datetime | None = None
+        self.last_frame_integrity_skip: datetime | None = None
         self.last_confident_update: dict[str, datetime] = {}
+        self._active_bin_ids: set[str] = {
+            b["id"]
+            for b in entry.data.get(CONF_BINS, [])
+            if b.get(CONF_BIN_ACTIVE, True)
+        }
         self._confirm_scans: int = int(
             entry.options.get(CONF_CONFIRM_SCANS, DEFAULT_CONFIRM_SCANS)
         )
@@ -103,11 +111,13 @@ class WastebinCoordinator(DataUpdateCoordinator[DetectionResult]):
             diag["median_sat"] = result.median_sat
             diag["median_val"] = result.median_val
             diag["clip_frac"] = result.clip_frac
+            diag["row_dup_frac"] = result.row_dup_frac
         profile = self.storage.profile
         if profile is not None:
             diag["limit_daylight_sat_min"] = profile.daylight_sat_min
             diag["limit_overexposure_clip_max"] = profile.overexposure_clip_max
             diag["limit_daylight_val_max"] = profile.daylight_val_max
+            diag["limit_row_dup_max"] = profile.row_dup_max
         diag.update(extra)
         self.diagnostics = diag
 
@@ -159,6 +169,36 @@ class WastebinCoordinator(DataUpdateCoordinator[DetectionResult]):
             self._set_diagnostics("detect_error", error=str(err))
             raise UpdateFailed(f"detection failed: {err}") from err
         now = dt_util.utcnow()
+        # Retired bins may linger in the profile until the next relearn
+        # lands; their results have no entity and must not steer the
+        # stability logic (e.g. the cold-start ambiguity hold).
+        result = replace(
+            result,
+            bins=[b for b in result.bins if b.id in self._active_bin_ids],
+        )
+        if result.frame_integrity_suspect:
+            # A smeared/truncated frame has PLAUSIBLE color statistics
+            # (it repeats real rows), so it must be rejected before the
+            # light gates even look at it - and never absorbed, or the
+            # gate would learn the pathology as normal.
+            self.last_frame_integrity_skip = now
+            self._pending_flips.clear()
+            self._set_diagnostics(
+                "hold_frame_integrity",
+                result,
+                held_previous_state=self.data is not None,
+                hint=(
+                    "the camera stream delivered a corrupted frame "
+                    "(duplicated rows); check camera/stream health if "
+                    "this persists"
+                ),
+            )
+            if self.data is not None:
+                return self.data
+            raise UpdateFailed(
+                "frame integrity suspect (smeared/truncated keyframe) and "
+                "no prior result yet; waiting for a clean frame"
+            )
         if result.grayscale_suspect or result.overexposure_suspect:
             # Degraded evidence (IR night frame or harsher light than
             # anything calibrated): hold the last accepted state rather
@@ -267,7 +307,12 @@ class WastebinCoordinator(DataUpdateCoordinator[DetectionResult]):
 
     async def _async_absorb_gate_sample(self, result: DetectionResult) -> None:
         self.storage.gate_samples.append(
-            [result.median_sat, result.median_val, result.clip_frac]
+            [
+                result.median_sat,
+                result.median_val,
+                result.clip_frac,
+                result.row_dup_frac,
+            ]
         )
         # Rolling window of one full daily light cycle at the current
         # cadence: older extremes are already baked into the profile by

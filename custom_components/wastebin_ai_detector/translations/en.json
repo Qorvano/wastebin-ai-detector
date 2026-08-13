@@ -146,7 +146,8 @@
           "detect_error": "Analysis error",
           "not_calibrated": "Not calibrated",
           "watchdog_timeout": "Analysis aborted by watchdog",
-          "previous_run_still_busy": "Previous analysis still running"
+          "previous_run_still_busy": "Previous analysis still running",
+          "hold_frame_integrity": "Holding: corrupted camera frame"
         }
       }
     }

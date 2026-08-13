@@ -189,20 +189,21 @@ class TestQualityGates:
     def test_single_sample_has_zero_slack(self):
         from wastebin_ai_detector.core import derive_quality_gates
 
-        gates = derive_quality_gates([[0.3, 0.6, 0.02]])
+        gates = derive_quality_gates([[0.3, 0.6, 0.02, 0.01]])
         assert gates == {
             "daylight_sat_min": 0.3,
             "daylight_val_max": 0.6,
             "overexposure_clip_max": 0.02,
+            "row_dup_max": 0.01,
         }
 
     def test_slack_extends_extrema(self):
         from wastebin_ai_detector.core import derive_quality_gates
 
         samples = [
-            [0.30, 0.60, 0.020],
-            [0.32, 0.62, 0.025],
-            [0.28, 0.64, 0.030],
+            [0.30, 0.60, 0.020, 0.00],
+            [0.32, 0.62, 0.025, 0.01],
+            [0.28, 0.64, 0.030, 0.02],
         ]
         gates = derive_quality_gates(samples)
         # sat diffs: 0.02, 0.04 -> slack 0.03; min 0.28 - 0.03 = 0.25
@@ -211,14 +212,19 @@ class TestQualityGates:
         assert gates["daylight_val_max"] == pytest.approx(0.66)
         # clip diffs: 0.005, 0.005 -> slack 0.005; max 0.03 + 0.005
         assert gates["overexposure_clip_max"] == pytest.approx(0.035)
+        # row-dup diffs: 0.01, 0.01 -> slack 0.01; max 0.02 + 0.01
+        assert gates["row_dup_max"] == pytest.approx(0.03)
 
     def test_bounds_clamped(self):
         from wastebin_ai_detector.core import derive_quality_gates
 
-        gates = derive_quality_gates([[0.001, 0.999, 0.999], [0.05, 0.5, 0.5]])
+        gates = derive_quality_gates(
+            [[0.001, 0.999, 0.999, 0.999], [0.05, 0.5, 0.5, 0.5]]
+        )
         assert gates["daylight_sat_min"] >= 0.0
         assert gates["daylight_val_max"] <= 1.0
         assert gates["overexposure_clip_max"] <= 1.0
+        assert gates["row_dup_max"] <= 1.0
 
     def test_bad_shape_rejected(self):
         from wastebin_ai_detector.core import derive_quality_gates

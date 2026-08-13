@@ -69,6 +69,7 @@ STATUS_OUTCOMES = (
     "hold_greyscale",
     "hold_overexposure",
     "hold_greyscale_and_overexposure",
+    "hold_frame_integrity",
     "ambiguous_cold_start",
     "camera_error",
     "detect_error",
