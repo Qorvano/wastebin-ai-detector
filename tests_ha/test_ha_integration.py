@@ -933,3 +933,58 @@ async def test_smeared_frame_holds_and_is_never_absorbed(
         await coordinator.async_refresh()
         await hass.async_block_till_done()
         assert coordinator.diagnostics["outcome"] == "ok"
+
+
+async def test_set_roi_service_reloads_and_reconciles(
+    hass: HomeAssistant,
+) -> None:
+    entry = MockConfigEntry(
+        domain=DOMAIN, data=ENTRY_DATA, title="Test", minor_version=2
+    )
+    entry.add_to_hass(hass)
+    feed = _CameraFeed(_scene_jpeg(with_yellow=True))
+    with patch(
+        "custom_components.wastebin_ai_detector.coordinator.async_get_image",
+        new=feed,
+    ):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        await _calibrate_yellow(hass)
+        response = await hass.services.async_call(
+            DOMAIN,
+            "set_roi",
+            {"roi_x": 0.1, "roi_y": 0.05, "roi_w": 0.85, "roi_h": 0.9},
+            blocking=True,
+            return_response=True,
+        )
+        assert response["roi"]["x"] == pytest.approx(0.1)
+        await hass.async_block_till_done(wait_background_tasks=True)
+        assert entry.data[CONF_ROI_X] == pytest.approx(0.1)
+        storage = entry.runtime_data.storage
+        assert storage.calibration.roi.x == pytest.approx(0.1)
+        # Sample survives (image-anchored) and the profile relearned.
+        assert storage.profile.roi.x == pytest.approx(0.1)
+        # Invalid geometry is rejected in the schema phase.
+        import voluptuous as vol
+
+        with pytest.raises(vol.Invalid):
+            await hass.services.async_call(
+                DOMAIN,
+                "set_roi",
+                {"roi_x": 0.8, "roi_y": 0.0, "roi_w": 0.5, "roi_h": 0.5},
+                blocking=True,
+            )
+        # NaN passes every ordering comparison and would persist as
+        # null in the entry store - must fail in the schema phase.
+        with pytest.raises(vol.Invalid):
+            await hass.services.async_call(
+                DOMAIN,
+                "set_roi",
+                {
+                    "roi_x": float("nan"),
+                    "roi_y": 0.0,
+                    "roi_w": 0.5,
+                    "roi_h": 0.5,
+                },
+                blocking=True,
+            )

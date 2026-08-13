@@ -6,7 +6,8 @@
   ],
   "config_flow": true,
   "dependencies": [
-    "camera"
+    "camera",
+    "http"
   ],
   "documentation": "https://github.com/Qorvano/wastebin-ai-detector",
   "integration_type": "service",
@@ -16,5 +17,5 @@
     "numpy>=1.26.0",
     "Pillow>=10.0.0"
   ],
-  "version": "0.3.4"
+  "version": "0.4.0"
 }

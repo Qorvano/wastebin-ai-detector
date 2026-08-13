@@ -528,3 +528,69 @@ class TestFrameIntegrity:
         flat = np.tile(noisy[0:1], (50, 1, 1))
         assert row_duplicate_fraction(flat) == 1.0
         assert row_duplicate_fraction(noisy[:1]) == 0.0  # single row
+
+
+class TestBlobLocalization:
+    """Phase 2.4a: bounding box and centroid of the detected lid, in
+    full-image relative coordinates - the calibration card overlay."""
+
+    def test_bbox_and_centroid_match_the_drawn_lid(self, tmp_path):
+        from wastebin_ai_detector.core import detect_file
+
+        store = CalibrationStore(
+            roi=ROI_LEARN,
+            working_width=160,
+            resample="bilinear",
+            bins=[
+                BinDecl("gelb", "Gelbe Tonne"),
+                BinDecl("blau", "Blaue Tonne"),
+            ],
+        )
+        for name, seed in (("a.png", 0), ("b.png", 3)):
+            _write_scene(tmp_path / name, seed=seed)
+            store.add_sample(name, "gelb", Rect(*inner_rect(RECT_YELLOW)))
+            store.add_sample(name, "blau", Rect(*inner_rect(RECT_BLUE)))
+            store.set_labels(name, present=["gelb", "blau"])
+        profile, _ = learn_profile(store, tmp_path / "store.json")
+        result = detect_file(tmp_path / "a.png", profile)
+        for bin_id, rect in (("gelb", RECT_YELLOW), ("blau", RECT_BLUE)):
+            r = next(b for b in result.bins if b.id == bin_id)
+            assert r.present and r.bbox is not None
+            x, y, w, h = r.bbox
+            # The detected box must tightly cover the drawn lid: the
+            # tolerance is one working pixel in image fractions, plus
+            # the blob may be a pixel short of the exact edge.
+            px = ROI_LEARN.w / 160.0
+            assert abs(x - rect[0]) <= 2 * px
+            assert abs(y - rect[1]) <= 2 * px
+            assert abs(w - rect[2]) <= 4 * px
+            assert abs(h - rect[3]) <= 4 * px
+            cx, cy = r.centroid
+            assert rect[0] <= cx <= rect[0] + rect[2]
+            assert rect[1] <= cy <= rect[1] + rect[3]
+        # Absent lid: no location claim.
+        _write_scene(tmp_path / "no_yellow.png", with_yellow=False, seed=9)
+        result = detect_file(tmp_path / "no_yellow.png", profile)
+        gelb = next(b for b in result.bins if b.id == "gelb")
+        assert gelb.area_frac == 0.0 and gelb.bbox is None
+
+    def test_region_matches_area_on_random_masks(self):
+        import numpy as np
+
+        from wastebin_ai_detector.core import (
+            largest_component_area,
+            largest_component_region,
+        )
+
+        rng = np.random.default_rng(4)
+        for density in (0.2, 0.5, 0.8):
+            mask = rng.uniform(0, 1, (40, 60)) < density
+            region = largest_component_region(mask)
+            expected = largest_component_area(mask)
+            if expected == 0:
+                assert region is None
+                continue
+            area, (x0, y0, x1, y1), (cx, cy) = region
+            assert area == expected
+            assert 0 <= x0 < x1 <= 60 and 0 <= y0 < y1 <= 40
+            assert x0 <= cx < x1 and y0 <= cy < y1

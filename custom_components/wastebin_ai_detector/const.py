@@ -49,6 +49,7 @@ SERVICE_FORGET_IMAGE = "forget_image"
 SERVICE_RESTORE_IMAGE = "restore_image"
 SERVICE_RECONFIRM_IMAGES = "reconfirm_images"
 SERVICE_MARK_BIN_CHANGED = "mark_bin_appearance_changed"
+SERVICE_SET_ROI = "set_roi"
 
 ATTR_ENTRY_ID = "entry_id"
 ATTR_FILENAME = "filename"

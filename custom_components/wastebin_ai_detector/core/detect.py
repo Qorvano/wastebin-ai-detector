@@ -13,10 +13,10 @@ from typing import Any
 import numpy as np
 from PIL import Image
 
-from .ccl import largest_component_area
+from .ccl import largest_component_region
 from .color import RGB_8BIT_LEVELS, circular_dist_deg, rgb_to_hsv
-from .imageio import extract_working_roi, load_image_rgb
-from .profile import BinModel, Profile, validate_profile
+from .imageio import extract_working_roi, load_image_rgb, roi_to_pixels
+from .profile import BinModel, Profile, Roi, validate_profile
 
 
 def is_uncertain(area_frac: float, learning_stats: dict[str, Any]) -> bool:
@@ -98,6 +98,11 @@ class BinResult:
     min_area_frac: float
     margin: float  # area_frac / min_area_frac - confidence on a ratio scale
     uncertain: bool = False  # inside the learned ambiguity interval
+    # Location of the largest matching blob, in FULL-IMAGE relative
+    # coordinates (same frame the sample rects live in): bounding box
+    # [x, y, w, h] and centroid [cx, cy]. None when nothing matched.
+    bbox: tuple[float, float, float, float] | None = None
+    centroid: tuple[float, float] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         # Values are serialized unrounded: any display rounding could
@@ -111,6 +116,8 @@ class BinResult:
             "min_area_frac": self.min_area_frac,
             "margin": self.margin,
             "uncertain": self.uncertain,
+            "bbox": None if self.bbox is None else list(self.bbox),
+            "centroid": None if self.centroid is None else list(self.centroid),
         }
 
 
@@ -140,15 +147,65 @@ class DetectionResult:
         }
 
 
+def _mask_point_to_image(
+    point: tuple[float, float], width: int, height: int, roi: Roi
+) -> tuple[float, float]:
+    """Working-mask pixel coordinates -> full-image relative (0..1).
+
+    Pixel centers sit at index + 0.5; the ROI grid maps affinely back
+    into the frame the sample rects and the calibration card live in.
+    """
+    fx = (point[0] + 0.5) / width
+    fy = (point[1] + 0.5) / height
+    return (roi.x + fx * roi.w, roi.y + fy * roi.h)
+
+
+def _mask_box_to_image(
+    box: tuple[int, int, int, int], width: int, height: int, roi: Roi
+) -> tuple[float, float, float, float]:
+    """Half-open working-mask pixel box -> full-image relative [x,y,w,h]."""
+    x0, y0, x1, y1 = box
+    left = roi.x + (x0 / width) * roi.w
+    top = roi.y + (y0 / height) * roi.h
+    return (
+        left,
+        top,
+        (x1 - x0) / width * roi.w,
+        (y1 - y0) / height * roi.h,
+    )
+
+
 def detect(img: Image.Image, profile: Profile) -> DetectionResult:
     """Run detection on an already-loaded PIL image."""
     validate_profile(profile)
     arr = extract_working_roi(img, profile.roi, profile.working_width, profile.resample)
     hue, sat, val = rgb_to_hsv(arr)
-    total = arr.shape[0] * arr.shape[1]
+    height, width = arr.shape[0], arr.shape[1]
+    total = height * width
+    # The crop is cut on INTEGER source pixels (roi_to_pixels rounds the
+    # nominal ROI edges), so blob coordinates must map through the crop
+    # that was actually taken, not the nominal ROI - otherwise every
+    # box inherits up to half a source pixel of offset per edge.
+    src_x0, src_y0, src_x1, src_y1 = roi_to_pixels(
+        profile.roi, img.width, img.height
+    )
+    actual_roi = Roi(
+        x=src_x0 / img.width,
+        y=src_y0 / img.height,
+        w=(src_x1 - src_x0) / img.width,
+        h=(src_y1 - src_y0) / img.height,
+    )
     results: list[BinResult] = []
     for model in profile.bins:
-        area = largest_component_area(bin_mask(hue, sat, val, model))
+        region = largest_component_region(bin_mask(hue, sat, val, model))
+        if region is None:
+            area, bbox, centroid = 0, None, None
+        else:
+            area, box_px, centroid_px = region
+            bbox = _mask_box_to_image(box_px, width, height, actual_roi)
+            centroid = _mask_point_to_image(
+                centroid_px, width, height, actual_roi
+            )
         frac = area / total
         results.append(
             BinResult(
@@ -159,6 +216,8 @@ def detect(img: Image.Image, profile: Profile) -> DetectionResult:
                 min_area_frac=model.min_area_frac,
                 margin=frac / model.min_area_frac,
                 uncertain=is_uncertain(frac, model.learning_stats),
+                bbox=bbox,
+                centroid=centroid,
             )
         )
     median_sat = float(np.median(sat))

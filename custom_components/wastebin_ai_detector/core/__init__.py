@@ -5,7 +5,7 @@ package can be exercised offline (calibration CLI, tests) and is reused
 unchanged by the Home Assistant integration layer.
 """
 
-from .ccl import largest_component_area
+from .ccl import largest_component_area, largest_component_region
 from .color import (
     MixtureFit,
     circular_dist_deg,
@@ -96,6 +96,7 @@ __all__ = [
     "ImageLoadError",
     "is_uncertain",
     "largest_component_area",
+    "largest_component_region",
     "learn_area_threshold",
     "learn_color_model",
     "learn_profile",

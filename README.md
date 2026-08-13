@@ -102,6 +102,36 @@ Downgrade note: once a store was saved by v0.3.3 (schema v2), older
 versions cannot read it; the original v1 store is kept as
 `calibration_v1_backup.json` in the archive folder.
 
+## Calibration card (v0.4.0)
+
+The integration ships a Lovelace card (registered automatically, no
+resource setup needed). Add it to any dashboard:
+
+```yaml
+type: custom:wastebin-calibration-card
+camera: camera.backyard
+bins:
+  - id: gelbe_tonne
+    name: Gelbe Tonne
+  - id: blaue_tonne
+    name: Blaue Tonne
+entities:            # optional: live detection overlay
+  - binary_sensor.backyard_gelbe_tonne
+  - binary_sensor.backyard_blaue_tonne
+```
+
+- **Capture snapshot** archives the current frame; samples and labels
+  you create afterwards attach to it.
+- **Draw region** drag the region of interest on the image and apply
+  it (runs through the same lossless path as the reconfigure dialog,
+  via the new `set_roi` service).
+- **Draw sample** drag a rectangle on a lid, pick the bin, save.
+- **Label** toggle each bin present/absent for the captured frame and
+  save; relearn runs automatically.
+- **View** overlays the currently detected blob boxes (the presence
+  sensors also expose `bbox` and `centroid` attributes in full-image
+  relative coordinates).
+
 ## Roadmap
 
 - **Phase 2:** Home Assistant config flow, guided calibration, one

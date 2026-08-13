@@ -280,6 +280,36 @@
           "description": "Bin id (slug)."
         }
       }
+    },
+    "set_roi": {
+      "name": "Set region of interest",
+      "description": "Programmatic region edit (used by the calibration card). Behaves exactly like the reconfigure dialog: evidence is kept, the profile is relearned under the new region.",
+      "fields": {
+        "entry_id": {
+          "name": "Entry",
+          "description": "Config entry (optional with a single entry)."
+        },
+        "roi_x": {
+          "name": "Region left edge (0-1)",
+          "description": "Region left edge (0-1)"
+        },
+        "roi_y": {
+          "name": "Region top edge (0-1)",
+          "description": "Region top edge (0-1)"
+        },
+        "roi_w": {
+          "name": "Region width (0-1)",
+          "description": "Region width (0-1)"
+        },
+        "roi_h": {
+          "name": "Region height (0-1)",
+          "description": "Region height (0-1)"
+        },
+        "working_width": {
+          "name": "Analysis width",
+          "description": "Analysis width"
+        }
+      }
     }
   }
 }

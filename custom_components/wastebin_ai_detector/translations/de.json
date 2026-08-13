@@ -280,6 +280,36 @@
           "description": "Tonnen-ID (Slug)."
         }
       }
+    },
+    "set_roi": {
+      "name": "Bildbereich setzen",
+      "description": "Programmatische Bereichsänderung (von der Kalibrier-Karte genutzt). Verhält sich exakt wie der Umkonfigurieren-Dialog: Daten bleiben erhalten, das Profil wird unter dem neuen Bereich neu gelernt.",
+      "fields": {
+        "entry_id": {
+          "name": "Eintrag",
+          "description": "Konfigurationseintrag (bei nur einem Eintrag optional)."
+        },
+        "roi_x": {
+          "name": "Linke Kante des Bereichs (0-1)",
+          "description": "Linke Kante des Bereichs (0-1)"
+        },
+        "roi_y": {
+          "name": "Obere Kante des Bereichs (0-1)",
+          "description": "Obere Kante des Bereichs (0-1)"
+        },
+        "roi_w": {
+          "name": "Breite des Bereichs (0-1)",
+          "description": "Breite des Bereichs (0-1)"
+        },
+        "roi_h": {
+          "name": "Höhe des Bereichs (0-1)",
+          "description": "Höhe des Bereichs (0-1)"
+        },
+        "working_width": {
+          "name": "Analysebreite",
+          "description": "Analysebreite"
+        }
+      }
     }
   }
 }

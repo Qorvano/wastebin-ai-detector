@@ -13,6 +13,7 @@ ServiceValidationError.
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +30,12 @@ from homeassistant.exceptions import ServiceValidationError
 import homeassistant.helpers.config_validation as cv
 
 from .const import (
+    CONF_ROI_H,
+    CONF_ROI_W,
+    CONF_ROI_X,
+    CONF_ROI_Y,
+    CONF_WORKING_WIDTH,
+    CONF_CAMERA,
     ATTR_ABSENT,
     ATTR_AUTO_RELEARN,
     ATTR_BIN,
@@ -47,6 +54,7 @@ from .const import (
     SERVICE_RECONFIRM_IMAGES,
     SERVICE_RELEARN,
     SERVICE_RESTORE_IMAGE,
+    SERVICE_SET_ROI,
 )
 from .core import (
     REL_EPS,
@@ -141,6 +149,38 @@ MARK_BIN_CHANGED_SCHEMA = vol.Schema(
         **_ENTRY_SCHEMA,
         vol.Required(ATTR_BIN): cv.string,
     }
+)
+
+
+def _valid_roi_payload(data: dict) -> dict:
+    x, y = data[CONF_ROI_X], data[CONF_ROI_Y]
+    w, h = data[CONF_ROI_W], data[CONF_ROI_H]
+    # NaN passes every ordering comparison below (all False) and would
+    # be persisted as null by the orjson-based entry store, bricking
+    # the entry on the next restart - reject non-finite values first.
+    if not all(math.isfinite(v) for v in (x, y, w, h)):
+        raise vol.Invalid("region coordinates must be finite numbers")
+    if w <= 0.0 or h <= 0.0 or x < 0.0 or y < 0.0 or x + w > 1.0 or y + h > 1.0:
+        raise vol.Invalid(
+            "region must have positive size and lie inside [0, 1]"
+        )
+    return data
+
+
+SET_ROI_SCHEMA = vol.Schema(
+    vol.All(
+        {
+            **_ENTRY_SCHEMA,
+            vol.Required(CONF_ROI_X): vol.Coerce(float),
+            vol.Required(CONF_ROI_Y): vol.Coerce(float),
+            vol.Required(CONF_ROI_W): vol.Coerce(float),
+            vol.Required(CONF_ROI_H): vol.Coerce(float),
+            vol.Optional(CONF_WORKING_WIDTH): vol.All(
+                vol.Coerce(int), vol.Range(min=1)
+            ),
+        },
+        _valid_roi_payload,
+    )
 )
 
 
@@ -298,6 +338,52 @@ def async_setup_services(hass: HomeAssistant) -> None:
             "unknown": unknown,
         }
 
+    async def handle_set_roi(call: ServiceCall) -> ServiceResponse:
+        """Programmatic ROI edit (the calibration card's write path).
+
+        Runs through entry.data exactly like the reconfigure flow: the
+        update listener reloads the entry, reconcile syncs the store
+        and the stale profile triggers the background relearn. Stored
+        evidence is untouched by design.
+        """
+        entry = _get_entry(hass, call)
+        updates = {
+            CONF_ROI_X: call.data[CONF_ROI_X],
+            CONF_ROI_Y: call.data[CONF_ROI_Y],
+            CONF_ROI_W: call.data[CONF_ROI_W],
+            CONF_ROI_H: call.data[CONF_ROI_H],
+        }
+        if CONF_WORKING_WIDTH in call.data:
+            updates[CONF_WORKING_WIDTH] = call.data[CONF_WORKING_WIDTH]
+        for other in hass.config_entries.async_entries(DOMAIN):
+            if other.entry_id == entry.entry_id:
+                continue
+            d = other.data
+            if d.get(CONF_CAMERA) == entry.data[CONF_CAMERA] and all(
+                d.get(k) == updates[k]
+                for k in (CONF_ROI_X, CONF_ROI_Y, CONF_ROI_W, CONF_ROI_H)
+            ):
+                raise ServiceValidationError(
+                    "another entry already watches the same camera and region"
+                )
+        changed = hass.config_entries.async_update_entry(
+            entry, data={**entry.data, **updates}
+        )
+        return {
+            "roi": {
+                "x": updates[CONF_ROI_X],
+                "y": updates[CONF_ROI_Y],
+                "w": updates[CONF_ROI_W],
+                "h": updates[CONF_ROI_H],
+            },
+            "note": (
+                "entry reloads now; the profile is relearned under the "
+                "new region in the background"
+                if changed
+                else "region unchanged; nothing to do"
+            ),
+        }
+
     async def handle_mark_bin_changed(call: ServiceCall) -> ServiceResponse:
         entry = _get_entry(hass, call)
         storage = entry.runtime_data.storage
@@ -353,6 +439,13 @@ def async_setup_services(hass: HomeAssistant) -> None:
         SERVICE_RECONFIRM_IMAGES,
         handle_reconfirm,
         schema=RECONFIRM_SCHEMA,
+        supports_response=SupportsResponse.OPTIONAL,
+    )
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_SET_ROI,
+        handle_set_roi,
+        schema=SET_ROI_SCHEMA,
         supports_response=SupportsResponse.OPTIONAL,
     )
     hass.services.async_register(

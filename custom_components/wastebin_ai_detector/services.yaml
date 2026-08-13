@@ -125,3 +125,55 @@ mark_bin_appearance_changed:
       example: "gelbe_tonne"
       selector:
         text:
+
+set_roi:
+  fields:
+    entry_id:
+      required: false
+      selector:
+        config_entry:
+          integration: wastebin_ai_detector
+    roi_x:
+      required: true
+      example: 0.24
+      selector:
+        number:
+          min: 0
+          max: 1
+          step: 0.001
+          mode: box
+    roi_y:
+      required: true
+      example: 0.10
+      selector:
+        number:
+          min: 0
+          max: 1
+          step: 0.001
+          mode: box
+    roi_w:
+      required: true
+      example: 0.42
+      selector:
+        number:
+          min: 0
+          max: 1
+          step: 0.001
+          mode: box
+    roi_h:
+      required: true
+      example: 0.86
+      selector:
+        number:
+          min: 0
+          max: 1
+          step: 0.001
+          mode: box
+    working_width:
+      required: false
+      example: 640
+      selector:
+        number:
+          min: 1
+          step: 1
+          mode: box

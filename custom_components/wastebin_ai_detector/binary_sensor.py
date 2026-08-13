@@ -90,6 +90,11 @@ class WastebinPresenceSensor(
             "uncertain": result.uncertain,
             "median_sat": self.coordinator.data.median_sat,
         }
+        # Blob location in full-image relative coordinates (the frame
+        # the calibration card draws in); None when nothing matched.
+        if result.bbox is not None:
+            attributes["bbox"] = list(result.bbox)
+            attributes["centroid"] = list(result.centroid)
         # The suspect flags of the PUBLISHED result are False by
         # construction (gated frames are never published); the hold
         # timestamps are the meaningful diagnostics.

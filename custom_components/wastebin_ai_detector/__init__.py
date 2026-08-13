@@ -16,13 +16,17 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
+from pathlib import Path as _Path
 
+from homeassistant.components.frontend import add_extra_js_url
+from homeassistant.components.http import StaticPathConfig
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.typing import ConfigType
+from homeassistant.loader import async_get_integration
 
 from .const import CONF_BIN_ACTIVE, CONF_BINS, DOMAIN
 from .coordinator import LearningCollector, WastebinCoordinator
@@ -45,9 +49,31 @@ PLATFORMS = [
 ]
 
 
+# The calibration card ships with the integration and is registered as
+# a frontend module automatically - no manual resource step for users.
+CARD_URL = f"/{DOMAIN}-card/wastebin-calibration-card.js"
+
+
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
-    """Register the domain services (independent of config entries)."""
+    """Register the domain services and the bundled calibration card."""
     async_setup_services(hass)
+    await hass.http.async_register_static_paths(
+        [
+            StaticPathConfig(
+                CARD_URL,
+                str(_Path(__file__).parent / "www" / "wastebin-calibration-card.js"),
+                True,
+            )
+        ]
+    )
+    if "frontend" in hass.config.components:
+        # Every real installation has the frontend; the guard only
+        # matters for headless test harnesses without hass_frontend.
+        # The manifest version busts the browser cache on updates (a
+        # bare URL would be served from heuristic cache for days), so
+        # long cache headers above are safe.
+        integration = await async_get_integration(hass, DOMAIN)
+        add_extra_js_url(hass, f"{CARD_URL}?v={integration.version}")
     return True
 
 
