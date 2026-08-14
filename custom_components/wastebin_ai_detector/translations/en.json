@@ -311,5 +311,11 @@
         }
       }
     }
+  },
+  "issues": {
+    "relearn_failed": {
+      "title": "Relearn failed: {title}",
+      "description": "The detection profile could not be relearned after the last change; detection keeps running on the previous profile and its old geometry. Reason: {error}\n\nFix the calibration (for example mark bins or confirm presence in the calibration card). The next successful relearn removes this issue automatically."
+    }
   }
 }

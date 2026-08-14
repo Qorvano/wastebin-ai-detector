@@ -1,12 +1,16 @@
 /* Wastebin AI Detector - calibration card.
  *
  * A thin UI over the integration's services: everything this card does
- * (capture, draw the region contour, draw samples, label, set the
- * region) can also be done from Developer Tools. All coordinates are
- * FULL-IMAGE relative - the frame the calibration store anchors its
- * evidence in. The region preview uses SVG fill-rule "evenodd", the
- * exact rule the core rasterizes with: what you see is what is
- * computed.
+ * (capture, draw the region contour, mark bins, declare presence, set
+ * the region) can also be done from Developer Tools. Marking a bin is
+ * ONE statement - "THIS is that bin, and it is here": the card saves
+ * the color sample and the present label together (add_sample +
+ * label_image, which merges per bin). The presence tab covers the two
+ * remaining cases: a bin that is here without a usable lid mark, and
+ * a bin that is away. All coordinates are FULL-IMAGE relative - the
+ * frame the calibration store anchors its evidence in. The region
+ * preview uses SVG fill-rule "evenodd", the exact rule the core
+ * rasterizes with: what you see is what is computed.
  *
  * Card config:
  *   type: custom:wastebin-calibration-card
@@ -26,23 +30,27 @@ const TEXTS = {
     captured: "Captured: ",
     view: "View",
     region: "Draw region",
-    sample: "Draw sample",
-    label: "Label",
+    sample: "Mark bins",
+    label: "Presence",
     apply_region: "Apply region",
     undo: "Undo point",
     clear: "Discard",
-    present: "present",
-    absent: "absent",
+    present: "here",
+    absent: "away",
     unset: "-",
-    save_labels: "Save labels",
-    need_capture: "Capture a snapshot first - samples and labels attach to an archived file.",
+    save_labels: "Save presence",
+    need_capture: "Capture a snapshot first - marks and presence attach to an archived file.",
     draw_first: "Draw a rectangle first.",
     need_closed: "Close the contour first (tap the first point).",
-    saved_sample: "Sample saved for ",
-    sample_outside: "Warning: the sample lies (partly) outside the region - its present-label will not count until the region covers it.",
+    marked_pre: "Marked ",
+    marked_post: " - color sample and “here” saved.",
+    mark_hint: "Pick a bin, drag a rectangle over its lid, then OK. That states: THIS is that bin, and it is here.",
+    presence_hint: "For bins without a mark: tap to set here/away, then save. Away shots are the valuable negative examples.",
+    nothing_set: "Nothing set - tap the bin buttons first.",
+    sample_outside: "Warning: the mark lies (partly) outside the region - the detector cannot measure that lid until the region covers it.",
     region_set: "Region updated; relearn runs in the background.",
     multi_ring: "This region has several contours; applying will replace all of them with the drawn one.",
-    labels_saved: "Labels saved. Relearn: ",
+    labels_saved: "Presence saved. Relearn: ",
     region_hint: "Tap to add points around every spot where bins can ever stand; tap the first point to close. Drag points to adjust.",
     error: "Error: ",
   },
@@ -51,23 +59,27 @@ const TEXTS = {
     captured: "Aufgenommen: ",
     view: "Ansehen",
     region: "Region zeichnen",
-    sample: "Sample zeichnen",
-    label: "Beschriften",
+    sample: "Tonnen markieren",
+    label: "Anwesenheit",
     apply_region: "Region übernehmen",
     undo: "Punkt zurück",
     clear: "Verwerfen",
-    present: "anwesend",
-    absent: "abwesend",
+    present: "da",
+    absent: "weg",
     unset: "-",
-    save_labels: "Beschriftung speichern",
-    need_capture: "Bitte nehmen Sie zuerst einen Schnappschuss auf - Samples und Beschriftungen gehören zu einer archivierten Datei.",
+    save_labels: "Anwesenheit speichern",
+    need_capture: "Bitte nehmen Sie zuerst einen Schnappschuss auf - Markierungen und Anwesenheit gehören zu einer archivierten Datei.",
     draw_first: "Bitte zeichnen Sie zuerst ein Rechteck.",
     need_closed: "Bitte schließen Sie zuerst die Kontur (ersten Punkt antippen).",
-    saved_sample: "Sample gespeichert für ",
-    sample_outside: "Hinweis: Das Sample liegt (teilweise) außerhalb der Region - sein Anwesend-Label zählt erst, wenn die Region es abdeckt.",
+    marked_pre: "",
+    marked_post: " markiert - Farb-Sample und „da“ gespeichert.",
+    mark_hint: "Wählen Sie eine Tonne, ziehen Sie ein Rechteck über ihren Deckel, dann OK. Das sagt: DAS ist diese Tonne, und sie ist da.",
+    presence_hint: "Für Tonnen ohne Markierung: Tippen Sie den Button an (da/weg) und speichern Sie. Weggestellte Tonnen liefern die wertvollen Abwesend-Beispiele.",
+    nothing_set: "Keine Angabe gesetzt - bitte tippen Sie zuerst die Tonnen-Buttons an.",
+    sample_outside: "Hinweis: Die Markierung liegt (teilweise) außerhalb der Region - diesen Deckel kann der Detektor erst messen, wenn die Region ihn abdeckt.",
     region_set: "Region aktualisiert; das Neu-Lernen läuft im Hintergrund.",
     multi_ring: "Diese Region hat mehrere Konturen; Übernehmen ersetzt sie durch die gezeichnete.",
-    labels_saved: "Beschriftung gespeichert. Neu-Lernen: ",
+    labels_saved: "Anwesenheit gespeichert. Neu-Lernen: ",
     region_hint: "Tippen setzt Punkte um alle Stellplätze, an denen je Tonnen stehen können; Tippen auf den ersten Punkt schließt. Punkte lassen sich ziehen.",
     error: "Fehler: ",
   },
@@ -95,7 +107,9 @@ class WastebinCalibrationCard extends HTMLElement {
     this._drawn = null; // sample rect {x,y,w,h} image-relative
     this._dragStart = null;
     this._filename = null;
-    this._labels = {};
+    this._labels = {}; // presence chips (mirror of what save would send)
+    this._savedLabels = {}; // presence last persisted for _filename
+    this._marks = {}; // binId -> rect, marks saved on _filename this session
     this._sampleBin = null;
     this._status = "";
     this._imgCounter = 0;
@@ -189,8 +203,11 @@ class WastebinCalibrationCard extends HTMLElement {
       const result = await this._svc("capture_snapshot", {}, true);
       this._filename = result?.response?.filename || null;
       this._labels = {};
+      this._savedLabels = {};
+      this._marks = {};
       this._drawn = null;
       this._paintDrawn();
+      this._paintMarks();
       this._setStatus(this._t.captured + (this._filename || "?"));
       await this._showArchivedFrame();
       this._renderLabelRow();
@@ -283,11 +300,35 @@ class WastebinCalibrationCard extends HTMLElement {
   async _saveSample() {
     if (!this._filename) return this._setStatus(this._t.need_capture);
     if (!this._drawn) return this._setStatus(this._t.draw_first);
+    const button = this.shadowRoot.getElementById("save-sample");
+    button.disabled = true; /* one statement at a time - no double OK */
+    try {
+      await this._saveSampleInner();
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  async _saveSampleInner() {
     const r = this._drawn;
+    const binId = this._sampleBin;
+    const bin = this._config.bins.find((b) => b.id === binId);
+    const name = bin ? bin.name : binId;
+    /* 9-point probe (corners, edge midpoints, center): still an
+     * approximation for exotic concavities, but catches rects that
+     * span holes or bridge a concave mouth, which corner-only
+     * checks miss. The authoritative veto stays in learning_view. */
+    const probes = [];
+    for (const fx of [0, 0.5, 1]) {
+      for (const fy of [0, 0.5, 1]) {
+        probes.push([r.x + fx * r.w, r.y + fy * r.h]);
+      }
+    }
+    const outside = probes.some(([cx, cy]) => !this._pointInRegion(cx, cy));
     try {
       await this._svc("add_sample", {
         filename: this._filename,
-        bin: this._sampleBin,
+        bin: binId,
         rect: [
           this._round(r.x),
           this._round(r.y),
@@ -296,28 +337,46 @@ class WastebinCalibrationCard extends HTMLElement {
         ],
         space: "image",
       });
-      const bin = this._config.bins.find((b) => b.id === this._sampleBin);
-      /* 9-point probe (corners, edge midpoints, center): still an
-       * approximation for exotic concavities, but catches rects that
-       * span holes or bridge a concave mouth, which corner-only
-       * checks miss. The authoritative veto stays in learning_view. */
-      const probes = [];
-      for (const fx of [0, 0.5, 1]) {
-        for (const fy of [0, 0.5, 1]) {
-          probes.push([r.x + fx * r.w, r.y + fy * r.h]);
-        }
-      }
-      const outside = probes.some(([cx, cy]) => !this._pointInRegion(cx, cy));
-      this._setStatus(
-        this._t.saved_sample +
-          (bin ? bin.name : this._sampleBin) +
-          (outside ? " - " + this._t.sample_outside : "")
-      );
-      this._drawn = null;
-      this._paintDrawn();
     } catch (err) {
-      this._setStatus(this._t.error + (err.message || err));
+      return this._setStatus(this._t.error + (err.message || err));
     }
+    /* The store appends samples, it never replaces - so the overlay
+     * keeps every saved rect too (marking the same bin again shows
+     * both, matching what the server holds). */
+    (this._marks[binId] = this._marks[binId] || []).push({ ...r });
+    this._drawn = null;
+    this._paintDrawn();
+    /* One gesture, one statement: the mark is "THIS is that bin, and
+     * it is here", so the present label is saved in the same step.
+     * set_labels merges per bin - other bins are never clobbered. */
+    let relearn = null;
+    try {
+      const result = await this._svc(
+        "label_image",
+        { filename: this._filename, present: [binId], absent: [] },
+        true
+      );
+      relearn = result?.response?.relearn || "?";
+      this._labels[binId] = "present";
+      this._savedLabels[binId] = "present";
+      this._renderLabelRow();
+    } catch (err) {
+      /* The sample IS stored, only the presence statement failed. Show
+       * it as a PENDING "here" (chip and mark tag get the dirty star),
+       * so "Save presence" completes the statement - re-drawing would
+       * append a second sample to the store instead. */
+      this._labels[binId] = "present";
+      this._renderLabelRow();
+      return this._setStatus(
+        this._t.error + (err.message || err) +
+          (outside ? " " + this._t.sample_outside : "")
+      );
+    }
+    this._setStatus(
+      this._t.marked_pre + name + this._t.marked_post +
+        (relearn && relearn !== "ok" ? " (" + relearn + ")" : "") +
+        (outside ? " " + this._t.sample_outside : "")
+    );
   }
 
   async _saveLabels() {
@@ -328,6 +387,11 @@ class WastebinCalibrationCard extends HTMLElement {
       if (state === "present") present.push(binId);
       if (state === "absent") absent.push(binId);
     }
+    if (!present.length && !absent.length) {
+      return this._setStatus(this._t.nothing_set);
+    }
+    const button = this.shadowRoot.getElementById("save-labels");
+    button.disabled = true; /* no double submit while the call runs */
     try {
       const result = await this._svc(
         "label_image",
@@ -336,12 +400,16 @@ class WastebinCalibrationCard extends HTMLElement {
       );
       const relearn = result?.response?.relearn || "?";
       const warnings = result?.response?.warnings || [];
+      this._savedLabels = { ...this._labels };
+      this._renderLabelRow();
       this._setStatus(
         this._t.labels_saved + relearn +
         (warnings.length ? " (" + warnings.length + " warnings)" : "")
       );
     } catch (err) {
       this._setStatus(this._t.error + (err.message || err));
+    } finally {
+      button.disabled = false;
     }
   }
 
@@ -465,6 +533,52 @@ class WastebinCalibrationCard extends HTMLElement {
     box.style.width = this._drawn.w * 100 + "%";
     box.style.height = this._drawn.h * 100 + "%";
     box.className = "rect sample";
+  }
+
+  _paintMarks() {
+    /* The marks saved on the current capture, labeled per bin: the
+     * visible answer to "what have I already told the system about
+     * this image?". Session-local by design - the card labels only
+     * the snapshot it just captured. The tag text mirrors the CHIP
+     * state (never a hardcoded "here"): if the presence is later
+     * flipped or still pending, the mark says so too. */
+    const layer = this.shadowRoot.getElementById("marks");
+    if (!layer) return;
+    const show =
+      (this._mode === "sample" || this._mode === "label") && this._filename;
+    if (!show) {
+      layer.replaceChildren();
+      return;
+    }
+    const boxes = [];
+    for (const [binId, rects] of Object.entries(this._marks)) {
+      const bin = this._config.bins.find((b) => b.id === binId);
+      const state = this._labels[binId];
+      const pending =
+        (state || null) !== (this._savedLabels[binId] || null);
+      const text =
+        state === "present"
+          ? this._t.present
+          : state === "absent"
+            ? this._t.absent
+            : this._t.unset;
+      rects.forEach((r, i) => {
+        const div = document.createElement("div");
+        div.className = "rect mark";
+        div.style.left = r.x * 100 + "%";
+        div.style.top = r.y * 100 + "%";
+        div.style.width = r.w * 100 + "%";
+        div.style.height = r.h * 100 + "%";
+        if (i === rects.length - 1) {
+          const tag = document.createElement("span");
+          tag.textContent =
+            (bin ? bin.name : binId) + ": " + text + (pending ? " *" : "");
+          div.appendChild(tag);
+        }
+        boxes.push(div);
+      });
+    }
+    layer.replaceChildren(...boxes);
   }
 
   _paintRegion() {
@@ -596,13 +710,22 @@ class WastebinCalibrationCard extends HTMLElement {
     this.shadowRoot.getElementById("stage").style.cursor =
       mode === "region" || mode === "sample" ? "crosshair" : "default";
     if (mode === "region") this._setStatus(this._t.region_hint);
+    if (mode === "sample") this._setStatus(this._t.mark_hint);
+    if (mode === "label") this._setStatus(this._t.presence_hint);
     this._paintDrawn();
+    this._paintMarks();
     this._paintRegion();
     this._updateOverlay();
   }
 
   _cycleLabel(binId) {
-    const order = [undefined, "present", "absent"];
+    /* A persisted presence cannot go back to "-": the store has no
+     * unlabel operation, so "-" after a save would display a state
+     * the server does not have. Saved bins toggle here/away only. */
+    const order =
+      this._savedLabels[binId] !== undefined
+        ? ["present", "absent"]
+        : [undefined, "present", "absent"];
     const cur = this._labels[binId];
     const next = order[(order.indexOf(cur) + 1) % order.length];
     if (next === undefined) delete this._labels[binId];
@@ -613,17 +736,22 @@ class WastebinCalibrationCard extends HTMLElement {
   _renderLabelRow() {
     const row = this.shadowRoot.getElementById("label-bins");
     if (!row) return;
+    let dirty = false;
     row.replaceChildren(
       ...this._config.bins.map((bin) => {
         const btn = document.createElement("button");
         const state = this._labels[bin.id];
+        const pending =
+          (state || null) !== (this._savedLabels[bin.id] || null);
+        if (pending) dirty = true;
         btn.textContent =
           bin.name + ": " +
           (state === "present"
             ? this._t.present
             : state === "absent"
               ? this._t.absent
-              : this._t.unset);
+              : this._t.unset) +
+          (pending ? " *" : "");
         btn.className =
           "chip" +
           (state === "present" ? " present" : state === "absent" ? " absent" : "");
@@ -631,6 +759,9 @@ class WastebinCalibrationCard extends HTMLElement {
         return btn;
       })
     );
+    const save = this.shadowRoot.getElementById("save-labels");
+    if (save) save.classList.toggle("attention", dirty);
+    this._paintMarks(); /* mark tags mirror the chip states */
   }
 
   _render() {
@@ -657,12 +788,21 @@ class WastebinCalibrationCard extends HTMLElement {
         .rect.sample { border: 2px solid var(--accent-color); background: rgba(255,152,0,.2); }
         .rect.detected { border: 2px solid var(--error-color, #a00); }
         .rect.detected.on { border-color: var(--success-color, #0a0); }
-        .rect.detected span {
+        .rect.mark {
+          border: 2px solid var(--success-color, #0a0);
+          background: rgba(0, 160, 0, .12);
+        }
+        .rect.detected span, .rect.mark span {
           position: absolute; top: -1.4em; left: 0; font-size: 11px;
           background: var(--card-background-color); padding: 0 4px; border-radius: 3px;
           white-space: nowrap;
         }
-        #overlay { position: absolute; inset: 0; pointer-events: none; }
+        button.attention {
+          border-color: var(--primary-color);
+          box-shadow: 0 0 0 1px var(--primary-color) inset;
+        }
+        button:disabled { opacity: .5; cursor: wait; }
+        #overlay, #marks { position: absolute; inset: 0; pointer-events: none; }
         #region-svg {
           position: absolute; inset: 0; width: 100%; height: 100%;
           pointer-events: none; display: none;
@@ -688,6 +828,7 @@ class WastebinCalibrationCard extends HTMLElement {
         <div id="stage">
           <img id="cam" alt="camera" />
           <div id="overlay"></div>
+          <div id="marks"></div>
           <svg id="region-svg" viewBox="0 0 100 100" preserveAspectRatio="none">
             <path id="region-dim" d="" />
             <polyline id="region-line" points="" />
@@ -758,5 +899,5 @@ window.customCards.push({
   type: "wastebin-calibration-card",
   name: "Wastebin Calibration Card",
   description:
-    "Draw the region contour, lid samples and labels for the Wastebin AI Detector directly on the camera image.",
+    "Draw the region contour, mark bins and declare presence for the Wastebin AI Detector directly on the camera image.",
 });

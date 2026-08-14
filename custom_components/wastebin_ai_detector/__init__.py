@@ -25,13 +25,14 @@ from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.typing import ConfigType
 from homeassistant.loader import async_get_integration
 
 from .const import CONF_BIN_ACTIVE, CONF_BINS, DOMAIN
 from .coordinator import LearningCollector, WastebinCoordinator
 from .core import rings_equal, roi_equal, store_to_dict
-from .services import async_relearn, async_setup_services
+from .services import async_relearn, async_setup_services, relearn_issue_id
 from .storage import (
     WastebinStorage,
     archive_dir,
@@ -208,6 +209,23 @@ async def _async_relearn_after_reconfigure(
             "stays active on its old geometry: %s",
             err,
         )
+        # This path has no interactive caller, so the stale state must
+        # surface as a Repairs issue. Persistent: the broken state
+        # survives HA restarts, so must the flag (any successful
+        # relearn deletes it, see async_relearn).
+        ir.async_create_issue(
+            hass,
+            DOMAIN,
+            relearn_issue_id(entry),
+            is_fixable=False,
+            is_persistent=True,
+            severity=ir.IssueSeverity.WARNING,
+            translation_key="relearn_failed",
+            translation_placeholders={
+                "title": entry.title,
+                "error": str(err),
+            },
+        )
         return
     if result["warnings"]:
         _LOGGER.warning(
@@ -282,6 +300,7 @@ async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     offline CLI, re-importable later). The snapshot files themselves
     are user data and are never deleted.
     """
+    ir.async_delete_issue(hass, DOMAIN, relearn_issue_id(entry))
     storage = WastebinStorage(hass, entry)
     await storage.async_load()
     if storage.calibration.images:

@@ -1149,3 +1149,112 @@ async def test_set_roi_polygon_flows_into_store_and_profile(
         assert response["polygons"] is None
         await hass.async_block_till_done(wait_background_tasks=True)
         assert entry.data.get(CONF_ROI_POLYGONS) is None
+
+
+async def test_failed_relearn_creates_and_clears_repair_issue(
+    hass: HomeAssistant,
+) -> None:
+    """A relearn failing in the background (here: after 'camera
+    re-aimed' sets all labels aside) must surface as a Repairs issue;
+    the next successful relearn removes it again."""
+    from homeassistant.helpers import issue_registry as ir
+
+    from custom_components.wastebin_ai_detector.services import (
+        relearn_issue_id,
+    )
+
+    entry = MockConfigEntry(
+        domain=DOMAIN, data=ENTRY_DATA, title="Test", minor_version=2
+    )
+    entry.add_to_hass(hass)
+    feed = _CameraFeed(_scene_jpeg(with_yellow=True))
+    with patch(
+        "custom_components.wastebin_ai_detector.coordinator.async_get_image",
+        new=feed,
+    ), patch(
+        "custom_components.wastebin_ai_detector.coordinator.is_up",
+        return_value=False,
+    ):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        filename = await _calibrate_yellow(hass)
+        registry = ir.async_get(hass)
+        issue_id = relearn_issue_id(entry)
+        assert registry.async_get_issue(DOMAIN, issue_id) is None
+
+        result = await _start_reconfigure(hass, entry)
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {"next_step_id": "reconf_view_changed"}
+        )
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {}
+        )
+        assert result["reason"] == "reconfigure_successful"
+        await hass.async_block_till_done(wait_background_tasks=True)
+
+        # The background relearn failed (every label set aside by the
+        # view bump); detection keeps running on the old profile, and
+        # exactly that stale state must be visible as a Repairs issue.
+        assert registry.async_get_issue(DOMAIN, issue_id) is not None
+
+        # Re-confirming under the new view heals the evidence; the
+        # next successful relearn clears the issue.
+        await hass.services.async_call(
+            DOMAIN,
+            "reconfirm_images",
+            {"filenames": [filename]},
+            blocking=True,
+            return_response=True,
+        )
+        await hass.services.async_call(
+            DOMAIN, "relearn", {}, blocking=True, return_response=True
+        )
+        assert registry.async_get_issue(DOMAIN, issue_id) is None
+
+
+async def test_early_unlearnable_label_creates_no_repair_issue(
+    hass: HomeAssistant,
+) -> None:
+    """label_image's auto-relearn failing during FIRST calibration is
+    the normal "not learnable yet" state (handle_label swallows it) -
+    it must not raise a Repairs issue."""
+    from homeassistant.helpers import issue_registry as ir
+
+    from custom_components.wastebin_ai_detector.services import (
+        relearn_issue_id,
+    )
+
+    entry = MockConfigEntry(
+        domain=DOMAIN, data=ENTRY_DATA, title="Test", minor_version=2
+    )
+    entry.add_to_hass(hass)
+    feed = _CameraFeed(_scene_jpeg(with_yellow=False))
+    with patch(
+        "custom_components.wastebin_ai_detector.coordinator.async_get_image",
+        new=feed,
+    ), patch(
+        "custom_components.wastebin_ai_detector.coordinator.is_up",
+        return_value=False,
+    ):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        response = await hass.services.async_call(
+            DOMAIN, "capture_snapshot", {}, blocking=True, return_response=True
+        )
+        # An absent label without any sample anywhere: relearn cannot
+        # succeed yet, and that is fine.
+        result = await hass.services.async_call(
+            DOMAIN,
+            "label_image",
+            {
+                "filename": response["filename"],
+                "absent": ["gelbe_tonne"],
+            },
+            blocking=True,
+            return_response=True,
+        )
+        assert result["relearn"].startswith("not possible yet")
+        registry = ir.async_get(hass)
+        assert (
+            registry.async_get_issue(DOMAIN, relearn_issue_id(entry)) is None
+        )

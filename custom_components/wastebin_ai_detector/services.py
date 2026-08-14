@@ -28,6 +28,7 @@ from homeassistant.core import (
 )
 from homeassistant.exceptions import ServiceValidationError
 import homeassistant.helpers.config_validation as cv
+from homeassistant.helpers import issue_registry as ir
 
 from .const import (
     CONF_ROI_POLYGONS,
@@ -255,6 +256,11 @@ def _get_entry(hass: HomeAssistant, call: ServiceCall) -> ConfigEntry:
     )
 
 
+def relearn_issue_id(entry: ConfigEntry) -> str:
+    """Repairs-issue id flagging a failed relearn for this entry."""
+    return f"relearn_failed_{entry.entry_id}"
+
+
 async def async_relearn(hass: HomeAssistant, entry: ConfigEntry) -> dict[str, Any]:
     """Recompute the profile from the store; shared by services and setup."""
     runtime = entry.runtime_data
@@ -271,7 +277,16 @@ async def async_relearn(hass: HomeAssistant, entry: ConfigEntry) -> dict[str, An
                 store_anchor(hass, entry.entry_id),
             )
         except WastebinError as err:
+            # No issue is created here: interactive callers see the
+            # error directly, and handle_label even treats it as the
+            # normal "not learnable yet" state during first
+            # calibration. Only the INVISIBLE background path after a
+            # reconfiguration flags it (see __init__).
             raise ServiceValidationError(f"relearn failed: {err}") from err
+        # Any successful relearn means detection runs on the current
+        # geometry again - a stale-profile flag, wherever it came
+        # from, is no longer true.
+        ir.async_delete_issue(hass, DOMAIN, relearn_issue_id(entry))
         # The labeled set defines the gates' floor; the unlabeled archive
         # statistics may only widen them (they know the full daily light
         # range, labels usually do not).

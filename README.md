@@ -152,17 +152,26 @@ entities:            # optional: live detection overlay
   - binary_sensor.backyard_blaue_tonne
 ```
 
-- **Capture snapshot** archives the current frame; samples and labels
+- **Capture snapshot** archives the current frame; marks and presence
   you create afterwards attach to it.
-- **Draw region** drag the region of interest on the image and apply
-  it (runs through the same lossless path as the reconfigure dialog,
-  via the new `set_roi` service).
-- **Draw sample** drag a rectangle on a lid, pick the bin, save.
-- **Label** toggle each bin present/absent for the captured frame and
-  save; relearn runs automatically.
+- **Draw region** tap points around every spot bins can ever stand and
+  apply (runs through the same lossless path as the reconfigure
+  dialog, via the `set_roi` service).
+- **Mark bins** (v0.5.1) pick a bin, drag a rectangle over its lid,
+  OK. One gesture is one statement: "THIS is that bin, and it is
+  here". The card saves the color sample and the present label
+  together and shows the mark on the image; relearn runs
+  automatically.
+- **Presence** covers the two remaining cases: a bin that is here
+  without a usable lid mark, and a bin that is away (the valuable
+  negative examples). Toggle and save; unsaved changes are starred.
 - **View** overlays the currently detected blob boxes (the presence
   sensors also expose `bbox` and `centroid` attributes in full-image
   relative coordinates).
+
+A failed background relearn (for example after a region change that
+sets labels aside) now raises a Repairs issue instead of only a log
+line; the next successful relearn clears it.
 
 ## Roadmap
 

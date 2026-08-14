@@ -311,5 +311,11 @@
         }
       }
     }
+  },
+  "issues": {
+    "relearn_failed": {
+      "title": "Neu-Lernen fehlgeschlagen: {title}",
+      "description": "Das Erkennungsprofil konnte nach der letzten Änderung nicht neu gelernt werden; die Erkennung läuft auf dem bisherigen Profil und dessen alter Geometrie weiter. Grund: {error}\n\nBitte korrigieren Sie die Kalibrierung (zum Beispiel markieren Sie in der Kalibrier-Karte Tonnen oder bestätigen Sie die Anwesenheit). Das nächste erfolgreiche Neu-Lernen entfernt diese Meldung automatisch."
+    }
   }
 }
