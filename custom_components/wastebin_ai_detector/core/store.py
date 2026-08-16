@@ -27,6 +27,8 @@ folder can be moved between machines.
 
 from __future__ import annotations
 
+import math
+
 import json
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
@@ -43,7 +45,7 @@ from .region import (
     validate_rings,
 )
 
-STORE_SCHEMA_VERSION = 3
+STORE_SCHEMA_VERSION = 4
 
 
 @dataclass(frozen=True)
@@ -80,6 +82,20 @@ class SampleRect:
     epoch: int = 0
 
 
+@dataclass(frozen=True)
+class AutoStamp:
+    """Where in the measured light space an unattended frame sits.
+
+    The two frame statistics detection already computes for its own
+    quality gates. They are the coordinates the reservoir spreads its
+    retained frames over, so "cover many light conditions" becomes a
+    measurable property instead of a hope.
+    """
+
+    median_sat: float
+    median_val: float
+
+
 @dataclass
 class ImageEntry:
     path: str
@@ -97,6 +113,14 @@ class ImageEntry:
     # Soft forget: excluded entries keep all their data but contribute
     # nothing to learning until restored.
     excluded: bool = False
+    # Provenance: set on entries a learning RUN created. None means "a
+    # human made this", which is exactly what every entry from before
+    # this field means. A run's entries carry the situation the user
+    # declared for that run, so their labels are a human statement
+    # applied to a machine-captured frame - which is why they may feed
+    # colour models and NEGATIVE area evidence, but never the smallest
+    # positive area, the shape bounds or the edge band (see learn).
+    auto: AutoStamp | None = None
 
 
 @dataclass
@@ -173,9 +197,113 @@ class CalibrationStore:
             else Roi(x=0.0, y=0.0, w=1.0, h=1.0)
         )
         entry = self.ensure_image(path)
+        # Human attention promotes an auto-collected frame to ordinary
+        # evidence: it leaves the reservoir and is never evicted.
+        entry.auto = None
         entry.samples.setdefault(bin_id, []).append(
             SampleRect(rect=rect, roi=grid, epoch=decl.appearance_epoch)
         )
+
+    def record_auto_frame(
+        self,
+        path: str,
+        stamp: AutoStamp,
+        *,
+        samples: dict[str, list[Rect]],
+        present: list[str],
+        absent: list[str],
+    ) -> None:
+        """Record one unattended observation of a DECLARED situation.
+
+        The labels are not a machine's opinion: before starting the
+        run the user declared which bins are standing there and which
+        are not, and undertook to keep it that way. This method simply
+        applies that declaration to a frame captured during the run,
+        together with color samples at the marks the user drew - for
+        the present bins only, since the marks of an absent bin would
+        sample the ground.
+
+        Everything goes through the ordinary validation and stamping;
+        the provenance stamp is what makes the evidence recognizable
+        and revertible in bulk afterwards.
+        """
+        entry = self.get_image(path)
+        if entry is not None and (
+            entry.samples or entry.present or entry.absent
+        ):
+            raise CalibrationError(
+                f"{path} already carries evidence - an unattended frame is "
+                "always a fresh capture"
+            )
+        # Validate the WHOLE declaration before writing anything. A
+        # declaration outlives the moment it was made (a bin can be
+        # retired mid-run), and a half-written entry would leave
+        # machine evidence in the store that carries no provenance
+        # stamp and is therefore invisible to every safeguard built
+        # around it.
+        declared = list(samples) + list(present) + list(absent)
+        unknown = [b for b in declared if b not in self.bin_ids()]
+        if unknown:
+            raise CalibrationError(
+                f"unknown bin ids {unknown}; declared: {self.bin_ids()}"
+            )
+        retired = [
+            b
+            for b in declared
+            if (decl := self.get_bin(b)) is not None and not decl.active
+        ]
+        if retired:
+            raise CalibrationError(
+                f"bins {retired} are retired - the run cannot record them"
+            )
+        conflict = sorted(set(present) & set(absent))
+        if conflict:
+            raise CalibrationError(
+                f"bins declared both present and absent: {conflict}"
+            )
+        created = self.get_image(path) is None
+        try:
+            for bin_id, rects in samples.items():
+                for rect in rects:
+                    self.add_sample(path, bin_id, rect)
+            self.set_labels(path, present=present, absent=absent)
+        except CalibrationError:
+            # Nothing half-written survives: a fresh entry is removed
+            # entirely rather than left as unstamped evidence.
+            if created:
+                self.images = [e for e in self.images if e.path != path]
+            raise
+        self.get_image(path).auto = stamp
+
+    def auto_entries(self) -> list[ImageEntry]:
+        """All auto-collected entries, excluded ones included."""
+        return [e for e in self.images if e.auto is not None]
+
+    def auto_reservoir(self) -> list[tuple[str, tuple[float, float]]]:
+        """Retained auto frames as (path, light-regime coordinate)."""
+        return [
+            (e.path, (e.auto.median_sat, e.auto.median_val))
+            for e in self.images
+            if e.auto is not None and not e.excluded
+        ]
+
+    def discard_auto_evidence(self) -> list[str]:
+        """Exclude every auto entry (reversible, deletes nothing)."""
+        touched = []
+        for entry in self.images:
+            if entry.auto is not None and not entry.excluded:
+                entry.excluded = True
+                touched.append(entry.path)
+        return touched
+
+    def restore_auto_evidence(self) -> list[str]:
+        """Undo :meth:`discard_auto_evidence`."""
+        touched = []
+        for entry in self.images:
+            if entry.auto is not None and entry.excluded:
+                entry.excluded = False
+                touched.append(entry.path)
+        return touched
 
     def forget_image(self, path: str) -> bool:
         """Exclude an image from learning WITHOUT deleting anything.
@@ -227,6 +355,9 @@ class CalibrationStore:
                 f"bins labeled both present and absent for {path}: {sorted(conflict)}"
             )
         entry = self.ensure_image(path)
+        # A label is human attention: the entry becomes ordinary
+        # evidence and leaves the auto reservoir.
+        entry.auto = None
         for bin_id in present:
             if bin_id not in entry.present:
                 entry.present.append(bin_id)
@@ -533,6 +664,7 @@ def learning_view(
                 ),
                 label_epoch=dict(entry.label_epoch),
                 view_epoch=entry.view_epoch,
+                auto=entry.auto,
             )
         )
 
@@ -633,6 +765,16 @@ def validate_store(store: CalibrationStore) -> None:
         if entry.path in paths:
             raise ProfileError(f"duplicate image entry {entry.path!r}")
         paths.add(entry.path)
+        if entry.auto is not None:
+            for name, value in (
+                ("median_sat", entry.auto.median_sat),
+                ("median_val", entry.auto.median_val),
+            ):
+                if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+                    raise ProfileError(
+                        f"{entry.path}: auto stamp {name} outside [0, 1]: "
+                        f"{value}"
+                    )
         # Dangling bin references (hand-edited/foreign store files) must
         # fail loudly here - learn silently skips unmatched ids, which
         # would quietly weaken the learned profile.
@@ -817,6 +959,10 @@ def store_from_dict(data: dict[str, Any]) -> CalibrationStore:
     if int(data.get("schema_version", 0)) == 2:
         # v2 -> v3 is a pure field addition (regions default to the
         # whole bbox = exact v2 semantics): lossless by construction.
+        data = {**data, "schema_version": 3}
+    if int(data.get("schema_version", 0)) == 3:
+        # v3 -> v4 adds the auto-provenance stamp; absent means "made
+        # by a human", which is what every v3 entry is.
         data = {**data, "schema_version": STORE_SCHEMA_VERSION}
     try:
         store = CalibrationStore(
@@ -869,6 +1015,14 @@ def store_from_dict(data: dict[str, Any]) -> CalibrationStore:
                     },
                     view_epoch=int(e.get("view_epoch", 0)),
                     excluded=bool(e.get("excluded", False)),
+                    auto=(
+                        None
+                        if e.get("auto") is None
+                        else AutoStamp(
+                            median_sat=float(e["auto"]["median_sat"]),
+                            median_val=float(e["auto"]["median_val"]),
+                        )
+                    ),
                 )
                 for e in data.get("images", [])
             ],

@@ -56,6 +56,7 @@ _LOGGER = logging.getLogger(__name__)
 
 V1_BACKUP_NAME = "calibration_v1_backup.json"
 V2_BACKUP_NAME = "calibration_v2_backup.json"
+V3_BACKUP_NAME = "calibration_v3_backup.json"
 STORE_MIRROR_NAME = "store.json"
 
 
@@ -231,6 +232,16 @@ class WastebinStorage:
         # bump makes the profile scene-stale even though its ROI still
         # matches (the profile schema itself stays unversioned).
         self.profile_view_epoch: int = 0
+        # Why unattended collection is currently paused (None = it is
+        # not). Set when a relearn refused to adopt what was collected.
+        self.auto_paused: str | None = None
+        # The situation the user declared for the running learning
+        # session: {bin_id: "present" | "absent"} for every bin the
+        # session covers. The user undertakes to keep the yard in that
+        # state until the session ends, which is what makes the labels
+        # on the collected frames human statements rather than machine
+        # guesses. None means: no session declared, collect nothing.
+        self.learning_declaration: dict[str, str] | None = None
         # Set on unload: a superseded instance (config entry reloaded
         # while a relearn was still running) must never write again,
         # or last-write-wins would resurrect pre-reload state.
@@ -263,10 +274,21 @@ class WastebinStorage:
                 await self._hass.async_add_executor_job(
                     self._write_backup, V2_BACKUP_NAME, raw
                 )
+            elif version == 3:
+                # And for v3 -> v4: a release without learning runs
+                # cannot read a store that carries their provenance.
+                await self._hass.async_add_executor_job(
+                    self._write_backup, V3_BACKUP_NAME, raw
+                )
             self.calibration = store_from_dict(raw)
         if data.get("profile"):
             self.profile = profile_from_dict(data["profile"])
         self.learning = bool(data.get("learning", True))
+        self.auto_paused = data.get("auto_paused")
+        declaration = data.get("learning_declaration")
+        self.learning_declaration = (
+            None if declaration is None else dict(declaration)
+        )
         # Pre-0.3.4 samples were [sat, val, clip] triples; the window is
         # an ephemeral one-day diagnostic and regenerates from live
         # frames, so old-format entries are simply dropped (the already
@@ -358,6 +380,8 @@ class WastebinStorage:
                     profile_to_dict(self.profile) if self.profile else None
                 ),
                 "learning": self.learning,
+                "auto_paused": self.auto_paused,
+                "learning_declaration": self.learning_declaration,
                 "gate_samples": self.gate_samples,
                 "profile_view_epoch": self.profile_view_epoch,
             }

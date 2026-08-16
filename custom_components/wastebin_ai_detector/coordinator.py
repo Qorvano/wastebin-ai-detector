@@ -44,11 +44,16 @@ from .const import (
     DOMAIN,
 )
 from .core import (
+    AutoStamp,
+    CalibrationError,
     DetectionResult,
     Profile,
     WastebinError,
     detect,
+    learn_color_model,
     load_image_rgb_bytes,
+    reference_rects,
+    reservoir_decision,
 )
 from .storage import WastebinStorage, archive_dir, widen_profile_gates
 
@@ -375,8 +380,112 @@ class WastebinCoordinator(DataUpdateCoordinator[DetectionResult]):
         return detect(load_image_rgb_bytes(data), profile)
 
 
+def _declaration_signature(
+    present: list[str], absent: list[str]
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    return (tuple(sorted(present)), tuple(sorted(absent)))
+
+
+def _entry_signature(entry) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    if entry is None:
+        return ((), ())
+    return _declaration_signature(entry.present, entry.absent)
+
+
+def _evaluate_auto_frame(
+    data: bytes,
+    profile: Profile,
+    references: dict[str, list],
+    retained: list[tuple[str, tuple[float, float]]],
+) -> dict[str, Any]:
+    """Decide whether this frame earns a slot in the reservoir.
+
+    Pure and HA-free, so it runs in the executor. Two gate classes,
+    both MODEL-FREE by design:
+
+    - frame-level light validity, reusing the very gates detection
+      already applies (greyscale night, overexposure, broken keyframe);
+    - patch coherence, which asks "is this patch ONE colour", never "is
+      it the colour I already know".
+
+    The second distinction is the whole point. A guard of the form
+    "only sample when it matches the current model" would reject
+    exactly the frames carrying new information - a lid in light the
+    models have never seen - which is what the collection exists for.
+    """
+    img = load_image_rgb_bytes(data)
+    result = detect(img, profile)
+    if result.frame_integrity_suspect:
+        return {"accept": False, "reason": "frame_integrity", "evict": None}
+    if result.grayscale_suspect:
+        return {"accept": False, "reason": "greyscale", "evict": None}
+    if result.overexposure_suspect:
+        return {"accept": False, "reason": "overexposed", "evict": None}
+    # Coherence: every referenced patch must show one colour. A rect
+    # that has slid half onto the ground (a bin was moved despite the
+    # standing precondition) fails here without any model knowledge.
+    for bin_id, rects in references.items():
+        hue, sat, val = _patch_pixels(img, profile, rects)
+        if hue.size == 0:
+            return {"accept": False, "reason": "empty_patch", "evict": None}
+        try:
+            learn_color_model(hue, sat, val, bin_id=bin_id)
+        except CalibrationError:
+            return {"accept": False, "reason": "incoherent_patch", "evict": None}
+    coord = (result.median_sat, result.median_val)
+    decision = reservoir_decision(retained, coord)
+    return {
+        "accept": decision.accept,
+        "reason": decision.reason,
+        "evict": decision.evict,
+        "coord": coord,
+    }
+
+
+def _patch_pixels(img, profile: Profile, rects: list):
+    """Pixels of the reference patches, through each rect's own stored
+    extraction grid - exactly how the learner reads them."""
+    import numpy as np
+
+    from .core import extract_working_roi, rect_to_pixels, rgb_to_hsv
+    from .core.store import image_rect_in_roi
+
+    hues, sats, vals = [], [], []
+    for sample in rects:
+        grid = image_rect_in_roi(sample.rect, sample.roi)
+        if grid is None:
+            continue
+        arr = extract_working_roi(
+            img, sample.roi, profile.working_width, profile.resample
+        )
+        hue, sat, val = rgb_to_hsv(arr)
+        try:
+            x0, y0, x1, y1 = rect_to_pixels(
+                grid.x, grid.y, grid.w, grid.h, hue.shape[1], hue.shape[0]
+            )
+        except WastebinError:
+            continue
+        hues.append(hue[y0:y1, x0:x1].ravel())
+        sats.append(sat[y0:y1, x0:x1].ravel())
+        vals.append(val[y0:y1, x0:x1].ravel())
+    if not hues:
+        return np.array([]), np.array([]), np.array([])
+    return (
+        np.concatenate(hues),
+        np.concatenate(sats),
+        np.concatenate(vals),
+    )
+
+
 class LearningCollector:
-    """Archives daylight snapshots while learning mode is enabled."""
+    """Archives daylight snapshots while learning mode is enabled, and
+    re-applies the user's own lid marks to the informative ones.
+
+    The unattended half collects COLOUR evidence only. It never writes
+    a presence label: the threshold is anchored by the smallest
+    positive and largest negative blob a human confirmed, and the only
+    machine that could produce such a label is the detector itself.
+    """
 
     def __init__(
         self, hass: HomeAssistant, entry: ConfigEntry, storage: WastebinStorage
@@ -391,6 +500,9 @@ class LearningCollector:
         )
         self._dir = archive_dir(hass, entry.entry_id)
         self._unsub: CALLBACK_TYPE | None = None
+        self._entry = entry
+        self._auto_busy = False
+        self.auto_diagnostics: dict[str, Any] = {}
 
     @callback
     def async_start(self) -> None:
@@ -414,12 +526,130 @@ class LearningCollector:
         if not is_up(self._hass):
             return
         try:
-            await self.async_capture_now()
+            filename, data = await self._async_capture_bytes()
         except HomeAssistantError as err:
             _LOGGER.debug("learning capture skipped: %s", err)
+            return
+        await self._async_maybe_auto_sample(filename, data)
+
+    async def _async_maybe_auto_sample(
+        self, filename: str, data: bytes
+    ) -> None:
+        """Record this frame as one observation of the DECLARED
+        situation, if it adds anything.
+
+        Cheapest checks first; every rejection is silent and leaves no
+        store entry behind, so declining costs nothing.
+        """
+        storage = self._storage
+        declaration = storage.learning_declaration
+        if declaration is None:
+            return
+        if storage.auto_paused is not None:
+            self._note_skip("paused")
+            return
+        if self._auto_busy:
+            self._note_skip("still_working")
+            return
+        profile = storage.profile
+        if profile is None:
+            self._note_skip("no_profile")
+            # Without a learned profile there are no light gates, so
+            # "is this frame usable" is unanswerable. Refusing is the
+            # honest answer; the first manual calibration provides it.
+            return
+        runtime = getattr(self._entry, "runtime_data", None)
+        if runtime is None:
+            return
+        if runtime.relearn_lock.locked():
+            self._note_skip("relearn_running")
+            return
+        present = [b for b, state in declaration.items() if state == "present"]
+        absent = [b for b, state in declaration.items() if state == "absent"]
+        # Marks of an ABSENT bin would sample the ground, so only the
+        # bins declared present contribute colour.
+        references = {
+            bin_id: rects
+            for bin_id, rects in reference_rects(storage.calibration).items()
+            if bin_id in present
+        }
+        missing_marks = [b for b in present if b not in references]
+        if missing_marks:
+            # A bin declared present without a current mark cannot be
+            # sampled, and labelling it present anyway would assert
+            # something no patch ever checked. The run waits until the
+            # user marks it (or ends the run and declares it away).
+            self._note_skip("no_mark_for:" + ",".join(sorted(missing_marks)))
+            return
+        # One reservoir per declared SITUATION: absent runs must not be
+        # evicted by present runs, and vice versa - they are different
+        # evidence, not competing samples of the same thing.
+        signature = _declaration_signature(present, absent)
+        retained = [
+            (path, coord)
+            for path, coord in storage.calibration.auto_reservoir()
+            if _entry_signature(storage.calibration.get_image(path))
+            == signature
+        ]
+        self._auto_busy = True
+        try:
+            outcome = await self._hass.async_add_executor_job(
+                _evaluate_auto_frame,
+                data,
+                profile,
+                references,
+                list(retained),
+            )
+        except WastebinError as err:
+            _LOGGER.debug("learning run skipped this frame: %s", err)
+            return
+        except Exception:  # noqa: BLE001 - never wedge the collector
+            _LOGGER.exception("learning run failed to evaluate a frame")
+            return
+        finally:
+            self._auto_busy = False
+        self.auto_diagnostics = {
+            **self.auto_diagnostics,
+            "last_reason": outcome["reason"],
+        }
+        if not outcome["accept"]:
+            return
+        # The gates were checked before an await; re-check the ones a
+        # concurrent relearn or an unload can have changed meanwhile.
+        if (
+            storage.learning_declaration != declaration
+            or storage.auto_paused is not None
+            or getattr(self._entry, "runtime_data", None) is None
+        ):
+            return
+        stamp = AutoStamp(*outcome["coord"])
+        storage.calibration.record_auto_frame(
+            filename,
+            stamp,
+            samples={
+                bin_id: [r.rect for r in rects]
+                for bin_id, rects in references.items()
+            },
+            present=present,
+            absent=absent,
+        )
+        if outcome["evict"]:
+            storage.calibration.forget_image(outcome["evict"])
+        await storage.async_save()
+        from .services import async_relearn  # local: avoids a cycle
+
+        try:
+            await async_relearn(self._hass, self._entry)
+        except HomeAssistantError as err:
+            _LOGGER.warning("relearn after auto sampling failed: %s", err)
 
     async def async_capture_now(self) -> str:
-        """Capture one frame into the archive; returns the filename.
+        """Capture one frame into the archive; returns the filename."""
+        filename, _data = await self._async_capture_bytes()
+        return filename
+
+    async def _async_capture_bytes(self) -> tuple[str, bytes]:
+        """Capture one frame into the archive; returns (name, bytes).
 
         Raises HomeAssistantError for both camera and filesystem
         failures, so every caller has a single error contract.
@@ -436,7 +666,15 @@ class LearningCollector:
             raise HomeAssistantError(
                 f"cannot write snapshot to {self._dir}: {err}"
             ) from err
-        return filename
+        return filename, image.content
+
+    def _note_skip(self, reason: str) -> None:
+        """Why the last tick collected nothing - otherwise a run that
+        silently does nothing looks identical to one that works."""
+        self.auto_diagnostics = {
+            **self.auto_diagnostics,
+            "last_reason": reason,
+        }
 
     def _write(self, filename: str, data: bytes) -> None:
         self._dir.mkdir(parents=True, exist_ok=True)

@@ -27,6 +27,7 @@ from .const import (
     STATUS_OUTCOMES,
 )
 from .coordinator import WastebinCoordinator
+from .core import describe_reservoir
 
 if TYPE_CHECKING:
     from . import WastebinConfigEntry
@@ -92,4 +93,14 @@ class WastebinStatusSensor(
             },
             "polygons": self._entry.data.get(CONF_ROI_POLYGONS),
         }
+        # Unattended collection: how much of the light space is covered
+        # so far, and whether it is currently paused for review.
+        runtime = self._entry.runtime_data
+        auto = describe_reservoir(runtime.storage.calibration)
+        auto["paused"] = runtime.storage.auto_paused
+        # The declaration IS the running learning run: the card reads
+        # it to know whether manual capturing is currently locked.
+        auto["declaration"] = runtime.storage.learning_declaration
+        auto.update(runtime.collector.auto_diagnostics)
+        attributes["auto_sampling"] = auto
         return attributes

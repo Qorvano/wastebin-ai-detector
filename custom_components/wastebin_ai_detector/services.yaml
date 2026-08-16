@@ -177,3 +177,61 @@ set_roi:
           min: 1
           step: 1
           mode: box
+
+discard_auto_evidence:
+  name: Automatisch gesammeltes zuruecknehmen
+  description: >-
+    Nimmt alle automatisch gesammelten Farbproben aus dem Training. Es
+    wird nichts geloescht; restore_auto_evidence macht es rueckgaengig.
+  fields:
+    entry_id:
+      name: Eintrag
+      required: false
+      selector:
+        text:
+
+restore_auto_evidence:
+  name: Automatisch gesammeltes wieder zulassen
+  description: >-
+    Laesst zuvor zurueckgenommene Proben wieder ins Training und hebt
+    eine Pause der automatischen Sammlung auf.
+  fields:
+    entry_id:
+      name: Eintrag
+      required: false
+      selector:
+        text:
+
+start_learning:
+  name: Lernlauf starten
+  description: >-
+    Erklaert die aktuelle Situation und startet den selbstaendigen
+    Lernlauf. Ab dann nimmt das System in festem Abstand eigene
+    Aufnahmen und wertet sie als genau diese Situation. Die Tonnen
+    duerfen sich waehrend des Laufs nicht veraendern.
+  fields:
+    present:
+      name: Tonnen, die da sind
+      required: false
+      selector:
+        object:
+    absent:
+      name: Tonnen, die weg sind
+      required: false
+      selector:
+        object:
+    entry_id:
+      name: Eintrag
+      required: false
+      selector:
+        text:
+
+stop_learning:
+  name: Lernlauf beenden
+  description: Beendet den Lernlauf und loescht die Situations-Erklaerung.
+  fields:
+    entry_id:
+      name: Eintrag
+      required: false
+      selector:
+        text:

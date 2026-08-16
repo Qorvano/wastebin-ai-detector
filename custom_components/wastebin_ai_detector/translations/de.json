@@ -310,6 +310,54 @@
           "description": "Analysebreite"
         }
       }
+    },
+    "start_learning": {
+      "name": "Lernlauf starten",
+      "description": "Erklärt die Situation und lässt das System selbstständig aufnehmen und lernen, bis der Lauf beendet wird.",
+      "fields": {
+        "present": {
+          "name": "Tonnen, die da sind",
+          "description": ""
+        },
+        "absent": {
+          "name": "Tonnen, die weg sind",
+          "description": ""
+        },
+        "entry_id": {
+          "name": "Eintrag",
+          "description": ""
+        }
+      }
+    },
+    "stop_learning": {
+      "name": "Lernlauf beenden",
+      "description": "Beendet den Lauf und löscht die erklärte Situation.",
+      "fields": {
+        "entry_id": {
+          "name": "Eintrag",
+          "description": ""
+        }
+      }
+    },
+    "discard_auto_evidence": {
+      "name": "Gesammeltes beiseitelegen",
+      "description": "Nimmt alles, was die Lernläufe gesammelt haben, aus dem Training. Es wird nichts gelöscht.",
+      "fields": {
+        "entry_id": {
+          "name": "Eintrag",
+          "description": ""
+        }
+      }
+    },
+    "restore_auto_evidence": {
+      "name": "Gesammeltes zurückholen",
+      "description": "Lässt zuvor beiseitegelegte Evidenz wieder ins Training und hebt eine Pause auf.",
+      "fields": {
+        "entry_id": {
+          "name": "Eintrag",
+          "description": ""
+        }
+      }
     }
   },
   "issues": {

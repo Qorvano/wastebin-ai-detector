@@ -39,6 +39,15 @@ const TEXTS = {
     absent: "away",
     unset: "-",
     save_labels: "Save presence",
+    start_run: "Start learning run",
+    stop_run: "End learning run",
+    run_hint: "Declare what is standing there right now, then start. The system captures and learns on its own until you end the run - leave the bins exactly as declared.",
+    run_active: "Learning run active: ",
+    run_started: "Learning run started. The system now captures on its own.",
+    run_stopped: "Learning run ended. Collected frames: ",
+    run_locked: "A learning run is active - end it to capture or mark by hand.",
+    declare_first: "Declare at least one bin as here or away first.",
+    run_needs_status: "Add status_entity to the card config to run learning runs from here.",
     need_capture: "Capture a snapshot first - marks and presence attach to an archived file.",
     draw_first: "Mark at least two points on the lid first.",
     need_closed: "Close the contour first (tap the first point).",
@@ -72,6 +81,15 @@ const TEXTS = {
     absent: "weg",
     unset: "-",
     save_labels: "Anwesenheit speichern",
+    start_run: "Lernlauf starten",
+    stop_run: "Lernlauf beenden",
+    run_hint: "Erklären Sie, was gerade dasteht, und starten Sie dann. Das System nimmt selbstständig auf und lernt daraus, bis Sie den Lauf beenden - lassen Sie die Tonnen bitte genau so stehen.",
+    run_active: "Lernlauf läuft: ",
+    run_started: "Lernlauf gestartet. Das System nimmt jetzt selbst auf.",
+    run_stopped: "Lernlauf beendet. Gesammelte Aufnahmen: ",
+    run_locked: "Ein Lernlauf läuft - bitte beenden Sie ihn, um selbst aufzunehmen oder zu markieren.",
+    declare_first: "Bitte erklären Sie zuerst mindestens eine Tonne als da oder weg.",
+    run_needs_status: "Bitte ergänzen Sie status_entity in der Karten-Konfiguration, um Lernläufe hier zu steuern.",
     need_capture: "Bitte nehmen Sie zuerst einen Schnappschuss auf - Markierungen und Anwesenheit gehören zu einer archivierten Datei.",
     draw_first: "Bitte markieren Sie zuerst mindestens zwei Punkte auf dem Deckel.",
     need_closed: "Bitte schließen Sie zuerst die Kontur (ersten Punkt antippen).",
@@ -125,6 +143,7 @@ class WastebinCalibrationCard extends HTMLElement {
     this.attachShadow({ mode: "open" });
     this._mode = "view";
     this._points = []; // [[x, y], ...] lid points, image-relative
+    this._locked = false; // a declared learning run is active
     this._saving = false;
     this._dragStart = null;
     this._filename = null;
@@ -187,11 +206,100 @@ class WastebinCalibrationCard extends HTMLElement {
     }
     this._updateImage();
     this._updateOverlay();
+    this._renderRunRow();
     this._maybePrefillRegion();
   }
 
   getCardSize() {
     return 6;
+  }
+
+  _session() {
+    /* The running learning run, read from the status sensor: the card
+     * never keeps its own idea of whether a run is active. */
+    if (!this._config.status_entity || !this._hass) return null;
+    const state = this._hass.states[this._config.status_entity];
+    if (!state) return null;
+    const auto = state.attributes.auto_sampling || null;
+    return auto && auto.declaration ? auto : null;
+  }
+
+  async _startRun() {
+    const present = [];
+    const absent = [];
+    for (const [binId, value] of Object.entries(this._labels)) {
+      if (value === "present") present.push(binId);
+      if (value === "absent") absent.push(binId);
+    }
+    if (!present.length && !absent.length) {
+      return this._setStatus(this._t.declare_first);
+    }
+    try {
+      await this._svc("start_learning", { present, absent }, true);
+      this._setStatus(this._t.run_started);
+      this._renderRunRow();
+    } catch (err) {
+      this._setStatus(this._t.error + (err.message || err));
+    }
+  }
+
+  async _stopRun() {
+    try {
+      const result = await this._svc("stop_learning", {}, true);
+      this._setStatus(
+        this._t.run_stopped + (result?.response?.collected ?? "?")
+      );
+      this._renderRunRow();
+    } catch (err) {
+      this._setStatus(this._t.error + (err.message || err));
+    }
+  }
+
+  _renderRunRow() {
+    const row = this.shadowRoot.getElementById("run-actions");
+    if (!row) return;
+    const start = this.shadowRoot.getElementById("start-run");
+    const stop = this.shadowRoot.getElementById("stop-run");
+    const info = this.shadowRoot.getElementById("run-info");
+    if (!this._config.status_entity) {
+      /* The run state lives on the status sensor. Without it the card
+       * could start a run it can neither show nor stop, so it offers
+       * none and says why. */
+      start.style.display = "none";
+      stop.style.display = "none";
+      info.textContent = this._t.run_needs_status;
+      return;
+    }
+    const session = this._session();
+    start.style.display = session ? "none" : "";
+    stop.style.display = session ? "" : "none";
+    if (session) {
+      const declared = Object.entries(session.declaration)
+        .map(
+          ([binId, state]) =>
+            (this._config.bins.find((b) => b.id === binId) || {}).name ||
+            binId
+        )
+        .join(", ");
+      info.textContent =
+        this._t.run_active +
+        declared +
+        " (" +
+        (session.retained ?? 0) +
+        "/" +
+        (session.capacity ?? "?") +
+        ")";
+    } else {
+      info.textContent = "";
+    }
+    /* While a run is active the yard must stay as declared, so manual
+     * capturing and marking are out of reach until it ends. */
+    this._locked = Boolean(session);
+    for (const id of ["capture", "save-labels"]) {
+      const el = this.shadowRoot.getElementById(id);
+      if (el) el.disabled = this._locked;
+    }
+    this._renderMarkRow();
   }
 
   _region() {
@@ -250,6 +358,7 @@ class WastebinCalibrationCard extends HTMLElement {
   // -- actions ---------------------------------------------------------
 
   async _capture() {
+    if (this._session()) return this._setStatus(this._t.run_locked);
     try {
       const result = await this._svc("capture_snapshot", {}, true);
       this._filename = result?.response?.filename || null;
@@ -357,6 +466,7 @@ class WastebinCalibrationCard extends HTMLElement {
   }
 
   async _saveSample(binId) {
+    if (this._session()) return this._setStatus(this._t.run_locked);
     if (!this._filename) return this._setStatus(this._t.need_capture);
     if (this._points.length < 2) return this._setStatus(this._t.draw_first);
     this._saving = true; /* one statement at a time */
@@ -490,6 +600,7 @@ class WastebinCalibrationCard extends HTMLElement {
   }
 
   async _saveLabels() {
+    if (this._session()) return this._setStatus(this._t.run_locked);
     if (!this._filename) return this._setStatus(this._t.need_capture);
     const present = [];
     const absent = [];
@@ -826,7 +937,11 @@ class WastebinCalibrationCard extends HTMLElement {
         this._setStatus(this._t.mark_hint);
       }
     }
-    if (mode === "label") this._setStatus(this._t.presence_hint);
+    if (mode === "label") {
+      this._setStatus(
+        this._session() ? this._t.run_locked : this._t.run_hint
+      );
+    }
     this._persist();
     this._paintPoints();
     this._paintMarks();
@@ -857,7 +972,8 @@ class WastebinCalibrationCard extends HTMLElement {
      * which is also the affordance telling the user to draw first. */
     const row = this.shadowRoot.getElementById("mark-bins");
     if (!row) return;
-    const ready = this._points.length >= 2 && !this._saving;
+    const ready =
+      this._points.length >= 2 && !this._saving && !this._locked;
     row.replaceChildren(
       ...this._config.bins.map((bin) => {
         const btn = document.createElement("button");
@@ -991,6 +1107,11 @@ class WastebinCalibrationCard extends HTMLElement {
         <div class="actions" id="label-actions" style="display:none">
           <span id="label-bins" class="actions"></span>
           <button id="save-labels">${t.save_labels}</button>
+          <button id="start-run">${t.start_run}</button>
+          <button id="stop-run" style="display:none">${t.stop_run}</button>
+        </div>
+        <div class="actions" id="run-actions">
+          <span id="run-info"></span>
         </div>
         <div id="status"></div>
       </ha-card>
@@ -1007,6 +1128,10 @@ class WastebinCalibrationCard extends HTMLElement {
       this._clearRegion();
     this.shadowRoot.getElementById("save-labels").onclick = () =>
       this._saveLabels();
+    this.shadowRoot.getElementById("start-run").onclick = () =>
+      this._startRun();
+    this.shadowRoot.getElementById("stop-run").onclick = () =>
+      this._stopRun();
     this.shadowRoot.getElementById("undo-point").onclick = () => {
       this._points.pop();
       this._paintPoints();

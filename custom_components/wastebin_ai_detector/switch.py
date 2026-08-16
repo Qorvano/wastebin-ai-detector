@@ -53,5 +53,11 @@ class WastebinLearningSwitch(SwitchEntity):
     async def _async_set(self, value: bool) -> None:
         storage = self._entry.runtime_data.storage
         storage.learning = value
+        if not value:
+            # A declared run cannot outlive learning mode: otherwise
+            # the card stays locked and the status keeps announcing a
+            # run that collects nothing.
+            storage.learning_declaration = None
         await storage.async_save()
         self.async_write_ha_state()
+        await self._entry.runtime_data.coordinator.async_request_refresh()

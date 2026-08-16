@@ -310,6 +310,54 @@
           "description": "Analysis width"
         }
       }
+    },
+    "start_learning": {
+      "name": "Start learning run",
+      "description": "Declare the situation and let the system capture and learn on its own until the run is ended.",
+      "fields": {
+        "present": {
+          "name": "Bins that are here",
+          "description": ""
+        },
+        "absent": {
+          "name": "Bins that are away",
+          "description": ""
+        },
+        "entry_id": {
+          "name": "Entry",
+          "description": ""
+        }
+      }
+    },
+    "stop_learning": {
+      "name": "End learning run",
+      "description": "Ends the run and clears the declared situation.",
+      "fields": {
+        "entry_id": {
+          "name": "Entry",
+          "description": ""
+        }
+      }
+    },
+    "discard_auto_evidence": {
+      "name": "Set collected evidence aside",
+      "description": "Takes everything the learning runs collected out of training. Nothing is deleted.",
+      "fields": {
+        "entry_id": {
+          "name": "Entry",
+          "description": ""
+        }
+      }
+    },
+    "restore_auto_evidence": {
+      "name": "Bring collected evidence back",
+      "description": "Returns previously set-aside evidence to training and lifts a pause.",
+      "fields": {
+        "entry_id": {
+          "name": "Entry",
+          "description": ""
+        }
+      }
     }
   },
   "issues": {

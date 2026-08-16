@@ -5,6 +5,21 @@ package can be exercised offline (calibration CLI, tests) and is reused
 unchanged by the Home Assistant integration layer.
 """
 
+from .autosample import (
+    AUTO_RESERVOIR_CAPACITY,
+    AdoptionVerdict,
+    ReservoirDecision,
+    adoption_verdict,
+    describe_reservoir,
+    over_capacity_paths,
+    reservoir_by_situation,
+    has_auto_evidence,
+    reference_rects,
+    regime_distance,
+    reservoir_decision,
+    reservoir_trim,
+    without_auto_evidence,
+)
 from .ccl import (
     component_regions,
     largest_component_area,
@@ -44,6 +59,7 @@ from .errors import (
 )
 from .imageio import (
     extract_working_roi,
+    rect_to_pixels,
     load_image_rgb,
     load_image_rgb_bytes,
     roi_to_pixels,
@@ -53,6 +69,7 @@ from .learn import (
     learn_area_threshold,
     learn_color_model,
     learn_profile,
+    misclassified_manual_labels,
     shape_bounds,
 )
 from .profile import (
@@ -78,6 +95,7 @@ from .region import (
     validate_rings,
 )
 from .store import (
+    AutoStamp,
     BinDecl,
     CalibrationStore,
     ImageEntry,
@@ -98,6 +116,19 @@ from .store import (
 )
 
 __all__ = [
+    "AUTO_RESERVOIR_CAPACITY",
+    "AdoptionVerdict",
+    "ReservoirDecision",
+    "adoption_verdict",
+    "describe_reservoir",
+    "over_capacity_paths",
+    "reservoir_by_situation",
+    "has_auto_evidence",
+    "reference_rects",
+    "regime_distance",
+    "reservoir_decision",
+    "reservoir_trim",
+    "without_auto_evidence",
     "bin_mask",
     "bin_match",
     "component_holes",
@@ -108,6 +139,7 @@ __all__ = [
     "BinModel",
     "BinResult",
     "CalibrationError",
+    "AutoStamp",
     "CalibrationStore",
     "circular_dist_deg",
     "circular_mean_deg",
@@ -117,6 +149,7 @@ __all__ = [
     "detect_file",
     "DetectionResult",
     "extract_working_roi",
+    "rect_to_pixels",
     "fit_vonmises_uniform_mixture",
     "image_rect_in_roi",
     "ImageEntry",
@@ -127,6 +160,7 @@ __all__ = [
     "learn_area_threshold",
     "learn_color_model",
     "learn_profile",
+    "misclassified_manual_labels",
     "learning_view",
     "component_regions",
     "polygon_mask",

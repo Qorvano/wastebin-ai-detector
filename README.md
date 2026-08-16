@@ -138,6 +138,67 @@ In the card, "Draw region" replaces the rectangle mode: tap to add
 points, tap the first point to close, drag points to adjust, then
 apply - the relearn runs automatically and keeps all evidence.
 
+## Learning runs: the system trains itself on a declared situation (v0.7.0)
+
+Calibrating used to mean taking snapshots by hand and confirming each
+one. Now you declare the situation once and let the system work:
+
+1. Arrange the yard and mark each lid with five taps (once per bin).
+2. In the presence row, declare what is standing there: **here** for
+   the bins that are out, **away** for the ones that are not.
+3. Press **Start learning run**.
+
+From then on the integration captures on its own at the configured
+interval and records every usable frame as an observation of exactly
+that declared situation. Manual capturing and marking are locked while
+a run is active, because the declaration only holds as long as the yard
+does: leave the bins as declared until you press **End learning run**.
+
+**What a run may teach, and what it may not.** Your declaration says a
+bin STANDS there. It does not say its lid is measurable in a given
+frame, and those differ exactly when a shadow, a van or heavy rain
+covers most of the lid. The presence threshold rests on the SMALLEST
+positive area ever confirmed, so a truthful declaration plus one
+covered lid would collapse it (measured on the real learner: a
+305-fold drop, adopted silently). Frames from a run therefore teach:
+
+- **colour**, always - that is what they are collected for;
+- **negative evidence** when the bin was declared away, because "the
+  yard is empty" is a complete statement that needs no judgement about
+  visibility;
+- **never** the smallest positive area, the lid shape bounds or the
+  region-edge band. Those are extrema, and a human has to have looked
+  at the frame to set them.
+
+Declaring bins **away** is how you get negative evidence without
+waiting for collection day: put them aside, declare them away, let a
+run gather the "empty yard" across an afternoon of changing light.
+
+What keeps an unattended run from slowly corrupting the models:
+
+- **A bounded reservoir.** At most ceil(1 + 100/5) = 21 frames are kept
+  per declared situation, and a new frame is only kept if it improves
+  the spread over the measured light space. The number is derived from
+  the percentile the colour floors are learned with, not chosen, and
+  the dispersion rule doubles as the rate limit - leaving a run on for
+  weeks is safe by construction.
+- **Model-free gates only.** A frame is rejected when it is a night
+  frame, overexposed or a broken keyframe (the very gates detection
+  already uses), or when a marked patch is no longer ONE colour (a bin
+  that moved). Never "does it match what I already know" - that would
+  reject exactly the new light the run exists to capture.
+- **A holdout test.** Every relearn with collected evidence learns
+  twice, with and without it, and adopts the collected half only if the
+  resulting profile still reproduces every image YOU labelled by hand.
+  Otherwise the collected frames are set aside (never deleted), the run
+  pauses and the relearn says why.
+- **Anti-ratchet.** Collected frames never re-derive the light gates
+  that admitted them, or the night protection would erode one step per
+  relearn.
+
+`discard_auto_evidence` / `restore_auto_evidence` take everything a run
+collected out of or back into training in one call.
+
 ## Bins exclude each other, and lids are marked by points (v0.6.0)
 
 **Two bins can never occupy the same spot**, so detection now enforces

@@ -16,6 +16,7 @@ import pytest
 pytest.importorskip("pytest_homeassistant_custom_component")
 
 from homeassistant.core import HomeAssistant
+from homeassistant.util import dt as dt_util
 from homeassistant.data_entry_flow import FlowResultType
 from homeassistant.helpers import entity_registry as er
 from pytest_homeassistant_custom_component.common import MockConfigEntry
@@ -731,7 +732,11 @@ async def test_v1_storage_data_migrates_with_backup(
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
     calibration = entry.runtime_data.storage.calibration
-    assert calibration.schema_version == 3
+    from custom_components.wastebin_ai_detector.core.store import (
+        STORE_SCHEMA_VERSION,
+    )
+
+    assert calibration.schema_version == STORE_SCHEMA_VERSION
     sample = calibration.get_image("old.jpg").samples["gelbe_tonne"][0]
     assert sample.rect.x == pytest.approx(0.35)
     assert calibration.get_image("old.jpg").label_roi is not None
@@ -1258,3 +1263,222 @@ async def test_early_unlearnable_label_creates_no_repair_issue(
         assert (
             registry.async_get_issue(DOMAIN, relearn_issue_id(entry)) is None
         )
+
+
+async def test_a_declared_learning_run_collects_by_itself(
+    hass: HomeAssistant,
+) -> None:
+    """The user declares the situation and starts the run; the system
+    then captures and learns on its own, recording each frame as an
+    observation of exactly that declared situation."""
+    from custom_components.wastebin_ai_detector.core import AutoStamp
+
+    entry = MockConfigEntry(
+        domain=DOMAIN, data=ENTRY_DATA, title="Test", minor_version=2
+    )
+    entry.add_to_hass(hass)
+    feed = _CameraFeed(_scene_jpeg(with_yellow=True))
+    with patch(
+        "custom_components.wastebin_ai_detector.coordinator.async_get_image",
+        new=feed,
+    ), patch(
+        "custom_components.wastebin_ai_detector.coordinator.is_up",
+        return_value=True,
+    ):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        await _calibrate_yellow(hass)
+        # An absent frame so the threshold rests on real evidence.
+        feed.content = _scene_jpeg(with_yellow=False)
+        response = await hass.services.async_call(
+            DOMAIN, "capture_snapshot", {}, blocking=True, return_response=True
+        )
+        await hass.services.async_call(
+            DOMAIN,
+            "label_image",
+            {"filename": response["filename"], "absent": ["gelbe_tonne"]},
+            blocking=True,
+            return_response=True,
+        )
+        await hass.async_block_till_done(wait_background_tasks=True)
+
+        storage = entry.runtime_data.storage
+        collector = entry.runtime_data.collector
+        before = len(storage.calibration.images)
+        # The user declares what is standing there, then starts.
+        await hass.services.async_call(
+            DOMAIN,
+            "start_learning",
+            {"present": ["gelbe_tonne"]},
+            blocking=True,
+            return_response=True,
+        )
+        assert storage.learning_declaration == {"gelbe_tonne": "present"}
+
+        # A frame in a light the models have not seen: dimmer, so its
+        # regime coordinate differs from the calibrated ones.
+        feed.content = _scene_jpeg(with_yellow=True, yellow_scale=0.9)
+        await collector._async_interval(dt_util.now())
+        await hass.async_block_till_done(wait_background_tasks=True)
+
+        auto = [e for e in storage.calibration.images if e.auto is not None]
+        assert auto, "the collector kept nothing"
+        assert len(storage.calibration.images) > before
+        for entry_ in auto:
+            # The declaration, applied to a frame from the run.
+            assert entry_.present == ["gelbe_tonne"]
+            assert entry_.absent == []
+            assert entry_.samples
+            assert isinstance(entry_.auto, AutoStamp)
+
+        # Stopping ends the run and clears the declaration.
+        await hass.services.async_call(
+            DOMAIN, "stop_learning", {}, blocking=True, return_response=True
+        )
+        assert storage.learning is False
+        assert storage.learning_declaration is None
+
+
+async def test_collected_evidence_is_dropped_when_it_would_regress(
+    hass: HomeAssistant,
+) -> None:
+    """The adoption test is the safety net: evidence that worsens the
+    measurements on the user's own labelled images is set aside (never
+    deleted) and collection pauses."""
+    entry = MockConfigEntry(
+        domain=DOMAIN, data=ENTRY_DATA, title="Test", minor_version=2
+    )
+    entry.add_to_hass(hass)
+    feed = _CameraFeed(_scene_jpeg(with_yellow=True))
+    with patch(
+        "custom_components.wastebin_ai_detector.coordinator.async_get_image",
+        new=feed,
+    ), patch(
+        "custom_components.wastebin_ai_detector.coordinator.is_up",
+        return_value=True,
+    ):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        filename = await _calibrate_yellow(hass)
+        storage = entry.runtime_data.storage
+
+        # Inject collected evidence and force the verdict to refuse it.
+        from custom_components.wastebin_ai_detector.core import AutoStamp
+        from custom_components.wastebin_ai_detector.core.store import Rect
+
+        storage.calibration.record_auto_frame(
+            "auto.jpg",
+            AutoStamp(0.5, 0.5),
+            samples={"gelbe_tonne": [Rect(0.35, 0.35, 0.10, 0.10)]},
+            present=["gelbe_tonne"],
+            absent=[],
+        )
+        with patch(
+            "custom_components.wastebin_ai_detector.services.adoption_verdict"
+        ) as verdict:
+            from custom_components.wastebin_ai_detector.core import (
+                AdoptionVerdict,
+            )
+
+            verdict.return_value = AdoptionVerdict(
+                False, ["gelbe_tonne: stopped separating"], {}
+            )
+            await hass.services.async_call(
+                DOMAIN, "relearn", {}, blocking=True, return_response=True
+            )
+
+        auto_entry = storage.calibration.get_image("auto.jpg")
+        assert auto_entry.excluded is True  # set aside...
+        assert auto_entry.samples  # ...but nothing deleted
+        assert storage.auto_paused is not None
+        # The manual evidence still stands.
+        assert storage.calibration.get_image(filename).present == [
+            "gelbe_tonne"
+        ]
+
+        # Restoring clears the pause and lets the evidence back in.
+        await hass.services.async_call(
+            DOMAIN,
+            "restore_auto_evidence",
+            {},
+            blocking=True,
+            return_response=True,
+        )
+        assert storage.auto_paused is None
+        assert storage.calibration.get_image("auto.jpg").excluded is False
+
+
+async def test_a_learning_run_can_declare_a_bin_away(hass: HomeAssistant) -> None:
+    """The absent case, which is what the yard cannot produce by
+    itself: the user takes a bin away, declares it away, and the run
+    collects negative evidence across light conditions on its own."""
+    entry = MockConfigEntry(
+        domain=DOMAIN, data=ENTRY_DATA, title="Test", minor_version=2
+    )
+    entry.add_to_hass(hass)
+    feed = _CameraFeed(_scene_jpeg(with_yellow=True))
+    with patch(
+        "custom_components.wastebin_ai_detector.coordinator.async_get_image",
+        new=feed,
+    ), patch(
+        "custom_components.wastebin_ai_detector.coordinator.is_up",
+        return_value=True,
+    ):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        await _calibrate_yellow(hass)
+        storage = entry.runtime_data.storage
+        collector = entry.runtime_data.collector
+
+        # Bin taken away, declared away, run started.
+        feed.content = _scene_jpeg(with_yellow=False)
+        await hass.services.async_call(
+            DOMAIN,
+            "start_learning",
+            {"absent": ["gelbe_tonne"]},
+            blocking=True,
+            return_response=True,
+        )
+        await collector._async_interval(dt_util.now())
+        await hass.async_block_till_done(wait_background_tasks=True)
+
+        auto = [e for e in storage.calibration.images if e.auto is not None]
+        assert auto, "no negative evidence collected"
+        for recorded in auto:
+            assert recorded.absent == ["gelbe_tonne"]
+            assert recorded.present == []
+            # Nothing was sampled: the marks of an absent bin would
+            # sample the ground.
+            assert recorded.samples == {}
+
+
+async def test_a_running_learning_run_rejects_an_unknown_declaration(
+    hass: HomeAssistant,
+) -> None:
+    from homeassistant.exceptions import ServiceValidationError
+
+    entry = MockConfigEntry(
+        domain=DOMAIN, data=ENTRY_DATA, title="Test", minor_version=2
+    )
+    entry.add_to_hass(hass)
+    feed = _CameraFeed(_scene_jpeg(with_yellow=True))
+    with patch(
+        "custom_components.wastebin_ai_detector.coordinator.async_get_image",
+        new=feed,
+    ):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        for payload in (
+            {"present": ["does_not_exist"]},
+            {"present": ["gelbe_tonne"], "absent": ["gelbe_tonne"]},
+            {},
+        ):
+            with pytest.raises(ServiceValidationError):
+                await hass.services.async_call(
+                    DOMAIN,
+                    "start_learning",
+                    payload,
+                    blocking=True,
+                    return_response=True,
+                )
+        assert entry.runtime_data.storage.learning_declaration is None

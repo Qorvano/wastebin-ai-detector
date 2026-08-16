@@ -528,10 +528,69 @@ def derive_quality_gates(
     }
 
 
-def _hue_bands_overlap(a: BinModel, b: BinModel) -> bool:
+def hue_bands_overlap(a: BinModel, b: BinModel) -> bool:
     """Circular interval overlap of two learned hue bands (pure geometry)."""
     centers = abs(((a.hue_center_deg - b.hue_center_deg + 180.0) % 360.0) - 180.0)
     return centers <= a.hue_tol_deg + b.hue_tol_deg
+
+
+def misclassified_manual_labels(
+    profile: Profile,
+    store: CalibrationStore,
+    store_path: str | Path,
+) -> list[str]:
+    """Which of the USER's own labeled images does this profile get
+    wrong?
+
+    The holdout test behind unattended collection: frames recorded
+    during a learning run carry the situation the user declared for
+    that run, and a declaration can be wrong (a bin was moved away
+    mid-run). Hand-labeled images are the evidence the run cannot
+    touch, so measuring the candidate profile against them is a
+    like-for-like check rather than the collection grading itself.
+
+    Returns one description per disagreement. The caller compares the
+    result against the same measurement on the baseline profile: an
+    installation whose calibration does not separate misclassifies some
+    of its own images by construction (the learner says so), so only
+    NEW disagreements mean anything.
+
+    Judged on the learning view, not the raw store: a label the learner
+    itself set aside (recoloured lid, region shrunk) must not be used to
+    grade a profile that never saw it.
+    """
+    from .detect import detect
+
+    view, _warnings = learning_view(store)
+    mistakes: list[str] = []
+    for entry in view.images:
+        if entry.excluded or entry.auto is not None:
+            continue
+        if entry.view_epoch != view.view_epoch:
+            continue
+        if not entry.present and not entry.absent:
+            continue
+        try:
+            img = load_image_rgb(resolve_image_path(store_path, entry.path))
+        except ImageLoadError:
+            continue
+        result = detect(img, profile)
+        by_id = {b.id: b for b in result.bins}
+        for bin_id in entry.present:
+            found = by_id.get(bin_id)
+            if found is not None and not found.present:
+                mistakes.append(
+                    f"{entry.path}: {bin_id} was confirmed present but "
+                    "would now read absent"
+                )
+        for bin_id in entry.absent:
+            found = by_id.get(bin_id)
+            if found is not None and found.present:
+                mistakes.append(
+                    f"{entry.path}: {bin_id} was confirmed absent but "
+                    "would now read present"
+                )
+    return mistakes
 
 
 def learn_profile(
@@ -893,6 +952,15 @@ def learn_profile(
             for entry in usable_images:
                 if model.id not in entry.present:
                     continue
+                if entry.auto is not None:
+                    # Shape and reach bounds are EXTREMA (smallest fill,
+                    # widest aspect, shallowest touch). A learning run
+                    # deliberately seeks out the most extreme light it
+                    # can find, so letting its frames set those bounds
+                    # would widen them without limit - the same
+                    # self-referential trap the light gates are
+                    # protected from further down.
+                    continue
                 if not entry.samples.get(model.id):
                     continue
                 mask, denom = layer1_mask(entry.path, model, competitors)
@@ -952,6 +1020,8 @@ def learn_profile(
             neg_areas: list[float] = []
             for entry in usable_images:
                 if model.id in entry.present:
+                    if entry.auto is not None:
+                        continue  # see pass 2b: positives stay human
                     target = pos_areas
                 elif model.id in entry.absent:
                     target = neg_areas
@@ -1029,6 +1099,18 @@ def learn_profile(
             )
             for model, cand in zip(competitors, candidates):
                 if model.id in entry.present:
+                    if entry.auto is not None:
+                        # min_pos is the SMALLEST area still counted as
+                        # present - a statement about how little of the
+                        # lid can still be seen, which only a human who
+                        # looked at that frame can make. A learning run
+                        # declares that the bin STANDS there, not that
+                        # its lid is measurable in this particular
+                        # frame: a passing shadow over half the lid is a
+                        # truthful declaration and a catastrophic
+                        # threshold (measured: a 305-fold drop). Colour
+                        # is what these frames are collected for.
+                        continue
                     target = pos_by_bin[model.id]
                 elif model.id in entry.absent:
                     target = neg_by_bin[model.id]
@@ -1176,6 +1258,18 @@ def learn_profile(
     for e in usable_images:
         if e.view_epoch != store.view_epoch:
             continue
+        if e.auto is not None:
+            # ANTI-RATCHET: an auto-collected frame was admitted BY
+            # these gates, so letting it re-derive them is
+            # self-referential. daylight_sat_min is the minimum over
+            # the set, so each accepted frame would lower the floor to
+            # its own value and admit a dimmer one next time - the
+            # night protection would erode one step per relearn (and
+            # mirrored for the three upward gates). The light gates
+            # stay defined by frames a human accepted as calibration
+            # data. Auto frames DO take part in the aspect cross-check
+            # below, where more frames can only help.
+            continue
         _hue, sat, val = hsv_for(e.path, store.roi)
         median_sats.append(float(np.median(sat)))
         clip_fracs.append(float(np.mean(val >= clip_floor)))
@@ -1188,7 +1282,10 @@ def learn_profile(
             )
         )
     if not median_sats:
-        raise CalibrationError("store contains no usable calibration images")
+        raise CalibrationError(
+            "store contains no usable calibration images (automatically "
+            "collected frames deliberately do not define the light gates)"
+        )
     daylight_sat_min = min(median_sats)
     overexposure_clip_max = max(clip_fracs)
     daylight_val_max = max(median_vals)
@@ -1211,7 +1308,7 @@ def learn_profile(
     # 4) Ambiguity diagnosis: overlapping learned hue bands.
     for i, a in enumerate(bins):
         for b in bins[i + 1 :]:
-            if _hue_bands_overlap(a, b):
+            if hue_bands_overlap(a, b):
                 losses = " ".join(
                     f"{m.id} keeps "
                     f"{m.learning_stats.get('exclusive_keep_frac', 1.0):.0%} "

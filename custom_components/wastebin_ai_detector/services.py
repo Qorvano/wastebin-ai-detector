@@ -53,7 +53,11 @@ from .const import (
     SERVICE_FORGET_IMAGE,
     SERVICE_LABEL_IMAGE,
     SERVICE_MARK_BIN_CHANGED,
+    SERVICE_DISCARD_AUTO,
+    SERVICE_START_LEARNING,
+    SERVICE_STOP_LEARNING,
     SERVICE_RECONFIRM_IMAGES,
+    SERVICE_RESTORE_AUTO,
     SERVICE_RELEARN,
     SERVICE_RESTORE_IMAGE,
     SERVICE_SET_ROI,
@@ -65,6 +69,13 @@ from .core import (
     Rect,
     Roi,
     WastebinError,
+    AdoptionVerdict,
+    adoption_verdict,
+    has_auto_evidence,
+    misclassified_manual_labels,
+    over_capacity_paths,
+    reservoir_by_situation,
+    without_auto_evidence,
     learn_profile,
     rect_as_rings,
     rings_bbox,
@@ -149,6 +160,14 @@ RECONFIRM_SCHEMA = vol.Schema(
         vol.Required(ATTR_FILENAMES): vol.All(
             [_plain_filename], vol.Length(min=1)
         ),
+    }
+)
+
+START_LEARNING_SCHEMA = vol.Schema(
+    {
+        **_ENTRY_SCHEMA,
+        vol.Optional(ATTR_PRESENT, default=[]): [cv.string],
+        vol.Optional(ATTR_ABSENT, default=[]): [cv.string],
     }
 )
 
@@ -270,12 +289,72 @@ async def async_relearn(hass: HomeAssistant, entry: ConfigEntry) -> dict[str, An
         # service calls while the executor thread iterates it. The dict
         # round-trip is lossless and hands the learner an isolated copy.
         calibration = store_from_dict(store_to_dict(storage.calibration))
+        anchor = store_anchor(hass, entry.entry_id)
+        adoption: dict[str, Any] | None = None
         try:
-            profile, warnings = await hass.async_add_executor_job(
-                learn_profile,
-                calibration,
-                store_anchor(hass, entry.entry_id),
-            )
+            if has_auto_evidence(calibration):
+                # Learn twice: once on the user's own evidence alone,
+                # once with the unattended colour samples on top. Both
+                # passes see IDENTICAL human labels (auto entries carry
+                # none), so any difference is the colour models - and
+                # the comparison runs on evidence the collector cannot
+                # touch, which is what keeps it from grading its own
+                # homework.
+                baseline, _base_warnings = await hass.async_add_executor_job(
+                    learn_profile, without_auto_evidence(calibration), anchor
+                )
+                candidate, warnings = await hass.async_add_executor_job(
+                    learn_profile, calibration, anchor
+                )
+                verdict = adoption_verdict(baseline, candidate)
+                # Holdout: whatever the run collected, the resulting
+                # profile must still reproduce every statement the USER
+                # made by hand. That evidence is the one thing an
+                # unattended run cannot influence, which is what makes
+                # this a check rather than self-assessment.
+                manual_only = without_auto_evidence(calibration)
+                candidate_mistakes = await hass.async_add_executor_job(
+                    misclassified_manual_labels, candidate, manual_only, anchor
+                )
+                baseline_mistakes = await hass.async_add_executor_job(
+                    misclassified_manual_labels, baseline, manual_only, anchor
+                )
+                # Only NEW disagreements count: a calibration that does
+                # not separate already misclassifies some of its own
+                # images, and holding that against the collected
+                # evidence would make adoption impossible forever.
+                known = set(baseline_mistakes)
+                mistakes = [m for m in candidate_mistakes if m not in known]
+                regressions = [*verdict.regressions, *mistakes]
+                adoption = {
+                    "adopted": not regressions,
+                    "regressions": regressions,
+                    "gaps": verdict.gaps,
+                }
+                verdict = AdoptionVerdict(
+                    not regressions, regressions, verdict.gaps
+                )
+                if verdict.adopt:
+                    profile = candidate
+                else:
+                    # Keep what the human evidence alone says, set the
+                    # collected part aside (reversibly) and stop
+                    # collecting until the user has looked.
+                    profile = baseline
+                    storage.calibration.discard_auto_evidence()
+                    storage.auto_paused = "; ".join(verdict.regressions)
+                    warnings = [
+                        *_base_warnings,
+                        "what the learning run collected was NOT adopted "
+                        "and is set aside; collection stays paused until "
+                        "you call restore_auto_evidence (brings it back) "
+                        "or start a new run: "
+                        + "; ".join(verdict.regressions),
+                    ]
+            else:
+                profile, warnings = await hass.async_add_executor_job(
+                    learn_profile, calibration, anchor
+                )
         except WastebinError as err:
             # No issue is created here: interactive callers see the
             # error directly, and handle_label even treats it as the
@@ -298,6 +377,7 @@ async def async_relearn(hass: HomeAssistant, entry: ConfigEntry) -> dict[str, An
     trained_ids = {b.id for b in profile.bins}
     return {
         "warnings": warnings,
+        **({} if adoption is None else {"auto": adoption}),
         "untrained": sorted(
             set(calibration.active_bin_ids()) - trained_ids
         ),
@@ -356,6 +436,102 @@ def async_setup_services(hass: HomeAssistant) -> None:
             # yet (e.g. first label, no samples for another bin).
             return {"relearn": f"not possible yet: {err}"}
         return {"relearn": "ok", **result}
+
+    async def handle_start_learning(call: ServiceCall) -> ServiceResponse:
+        """Declare the situation and start collecting on its own.
+
+        Everything the run records afterwards rests on this
+        declaration, so it is validated like any other label: unknown
+        or retired bins and present/absent conflicts fail loudly here
+        rather than quietly producing wrong evidence for hours.
+        """
+        entry = _get_entry(hass, call)
+        storage = entry.runtime_data.storage
+        present = list(call.data[ATTR_PRESENT])
+        absent = list(call.data[ATTR_ABSENT])
+        store = storage.calibration
+        declared = present + absent
+        unknown = [b for b in declared if b not in store.bin_ids()]
+        if unknown:
+            raise ServiceValidationError(
+                f"unknown bin ids {unknown}; declared: {store.bin_ids()}"
+            )
+        retired = [
+            b
+            for b in declared
+            if (decl := store.get_bin(b)) is not None and not decl.active
+        ]
+        if retired:
+            raise ServiceValidationError(
+                f"bins {retired} are retired - reactivate them first"
+            )
+        conflict = sorted(set(present) & set(absent))
+        if conflict:
+            raise ServiceValidationError(
+                f"bins declared both present and absent: {conflict}"
+            )
+        if not declared:
+            raise ServiceValidationError(
+                "declare at least one bin as present or absent - the "
+                "declaration is what the collected frames will mean"
+            )
+        missing = [
+            b.id for b in store.bins if b.active and b.id not in declared
+        ]
+        storage.learning_declaration = {
+            **{b: "present" for b in present},
+            **{b: "absent" for b in absent},
+        }
+        storage.learning = True
+        storage.auto_paused = None
+        await storage.async_save()
+        # The card reads the running run from the status sensor, so it
+        # must reflect the new state now, not at the next scan.
+        await entry.runtime_data.coordinator.async_request_refresh()
+        return {
+            "declaration": storage.learning_declaration,
+            # Undeclared bins are simply not part of this run: their
+            # evidence stays whatever it was.
+            "not_declared": missing,
+        }
+
+    async def handle_stop_learning(call: ServiceCall) -> ServiceResponse:
+        entry = _get_entry(hass, call)
+        storage = entry.runtime_data.storage
+        collected = sum(
+            len(v)
+            for v in reservoir_by_situation(storage.calibration).values()
+        )
+        storage.learning = False
+        storage.learning_declaration = None
+        await storage.async_save()
+        await entry.runtime_data.coordinator.async_request_refresh()
+        return {"collected": collected}
+
+    async def handle_discard_auto(call: ServiceCall) -> ServiceResponse:
+        entry = _get_entry(hass, call)
+        storage = entry.runtime_data.storage
+        touched = storage.calibration.discard_auto_evidence()
+        await storage.async_save()
+        return {"excluded": touched}
+
+    async def handle_restore_auto(call: ServiceCall) -> ServiceResponse:
+        entry = _get_entry(hass, call)
+        storage = entry.runtime_data.storage
+        touched = storage.calibration.restore_auto_evidence()
+        # A bulk restore also brings back everything the reservoir had
+        # displaced over the run's history, so the capacity has to be
+        # re-established - dropping the most redundant frames first,
+        # by the same dispersion rule that admitted them.
+        trimmed = over_capacity_paths(storage.calibration)
+        for path in trimmed:
+            storage.calibration.forget_image(path)
+        storage.auto_paused = None
+        await storage.async_save()
+        return {
+            "restored": [p for p in touched if p not in set(trimmed)],
+            "still_set_aside": trimmed,
+        }
 
     async def handle_relearn(call: ServiceCall) -> ServiceResponse:
         entry = _get_entry(hass, call)
@@ -552,6 +728,34 @@ def async_setup_services(hass: HomeAssistant) -> None:
         DOMAIN,
         SERVICE_RELEARN,
         handle_relearn,
+        schema=RELEARN_SCHEMA,
+        supports_response=SupportsResponse.OPTIONAL,
+    )
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_START_LEARNING,
+        handle_start_learning,
+        schema=START_LEARNING_SCHEMA,
+        supports_response=SupportsResponse.OPTIONAL,
+    )
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_STOP_LEARNING,
+        handle_stop_learning,
+        schema=RELEARN_SCHEMA,
+        supports_response=SupportsResponse.OPTIONAL,
+    )
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_DISCARD_AUTO,
+        handle_discard_auto,
+        schema=RELEARN_SCHEMA,
+        supports_response=SupportsResponse.OPTIONAL,
+    )
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_RESTORE_AUTO,
+        handle_restore_auto,
         schema=RELEARN_SCHEMA,
         supports_response=SupportsResponse.OPTIONAL,
     )

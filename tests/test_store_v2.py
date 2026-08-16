@@ -667,15 +667,23 @@ class TestPolygonRegion:
         assert res.bins[0].area_frac == 0.0
         assert res.bins[0].present is False
 
-    def test_v2_store_dict_loads_as_v3(self):
-        data = store_to_dict(_store(Roi(0.1, 0.1, 0.8, 0.8)))
-        data["schema_version"] = 2
-        for e in data["images"]:
-            e.pop("label_polygons", None)
-        data.pop("roi_polygons", None)
-        loaded = store_from_dict(data)
-        assert loaded.schema_version == 3
-        assert loaded.roi_polygons is None
+    def test_older_store_dicts_migrate_to_the_current_schema(self):
+        from wastebin_ai_detector.core.store import STORE_SCHEMA_VERSION
+
+        for version in (2, 3):
+            data = store_to_dict(_store(Roi(0.1, 0.1, 0.8, 0.8)))
+            data["schema_version"] = version
+            for e in data["images"]:
+                e.pop("auto", None)
+                if version < 3:
+                    e.pop("label_polygons", None)
+            if version < 3:
+                data.pop("roi_polygons", None)
+            loaded = store_from_dict(data)
+            assert loaded.schema_version == STORE_SCHEMA_VERSION
+            assert loaded.roi_polygons is None
+            # Every pre-v4 entry means "made by a human".
+            assert all(e.auto is None for e in loaded.images)
 
     def test_polygon_region_containment_in_learning_view(self):
         store = _store(Roi(0.0, 0.0, 1.0, 1.0))
