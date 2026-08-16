@@ -697,47 +697,44 @@ def learn_profile(
             )
         )
 
-    # Region mask per image on the CURRENT region's grid; None = whole
-    # crop (rect fast path). The crop is integer-rounded per frame, so
-    # the mask maps through each frame's actual crop box.
-    poly_cache: dict[str, np.ndarray | None] = {}
+    # Region mask (None = whole crop, the rect fast path) and interior
+    # depth of the region universe. Both depend ONLY on the geometry -
+    # the frame's integer-rounded crop and the working grid - never on
+    # image content, so they are cached by that geometry: a calibration
+    # set from one camera shares a single computation instead of
+    # repeating it per image. Measured on a 25-image set at working
+    # width 640, the per-image depth map was the single largest cost of
+    # a relearn.
+    geom_cache: dict[tuple, tuple[np.ndarray | None, np.ndarray]] = {}
 
-    def poly_for(path: str) -> np.ndarray | None:
-        if path not in poly_cache:
-            if store.roi_polygons is None:
-                poly_cache[path] = None
-            else:
-                img = frames[path]
-                sx0, sy0, sx1, sy1 = roi_to_pixels(
-                    store.roi, img.width, img.height
-                )
-                crop = Roi(
-                    x=sx0 / img.width,
-                    y=sy0 / img.height,
-                    w=(sx1 - sx0) / img.width,
-                    h=(sy1 - sy0) / img.height,
-                )
-                _hue, sat, _val = hsv_for(path, store.roi)
-                poly_cache[path] = region_mask(
+    def _geometry(path: str) -> tuple[np.ndarray | None, np.ndarray]:
+        img = frames[path]
+        sx0, sy0, sx1, sy1 = roi_to_pixels(store.roi, img.width, img.height)
+        crop = Roi(
+            x=sx0 / img.width,
+            y=sy0 / img.height,
+            w=(sx1 - sx0) / img.width,
+            h=(sy1 - sy0) / img.height,
+        )
+        _hue, sat, _val = hsv_for(path, store.roi)
+        key = (sat.shape, crop)
+        if key not in geom_cache:
+            poly = (
+                None
+                if store.roi_polygons is None
+                else region_mask(
                     store.roi_polygons, sat.shape[1], sat.shape[0], crop
                 )
-        return poly_cache[path]
+            )
+            universe = np.ones(sat.shape, dtype=bool) if poly is None else poly
+            geom_cache[key] = (poly, interior_depth(universe))
+        return geom_cache[key]
 
-    # Interior depth of the region universe per image (polygon mask,
-    # or the full crop for a rectangle region - there the crop edge is
-    # the drawn boundary). Same grid as the color masks.
-    depth_cache: dict[str, np.ndarray] = {}
+    def poly_for(path: str) -> np.ndarray | None:
+        return _geometry(path)[0]
 
     def depth_for(path: str) -> np.ndarray:
-        if path not in depth_cache:
-            poly = poly_for(path)
-            if poly is None:
-                _hue, sat, _val = hsv_for(path, store.roi)
-                universe = np.ones(sat.shape, dtype=bool)
-            else:
-                universe = poly
-            depth_cache[path] = interior_depth(universe)
-        return depth_cache[path]
+        return _geometry(path)[1]
 
     def seed_for(entry, model_id: str, shape: tuple[int, int]) -> np.ndarray:
         height, width = shape

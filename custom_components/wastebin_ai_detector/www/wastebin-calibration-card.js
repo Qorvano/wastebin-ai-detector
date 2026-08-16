@@ -1033,11 +1033,18 @@ class WastebinCalibrationCard extends HTMLElement {
   }
 }
 
-customElements.define("wastebin-calibration-card", WastebinCalibrationCard);
-window.customCards = window.customCards || [];
-window.customCards.push({
-  type: "wastebin-calibration-card",
-  name: "Wastebin Calibration Card",
-  description:
-    "Draw the region contour, mark bins and declare presence for the Wastebin AI Detector directly on the camera image.",
-});
+/* The module can legitimately be evaluated twice in one page - the
+ * integration registers it as an extra JS module while a user may also
+ * have it as a dashboard resource, and the URL carries a version query
+ * that changes on update. Defining the element twice throws and takes
+ * the whole module down with it, so registration is idempotent. */
+if (!customElements.get("wastebin-calibration-card")) {
+  customElements.define("wastebin-calibration-card", WastebinCalibrationCard);
+  window.customCards = window.customCards || [];
+  window.customCards.push({
+    type: "wastebin-calibration-card",
+    name: "Wastebin Calibration Card",
+    description:
+      "Draw the region contour, mark bins and declare presence for the Wastebin AI Detector directly on the camera image.",
+  });
+}
