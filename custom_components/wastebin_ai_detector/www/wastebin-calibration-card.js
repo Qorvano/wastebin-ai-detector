@@ -44,6 +44,8 @@ const TEXTS = {
     need_closed: "Close the contour first (tap the first point).",
     marked_pre: "Marked ",
     marked_post: " - color sample and “here” saved.",
+    next_pre: "Next:",
+    all_marked: "All bins marked.",
     mark_hint: "Pick a bin, drag a rectangle over its lid, then OK. That states: THIS is that bin, and it is here.",
     presence_hint: "For bins without a mark: tap to set here/away, then save. Away shots are the valuable negative examples.",
     nothing_set: "Nothing set - tap the bin buttons first.",
@@ -73,6 +75,8 @@ const TEXTS = {
     need_closed: "Bitte schließen Sie zuerst die Kontur (ersten Punkt antippen).",
     marked_pre: "",
     marked_post: " markiert - Farb-Sample und „da“ gespeichert.",
+    next_pre: "Als Nächstes:",
+    all_marked: "Alle Tonnen markiert.",
     mark_hint: "Wählen Sie eine Tonne, ziehen Sie ein Rechteck über ihren Deckel, dann OK. Das sagt: DAS ist diese Tonne, und sie ist da.",
     presence_hint: "Für Tonnen ohne Markierung: Tippen Sie den Button an (da/weg) und speichern Sie. Weggestellte Tonnen liefern die wertvollen Abwesend-Beispiele.",
     nothing_set: "Keine Angabe gesetzt - bitte tippen Sie zuerst die Tonnen-Buttons an.",
@@ -372,10 +376,30 @@ class WastebinCalibrationCard extends HTMLElement {
           (outside ? " " + this._t.sample_outside : "")
       );
     }
+    /* Auto-advance: the standard pass is draw+OK once per bin, so the
+     * selection jumps to the next bin without a mark on this capture -
+     * no dropdown round-trip between bins. The save runs a relearn and
+     * can take seconds, during which the dropdown stays usable: a
+     * selection the user changed meanwhile is THEIR statement about
+     * the next rect and must never be overwritten (silently saving a
+     * rect under the wrong bin is exactly the cross-bin poisoning this
+     * release exists to prevent). */
+    const next = this._config.bins.find((b) => !this._marks[b.id]);
+    const advanced = next && this._sampleBin === binId;
+    if (advanced) {
+      this._sampleBin = next.id;
+      const select = this.shadowRoot.getElementById("sample-bin");
+      if (select) select.value = next.id;
+    }
     this._setStatus(
       this._t.marked_pre + name + this._t.marked_post +
         (relearn && relearn !== "ok" ? " (" + relearn + ")" : "") +
-        (outside ? " " + this._t.sample_outside : "")
+        (outside ? " " + this._t.sample_outside : "") +
+        (advanced
+          ? " " + this._t.next_pre + " " + next.name
+          : next
+            ? ""
+            : " " + this._t.all_marked)
     );
   }
 

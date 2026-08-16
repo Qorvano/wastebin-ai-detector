@@ -134,6 +134,33 @@ In the card, "Draw region" replaces the rectangle mode: tap to add
 points, tap the first point to close, drag points to adjust, then
 apply - the relearn runs automatically and keeps all evidence.
 
+## Region-edge band and one-vote-per-image (v0.5.2)
+
+Two field failures, two learned cures, no new knobs:
+
+**Boundary slivers.** Background that the region contour cuts through
+(a hedge leaf at the edge, a sunlit paving stone) can match a lid color
+and, in harsh light where real lids shrink, exceed the learned
+threshold. Detection now measures how deep each calibrated lid reaches
+into the region and requires the same of any candidate that TOUCHES the
+region boundary: a component confined to the boundary rim is background,
+not a lid. Components fully inside the region are never filtered, so a
+bin may still stand anywhere, and a lid that crosses the contour (tight
+regions are normal) stays detected because it reaches deep. The band is
+learned per bin from boundary-touching lids only, as a fraction of the
+working grid, and stays inactive until two such observations exist - the
+mechanism never invents separation. If absent-labeled frames show
+boundary clutter reaching that depth, the relearn says so instead of
+letting the overlap pass silently.
+
+**One big sample outvoting several small ones.** Color models pooled
+sample pixels, so a single large rectangle drawn on a washed-out lid
+could outvote several small clean ones and blow up the learned hue band
+(field: a bin's model collapsed and the sensor went unavailable). Every
+sample IMAGE now carries one vote regardless of rectangle size, and the
+mixture fit runs from two deterministic starts so a quantization spike
+in a washed-out patch can no longer trap it.
+
 ## Calibration card (v0.4.0)
 
 The integration ships a Lovelace card (registered automatically, no

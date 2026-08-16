@@ -15,11 +15,11 @@ from PIL import Image
 
 import math
 
-from .ccl import component_regions
+from .ccl import component_regions, seeded_component
 from .color import RGB_8BIT_LEVELS, circular_dist_deg, rgb_to_hsv
 from .imageio import extract_working_roi, load_image_rgb, roi_to_pixels
 from .profile import BinModel, Profile, Roi, validate_profile
-from .region import region_mask
+from .region import interior_depth, region_mask
 
 # Singular-vs-plural rule (same convention as the color-floor warning):
 # with fewer than two shape observations there is no between-sample
@@ -59,6 +59,59 @@ def shape_plausible(
         stats["shape_log_aspect_min"] <= log_aspect <= stats["shape_log_aspect_max"]
         and fill >= stats["shape_fill_min"]
     )
+
+
+def edge_band_min_frac(model: BinModel) -> float | None:
+    """The bin's active edge band as a fraction of the working grid
+    width, or None when the band is off.
+
+    The band is the learned minimum reach of this bin's BOUNDARY-
+    TOUCHING lid observations (see learn_edge_band). Activation
+    follows the singular-vs-plural rule (SHAPE_MIN_OBSERVATIONS, as
+    for the shape filter). The fraction is converted to pixels at the
+    application site, where the structural no-op identity lives: every
+    region pixel has depth >= 1, so a band of one pixel or less on
+    that grid removes nothing and is skipped there.
+    """
+    stats = model.learning_stats
+    if int(stats.get("region_edge_depth_n", 0)) < SHAPE_MIN_OBSERVATIONS:
+        return None
+    band = stats.get("region_edge_depth_min_frac")
+    if band is None:
+        return None
+    band = float(band)
+    if band <= 0.0:
+        return None
+    return band
+
+
+def edge_band_filter(
+    mask: np.ndarray, depth: np.ndarray, band: float
+) -> np.ndarray:
+    """Drop BOUNDARY-TOUCHING components that never reach ``band``.
+
+    Shared by detection and area learning (pipeline identity). The two
+    criteria are both structural, no thresholds:
+    - touching = the component contains a pixel of the outermost region
+      layer (depth == 1); anything entering from outside the drawn
+      contour must cross that layer,
+    - reach = the component contains a pixel at depth >= band, the
+      learned minimum interior depth of this bin's calibrated lids.
+    A component confined to the boundary rim is background cut by the
+    region line (field failure: a hedge sliver hugging the contour) and
+    is dropped whole. Components that never touch the boundary are
+    NEVER filtered, wherever they sit - bins may stand anywhere inside
+    the region (position independence is a hard invariant). Surviving
+    components keep every pixel; the denominator is untouched.
+    """
+    touching = seeded_component(mask, mask & (depth == 1))
+    if touching is None:
+        return mask
+    reached = seeded_component(touching, touching & (depth >= band))
+    interior = mask & ~touching
+    if reached is None:
+        return interior
+    return interior | reached
 
 
 def select_component(
@@ -249,6 +302,27 @@ def _cached_region_mask(profile: Profile, width: int, height: int, crop: Roi):
     return cache[key]
 
 
+def _cached_interior_depth(
+    profile: Profile, width: int, height: int, crop: Roi
+) -> np.ndarray:
+    """Interior-depth map of the region universe, cached per profile
+    (same lifetime argument as _cached_region_mask). The universe is
+    the polygon mask, or the full crop for a rectangle region - there
+    the crop edge is the drawn boundary."""
+    cache = getattr(profile, "_interior_depth_cache", None)
+    if cache is None:
+        cache = {}
+        object.__setattr__(profile, "_interior_depth_cache", cache)
+    key = (width, height, crop)
+    if key not in cache:
+        poly = _cached_region_mask(profile, width, height, crop)
+        universe = (
+            np.ones((height, width), dtype=bool) if poly is None else poly
+        )
+        cache[key] = interior_depth(universe)
+    return cache[key]
+
+
 def detect(img: Image.Image, profile: Profile) -> DetectionResult:
     """Run detection on an already-loaded PIL image."""
     validate_profile(profile)
@@ -280,6 +354,19 @@ def detect(img: Image.Image, profile: Profile) -> DetectionResult:
         mask = bin_mask(hue, sat, val, model)
         if poly is not None:
             mask &= poly
+        # Edge band: boundary-touching candidates must reach the
+        # learned lid depth (see edge_band_filter); thresholds were
+        # measured with exactly this filter (banded_bin_mask in learn).
+        # Fraction -> pixels on THIS grid; a band of one pixel or less
+        # removes nothing (every region pixel has depth >= 1).
+        band_frac = edge_band_min_frac(model)
+        if band_frac is not None:
+            band_px = band_frac * width
+            if band_px > 1.0:
+                depth = _cached_interior_depth(
+                    profile, width, height, actual_roi
+                )
+                mask = edge_band_filter(mask, depth, band_px)
         selected = select_component(mask, model, denom)
         if selected is None:
             area, bbox, centroid = 0, None, None

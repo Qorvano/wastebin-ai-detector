@@ -166,6 +166,49 @@ def region_mask(
     return polygon_mask(rings, width, height, crop)
 
 
+def interior_depth(universe: np.ndarray) -> np.ndarray:
+    """Chessboard distance of every region pixel to the nearest
+    non-region cell, int32, 0 outside the region.
+
+    - Metric/connectivity: chessboard (8-neighborhood peeling), the
+      documented model choice of the component machinery in ccl.py -
+      any other metric would be inconsistent with how components are
+      defined.
+    - The GRID BORDER counts as exterior: the crop edge is part of the
+      drawn boundary (for a rectangle region the crop edge IS the
+      boundary), so scene content hanging over any edge is banded the
+      same way as content crossing a polygon line.
+    - Every region pixel has depth >= 1, so a band of 1 or less removes
+      nothing (the structural no-op identity the activation predicate
+      relies on).
+
+    Pure peeling: per iteration an 8-neighbor erosion (all neighbors
+    inside, off-grid counts as outside); a pixel's depth is the number
+    of erosions it survives plus one.
+    """
+    current = np.asarray(universe, dtype=bool).copy()
+    depth = np.zeros(current.shape, dtype=np.int32)
+    level = 0
+    while bool(current.any()):
+        level += 1
+        depth[current] = level
+        eroded = np.zeros_like(current)
+        if current.shape[0] > 2 and current.shape[1] > 2:
+            eroded[1:-1, 1:-1] = (
+                current[1:-1, 1:-1]
+                & current[:-2, 1:-1]
+                & current[2:, 1:-1]
+                & current[1:-1, :-2]
+                & current[1:-1, 2:]
+                & current[:-2, :-2]
+                & current[:-2, 2:]
+                & current[2:, :-2]
+                & current[2:, 2:]
+            )
+        current = eroded
+    return depth
+
+
 def region_grid(bbox: Roi, working_width: int) -> tuple[int, int]:
     """A canonical store-level grid for containment tests: width fixed,
     height from the RELATIVE box aspect. Per-image pipeline grids also

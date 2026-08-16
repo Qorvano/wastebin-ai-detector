@@ -190,3 +190,27 @@ def largest_component_region(
     """Largest component's (area, half-open box, centroid), or None."""
     regions = component_regions(mask)
     return regions[0] if regions else None
+
+
+def seeded_component(mask: np.ndarray, seed: np.ndarray) -> np.ndarray | None:
+    """The connected component of ``mask`` touching ``seed`` (both 2-D
+    bool). Exact 8-connectivity via iterative dilation-by-shifts until
+    stable (O(diameter) shift loop, exact and dependency-free).
+    Returns None when mask and seed do not overlap."""
+    current = mask & seed
+    if not bool(current.any()):
+        return None
+    while True:
+        grown = current.copy()
+        grown[1:, :] |= current[:-1, :]
+        grown[:-1, :] |= current[1:, :]
+        grown[:, 1:] |= current[:, :-1]
+        grown[:, :-1] |= current[:, 1:]
+        grown[1:, 1:] |= current[:-1, :-1]
+        grown[1:, :-1] |= current[:-1, 1:]
+        grown[:-1, 1:] |= current[1:, :-1]
+        grown[:-1, :-1] |= current[1:, 1:]
+        grown &= mask
+        if bool((grown == current).all()):
+            return current
+        current = grown

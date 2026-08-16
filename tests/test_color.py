@@ -140,3 +140,66 @@ def test_mixture_separates_coherent_from_uniform():
     assert 0.7 < fit.weight < 0.95
     # The known-coherent pixels overwhelmingly classify as coherent.
     assert (fit.posterior[:800] >= 0.5).mean() > 0.95
+
+
+def test_weighted_percentile_midpoint_convention():
+    from wastebin_ai_detector.core.color import weighted_percentile
+
+    values = np.array([0.0, 10.0])
+    ones = np.ones_like(values)
+    # Uniform two-point median interpolates to the midpoint; edge
+    # queries clamp to the extreme values.
+    assert weighted_percentile(values, ones, 50.0) == pytest.approx(5.0)
+    assert weighted_percentile(values, ones, 0.0) == pytest.approx(0.0)
+    assert weighted_percentile(values, ones, 100.0) == pytest.approx(10.0)
+    # An observation holding almost all mass IS the median.
+    heavy = np.array([1.0, 98.0, 1.0])
+    assert weighted_percentile(
+        np.array([0.0, 10.0, 20.0]), heavy, 50.0
+    ) == pytest.approx(10.0)
+
+
+def test_weighted_percentile_mass_shifts_result():
+    from wastebin_ai_detector.core.color import weighted_percentile
+
+    values = np.array([0.0, 10.0])
+    # Equal mass: the median interpolates to the midpoint (type 7).
+    assert weighted_percentile(values, np.array([1.0, 1.0]), 50.0) == (
+        pytest.approx(5.0)
+    )
+    # Nearly all mass on the right observation pulls the median there
+    # (midpoint positions 0.005 and 0.505: q=0.5 sits just inside).
+    assert weighted_percentile(values, np.array([1.0, 99.0]), 50.0) == (
+        pytest.approx(9.9, abs=0.01)
+    )
+
+
+def test_learn_color_model_one_image_one_vote():
+    """The field regression behind per-image weighting: one huge
+    washed-out sample rectangle must not outvote two small clean ones
+    from other images. Unweighted, the pixel majority wins (the old
+    failure mode); with 1/(image pixels) weights, the image majority
+    wins and the big rectangle is classified as junk."""
+    from wastebin_ai_detector.core.learn import learn_color_model
+
+    big = np.linspace(19.5, 20.5, 1000)  # one huge washed-out patch
+    small_a = np.linspace(198.0, 202.0, 100)  # two clean lid samples
+    small_b = np.linspace(199.0, 201.0, 100)
+    hue = np.concatenate([big, small_a, small_b])
+    sat = np.full(hue.size, 0.6)
+    val = np.full(hue.size, 0.7)
+    weights = np.concatenate(
+        [
+            np.full(big.size, 1.0 / big.size),
+            np.full(small_a.size, 1.0 / small_a.size),
+            np.full(small_b.size, 1.0 / small_b.size),
+        ]
+    )
+    unweighted = learn_color_model(hue, sat, val, bin_id="braune_tonne")
+    weighted = learn_color_model(
+        hue, sat, val, bin_id="braune_tonne", weights=weights
+    )
+    assert abs(unweighted.hue_center_deg - 20.0) < 5.0
+    assert abs(weighted.hue_center_deg - 200.0) < 5.0
+    # The big rectangle is one of three image votes: junk mass 1/3.
+    assert weighted.stats["junk_fraction"] == pytest.approx(1.0 / 3.0, abs=0.05)

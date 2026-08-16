@@ -174,6 +174,33 @@ def validate_profile(profile: Profile) -> None:
                     raise ProfileError(
                         f"bin {b.id}: shape_fill_min outside [0, 1]"
                     )
+        # Edge-band stats feed the boundary filter in detection: a
+        # hand-edited profile must not smuggle in values that crash or
+        # silently blind a bin (same policy as the shape stats).
+        edge_n = b.learning_stats.get("region_edge_depth_n")
+        if edge_n is not None:
+            if isinstance(edge_n, bool) or not isinstance(edge_n, int):
+                raise ProfileError(
+                    f"bin {b.id}: learning_stats.region_edge_depth_n is "
+                    "not an int"
+                )
+            if edge_n < 0:
+                raise ProfileError(
+                    f"bin {b.id}: negative region_edge_depth_n"
+                )
+            if edge_n >= 2:
+                band = b.learning_stats.get("region_edge_depth_min_frac")
+                if (
+                    isinstance(band, bool)
+                    or not isinstance(band, (int, float))
+                    or not math.isfinite(float(band))
+                    or float(band) < 0.0
+                ):
+                    raise ProfileError(
+                        f"bin {b.id}: learning_stats."
+                        "region_edge_depth_min_frac missing or not a "
+                        f"finite number >= 0: {band!r}"
+                    )
         # These two stats feed the ambiguity interval in detection, so
         # hand-edited profiles must not smuggle in broken values.
         for key in ("min_pos_area_frac", "max_neg_area_frac"):

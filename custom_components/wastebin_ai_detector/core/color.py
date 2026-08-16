@@ -96,6 +96,39 @@ def circular_mean_deg(
     return mean, resultant
 
 
+def weighted_percentile(
+    values: np.ndarray, weights: np.ndarray, q: float
+) -> float:
+    """Weighted percentile, linear interpolation, midpoint convention.
+
+    Each observation owns a block of probability mass ``w/total``; its
+    rank position is the MIDPOINT of that block, ``(cumsum(w) - w/2) /
+    total`` (the C=1/2 convention). This is the mass-correct choice: an
+    observation holding 98% of the mass IS the median, no matter how
+    many other observations exist - exactly the property per-image
+    weighting needs. Queries beyond the outermost midpoints clamp to
+    the extreme values (``np.interp`` semantics). Sorting is stable,
+    so ties keep a deterministic order.
+    """
+    v = np.asarray(values, dtype=np.float64).ravel()
+    w = np.asarray(weights, dtype=np.float64).ravel()
+    if v.size == 0:
+        raise CalibrationError("weighted percentile of an empty sample")
+    if v.size != w.size:
+        raise ValueError(f"values/weights mismatch: {v.size} vs {w.size}")
+    total = float(w.sum())
+    if total <= 0.0:
+        raise CalibrationError("weighted percentile of zero total weight")
+    if v.size == 1:
+        return float(v[0])
+    order = np.argsort(v, kind="stable")
+    v = v[order]
+    w = w[order]
+    cs = np.cumsum(w)
+    positions = (cs - w / 2.0) / total
+    return float(np.interp(q / 100.0, positions, v))
+
+
 def circular_dist_deg(hues_deg: np.ndarray, center_deg: float) -> np.ndarray:
     """Absolute circular distance in degrees, in [0, 180]; NaN propagates.
 
@@ -160,6 +193,7 @@ def fit_vonmises_uniform_mixture(
     init_weight: float,
     init_kappa: float,
     kappa_max: float,
+    weights: np.ndarray | None = None,
 ) -> MixtureFit:
     """EM fit of a von Mises + circular-uniform mixture.
 
@@ -167,6 +201,12 @@ def fit_vonmises_uniform_mixture(
     highlights, edge artifacts) whose hues scatter over the circle. The
     posterior classifies every pixel; the caller thresholds it at the
     Bayes boundary 0.5.
+
+    Optional ``weights`` (same shape as ``hues_deg``) weight each
+    observation's mass in the likelihood and the M-step - the mechanism
+    behind per-image weighting, where one big sample rectangle must not
+    outvote several small ones. ``None`` means unit weights and is
+    numerically identical to the unweighted fit.
 
     Termination: the loop breaks once the likelihood gain falls to (or
     below) the floating-point resolution of the likelihood, which also
@@ -178,7 +218,12 @@ def fit_vonmises_uniform_mixture(
     is returned.
     """
     hues = np.asarray(hues_deg, dtype=np.float64).ravel()
-    hues = hues[~np.isnan(hues)]
+    finite = ~np.isnan(hues)
+    if weights is None:
+        w = np.ones(int(finite.sum()), dtype=np.float64)
+    else:
+        w = np.asarray(weights, dtype=np.float64).ravel()[finite]
+    hues = hues[finite]
     n = hues.size
     if n == 0:
         raise CalibrationError("mixture fit without valid hue pixels")
@@ -198,9 +243,13 @@ def fit_vonmises_uniform_mixture(
             n_iter=0,
         )
     rad = np.deg2rad(hues)
-    # A component weight of zero can never recover in EM; one pixel of
-    # mass is the smallest meaningful floor.
-    w_floor = 1.0 / n
+    total_mass = float(w.sum())
+    if total_mass <= 0.0:
+        raise CalibrationError("mixture fit with zero total weight")
+    # A component weight of zero can never recover in EM; the smallest
+    # single observation's mass is the smallest meaningful floor (one
+    # pixel, in the unweighted case).
+    w_floor = float(w.min()) / total_mass
     weight = float(np.clip(init_weight, w_floor, 1.0 - w_floor))
     mu = float(np.deg2rad(init_center_deg))
     kappa = float(np.clip(init_kappa, 0.0, kappa_max))
@@ -214,7 +263,7 @@ def fit_vonmises_uniform_mixture(
         log_num = np.log(weight) + log_vm
         log_den = np.logaddexp(log_num, np.log(1.0 - weight) + log_uniform)
         posterior = np.exp(log_num - log_den)
-        ll = float(log_den.sum())
+        ll = float((w * log_den).sum())
         if best is None or ll > best[0]:
             best = (ll, mu, kappa, weight, posterior)
         if prev_ll is not None:
@@ -224,11 +273,12 @@ def fit_vonmises_uniform_mixture(
             if ll - prev_ll <= max(abs(ll), 1.0) * np.finfo(np.float64).eps * n:
                 break
         prev_ll = ll
-        # M-step: weighted circular statistics of the coherent part.
-        mean_deg, resultant_w = circular_mean_deg(hues, weights=posterior)
+        # M-step: weighted circular statistics of the coherent part
+        # (observation mass times coherence responsibility).
+        mean_deg, resultant_w = circular_mean_deg(hues, weights=posterior * w)
         mu = float(np.deg2rad(mean_deg))
-        total = float(posterior.sum())
-        weight = float(np.clip(total / n, w_floor, 1.0 - w_floor))
+        total = float((w * posterior).sum())
+        weight = float(np.clip(total / total_mass, w_floor, 1.0 - w_floor))
         kappa = float(
             np.clip(vonmises_kappa_from_resultant(resultant_w), 0.0, kappa_max)
         )

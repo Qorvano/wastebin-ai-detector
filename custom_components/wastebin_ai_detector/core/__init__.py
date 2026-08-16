@@ -5,7 +5,12 @@ package can be exercised offline (calibration CLI, tests) and is reused
 unchanged by the Home Assistant integration layer.
 """
 
-from .ccl import component_regions, largest_component_area, largest_component_region
+from .ccl import (
+    component_regions,
+    largest_component_area,
+    largest_component_region,
+    seeded_component,
+)
 from .color import (
     MixtureFit,
     circular_dist_deg,
@@ -43,7 +48,6 @@ from .learn import (
     learn_area_threshold,
     learn_color_model,
     learn_profile,
-    seeded_component,
     shape_bounds,
 )
 from .profile import (

@@ -39,8 +39,8 @@ from typing import Any
 
 import numpy as np
 
-from .ccl import largest_component_area
-from .region import region_mask
+from .ccl import largest_component_area, seeded_component
+from .region import interior_depth, region_mask
 from .color import (
     HUE_DEG_PER_SEXTANT,
     RGB_8BIT_LEVELS,
@@ -49,8 +49,15 @@ from .color import (
     fit_vonmises_uniform_mixture,
     rgb_to_hsv,
     vonmises_kappa_from_resultant,
+    weighted_percentile,
 )
-from .detect import bin_mask, row_duplicate_fraction, select_component
+from .detect import (
+    bin_mask,
+    edge_band_filter,
+    edge_band_min_frac,
+    row_duplicate_fraction,
+    select_component,
+)
 from .errors import CalibrationError, ImageLoadError, RoiError
 from .imageio import extract_working_roi, load_image_rgb, rect_to_pixels, roi_to_pixels
 from .profile import BinModel, Profile, Roi
@@ -76,30 +83,6 @@ DEGENERATE_HUE_BAND_DEG = 180.0
 #   rectangle shows the lid color".
 COHERENT_POSTERIOR_MIN = 0.5
 COHERENT_MAJORITY_MIN = 0.5
-
-
-def seeded_component(mask: np.ndarray, seed: np.ndarray) -> np.ndarray | None:
-    """The connected component of ``mask`` touching ``seed`` (both 2-D
-    bool). Exact 8-connectivity via iterative dilation-by-shifts until
-    stable - calibration-time only, so the O(diameter) loop is fine.
-    Returns None when mask and seed do not overlap."""
-    current = mask & seed
-    if not bool(current.any()):
-        return None
-    while True:
-        grown = current.copy()
-        grown[1:, :] |= current[:-1, :]
-        grown[:-1, :] |= current[1:, :]
-        grown[:, 1:] |= current[:, :-1]
-        grown[:, :-1] |= current[:, 1:]
-        grown[1:, 1:] |= current[:-1, :-1]
-        grown[1:, :-1] |= current[:-1, 1:]
-        grown[:-1, 1:] |= current[1:, :-1]
-        grown[:-1, :-1] |= current[1:, 1:]
-        grown &= mask
-        if bool((grown == current).all()):
-            return current
-        current = grown
 
 
 def shape_bounds(
@@ -175,6 +158,40 @@ def shape_bounds(
     }
 
 
+def learn_edge_band(touch_depth_fracs: list[float]) -> dict[str, Any]:
+    """Learned region-edge band from BOUNDARY-TOUCHING lid depths.
+
+    ``touch_depth_fracs`` holds, per present-frame lid observation
+    whose component touches the region boundary (in store order), the
+    maximum interior depth it reaches, as a FRACTION of the working
+    grid width (resolution-independent: with working_width None the
+    grids are native crops and may differ between frames and between
+    learn and detect). Interior observations are deliberately absent:
+    their depth measures the parking position, not lid geometry, and
+    a band learned from them would veto legitimate lids parked against
+    the contour.
+
+    The band is the largest depth that provably keeps every calibrated
+    boundary-touching lid: the minimum of the series minus the
+    established successive-difference slack (the shape_bounds /
+    derive_quality_gates convention; it also absorbs the ±1 px wobble
+    of integer crop rounding). Clamped at 0. Without touching
+    observations the band stays inactive - no evidence about touching
+    lids, no filtering (the mechanism never invents separation).
+    """
+    stats: dict[str, Any] = {"region_edge_depth_n": len(touch_depth_fracs)}
+    if not touch_depth_fracs:
+        return stats
+    series = np.asarray(touch_depth_fracs, dtype=np.float64)
+    obs_min = float(series.min())
+    stats["region_edge_depth_obs_min_frac"] = obs_min
+    slack = (
+        float(np.median(np.abs(np.diff(series)))) if series.size >= 2 else 0.0
+    )
+    stats["region_edge_depth_min_frac"] = max(obs_min - slack, 0.0)
+    return stats
+
+
 @dataclass
 class ColorLearnResult:
     hue_center_deg: float
@@ -186,7 +203,12 @@ class ColorLearnResult:
 
 
 def learn_color_model(
-    hue: np.ndarray, sat: np.ndarray, val: np.ndarray, *, bin_id: str = "?"
+    hue: np.ndarray,
+    sat: np.ndarray,
+    val: np.ndarray,
+    *,
+    bin_id: str = "?",
+    weights: np.ndarray | None = None,
 ) -> ColorLearnResult:
     """Learn one bin's color model from pooled sample pixels (1-D arrays).
 
@@ -196,17 +218,50 @@ def learn_color_model(
     coherent pixels only. Field measurements showed that plain
     percentiles break as soon as more than the percentile share of the
     sample is junk.
+
+    Optional ``weights`` (per pixel, aligned with the pooled arrays)
+    weight every statistic - the caller uses 1/(pixels of that image)
+    so each sample IMAGE carries one vote regardless of rectangle size
+    (field evidence: one big washed-out rectangle repeatedly outvoted
+    several small clean ones pixel-wise). ``None`` means unit weights,
+    i.e. every pixel votes.
+
+    The mixture fit runs from two deterministic starts (histogram
+    density mode and mass mean direction) on BOTH paths, weighted or
+    not: a washed-out patch produces a tight quantization spike that
+    traps a single local start (field failure: a lid model collapsed
+    onto one hue value). Unweighted results therefore differ from
+    releases before the two-start change wherever that trap applied;
+    that difference is the fix, not a regression.
     """
     warnings: list[str] = []
     n_px = int(sat.size)
     if n_px == 0:
         raise CalibrationError(f"bin {bin_id}: no sample pixels")
-    _center0, resultant = circular_mean_deg(hue)  # raises if all hues NaN
+    if weights is not None and np.asarray(weights).size != n_px:
+        raise ValueError(
+            f"weights/pixels mismatch: {np.asarray(weights).size} vs {n_px}"
+        )
+    # Raises if all hues are NaN; resultant is the stats-reported
+    # concentration of the full (valid) pool.
+    _center0, resultant = circular_mean_deg(hue, weights=weights)
     valid_mask = ~np.isnan(hue)
     valid_hue = np.asarray(hue, dtype=np.float64)[valid_mask]
     sat_valid = np.asarray(sat, dtype=np.float64)[valid_mask]
     val_valid = np.asarray(val, dtype=np.float64)[valid_mask]
+    w_valid = (
+        None
+        if weights is None
+        else np.asarray(weights, dtype=np.float64).ravel()[valid_mask]
+    )
     n_valid = int(valid_hue.size)
+
+    def pct(values: np.ndarray, wts: np.ndarray | None, q: float) -> float:
+        """Percentile under the pool's weighting convention."""
+        if wts is None:
+            return float(np.percentile(values, q))
+        return weighted_percentile(values, wts, q)
+
     # chroma = sat · val, since sat = c/maxc and val = maxc.
     chroma_valid = sat_valid * val_valid
 
@@ -214,22 +269,14 @@ def learn_color_model(
     # width is the hue quantization of an 8-bit pixel at the median
     # chroma of the sample (60°/(255·c)), a structural resolution, not
     # a chosen granularity.
-    median_chroma = float(np.median(chroma_valid))
+    median_chroma = pct(chroma_valid, w_valid, 50.0)
     bin_width = HUE_DEG_PER_SEXTANT / (RGB_8BIT_LEVELS * median_chroma)
     n_bins = max(int(np.ceil(360.0 / bin_width)), 1)
-    hist, edges = np.histogram(valid_hue, bins=n_bins, range=(0.0, 360.0))
+    hist, edges = np.histogram(
+        valid_hue, bins=n_bins, range=(0.0, 360.0), weights=w_valid
+    )
     peak = int(np.argmax(hist))
     mu0 = float((edges[peak] + edges[peak + 1]) / 2.0)
-    # Moment start for the mixture weight: under the model, the share
-    # of pixels within 90° (the geometric half-circle boundary) of the
-    # center is w + (1-w)/2, hence w0 = 2·(share − 1/2).
-    within = circular_dist_deg(valid_hue, mu0) < 90.0
-    w0 = 2.0 * (float(within.mean()) - 0.5)
-    if bool(within.any()):
-        _, r_within = circular_mean_deg(valid_hue[within])
-        kappa0 = vonmises_kappa_from_resultant(r_within)
-    else:
-        kappa0 = 0.0
     # Kappa cap: below the finest representable hue step, concentration
     # is not measurable (same quantization logic as the tol floor).
     max_chroma = float(np.max(chroma_valid))
@@ -237,28 +284,76 @@ def learn_color_model(
     sigma_min_rad = float(np.deg2rad(finest_quantum_deg / 2.0))
     kappa_max = 1.0 / (sigma_min_rad * sigma_min_rad)
 
-    fit = fit_vonmises_uniform_mixture(
-        valid_hue,
-        init_center_deg=mu0,
-        init_weight=w0,
-        init_kappa=kappa0,
-        kappa_max=kappa_max,
-    )
+    def fit_from(mu_init: float) -> Any:
+        # Moment start for the mixture weight: under the model, the
+        # share of pixel MASS within 90° (the geometric half-circle
+        # boundary) of the center is w + (1-w)/2, so
+        # w_start = 2·(share − 1/2).
+        within = circular_dist_deg(valid_hue, mu_init) < 90.0
+        if w_valid is None:
+            share = float(within.mean())
+        else:
+            share = float(w_valid[within].sum() / w_valid.sum())
+        w_start = 2.0 * (share - 0.5)
+        if bool(within.any()):
+            _, r_within = circular_mean_deg(
+                valid_hue[within],
+                weights=None if w_valid is None else w_valid[within],
+            )
+            kappa_start = vonmises_kappa_from_resultant(r_within)
+        else:
+            kappa_start = 0.0
+        return fit_vonmises_uniform_mixture(
+            valid_hue,
+            init_center_deg=mu_init,
+            init_weight=w_start,
+            init_kappa=kappa_start,
+            kappa_max=kappa_max,
+            weights=w_valid,
+        )
+
+    fit = fit_from(mu0)
+    # Second start at the mass-mean direction: the histogram argmax is
+    # a DENSITY mode and can sit on a tight junk spike that carries
+    # little total mass, trapping the local EM there. The circular mean
+    # of all mass is the moment start for the heaviest mode. Standard
+    # deterministic multi-start: the better (weighted) likelihood wins.
+    # A zero resultant means the mean direction is undefined (perfectly
+    # cancelling hues) - then only the histogram start exists.
+    if resultant > 0.0:
+        fit_mean = fit_from(_center0)
+        if fit_mean.log_likelihood > fit.log_likelihood:
+            fit = fit_mean
     coherent = fit.posterior >= COHERENT_POSTERIOR_MIN
     n_coherent = int(coherent.sum())
-    junk_fraction = 1.0 - (n_coherent / n_valid) if n_valid else 1.0
-    if n_coherent <= n_valid * COHERENT_MAJORITY_MIN:
+    # Junk share and the majority guard run on observation MASS: with
+    # per-image weights a huge junk rectangle must count as one bad
+    # image, not as a pixel majority.
+    if w_valid is None:
+        coherent_share = (n_coherent / n_valid) if n_valid else 0.0
+    else:
+        coherent_share = float(w_valid[coherent].sum() / w_valid.sum())
+    junk_fraction = 1.0 - coherent_share
+    # Weighted pools vote per IMAGE, unweighted ones per pixel; the
+    # messages below must name the unit they actually measured.
+    unit = "pixels" if w_valid is None else "evidence (one vote per image)"
+    if coherent_share <= COHERENT_MAJORITY_MIN:
         raise CalibrationError(
-            f"bin {bin_id}: only {n_coherent} of {n_valid} coherent sample "
-            f"pixels (junk fraction {junk_fraction:.0%}) - the samples have "
-            "no consistent majority color. Re-draw them on a colored lid "
-            "area; grey/black lids cannot be color-calibrated - attach a "
-            "small colored marker to the lid and sample that instead"
+            f"bin {bin_id}: only {coherent_share:.0%} of the sample "
+            f"{unit} is coherent ({n_coherent} of {n_valid} pixels lie in "
+            "the majority color) - the samples have no consistent majority "
+            "color. Re-draw them on a colored lid area; grey/black lids "
+            "cannot be color-calibrated - attach a small colored marker to "
+            "the lid and sample that instead"
         )
 
     center = fit.center_deg
     dist = circular_dist_deg(valid_hue[coherent], center)
-    tol = float(np.percentile(dist, HUE_TOL_PERCENTILE))
+    tol = pct(
+        dist,
+        None if w_valid is None else w_valid[coherent],
+        HUE_TOL_PERCENTILE,
+    )
     if tol <= 0.0:
         # All coherent pixels share one exact float hue (uniform
         # synthetic patches). Half the finest 8-bit hue quantum keeps
@@ -275,8 +370,9 @@ def learn_color_model(
     # Floors from the coherent pixels only: junk (overexposed, greyish)
     # pixels must not drag them toward zero, or the runtime mask would
     # re-admit exactly the junk the mixture just removed.
-    sat_min = float(np.percentile(sat_valid[coherent], SV_MIN_PERCENTILE))
-    val_min = float(np.percentile(val_valid[coherent], SV_MIN_PERCENTILE))
+    w_coherent = None if w_valid is None else w_valid[coherent]
+    sat_min = pct(sat_valid[coherent], w_coherent, SV_MIN_PERCENTILE)
+    val_min = pct(val_valid[coherent], w_coherent, SV_MIN_PERCENTILE)
     # Order-statistics-derived warning (no chosen cutoff): if
     # q/100·(n−1) < 1, the q-th percentile IS the sample minimum, i.e.
     # the sample is too small for the percentile to differ from min.
@@ -291,7 +387,7 @@ def learn_color_model(
     # the coherent majority, but the sample spot deserves a re-draw.
     if junk_fraction > (100.0 - HUE_TOL_PERCENTILE) / 100.0:
         warnings.append(
-            f"bin {bin_id}: {junk_fraction:.0%} of the sample pixels are "
+            f"bin {bin_id}: {junk_fraction:.0%} of the sample {unit} is "
             "junk (overexposed or off-color); the model was learned from "
             "the coherent majority - consider re-drawing this sample in "
             "better light"
@@ -305,7 +401,10 @@ def learn_color_model(
             "n_sample_px": n_px,
             "n_valid_hue_px": n_valid,
             "n_coherent_px": n_coherent,
+            # Mass share, not n_coherent_px/n_valid_hue_px: with
+            # per-image weights these differ by design.
             "junk_fraction": junk_fraction,
+            "junk_fraction_is_per_image": w_valid is not None,
             "mixture_weight": fit.weight,
             "kappa": fit.kappa,
             "em_iterations": fit.n_iter,
@@ -511,12 +610,16 @@ def learn_profile(
         hue_parts: list[np.ndarray] = []
         sat_parts: list[np.ndarray] = []
         val_parts: list[np.ndarray] = []
+        weight_parts: list[np.ndarray] = []
         n_sample_images = 0
         for entry in usable_images:
             rects = entry.samples.get(decl.id, [])
             if not rects:
                 continue
             n_sample_images += 1
+            img_hue_parts: list[np.ndarray] = []
+            img_sat_parts: list[np.ndarray] = []
+            img_val_parts: list[np.ndarray] = []
             for sample in rects:
                 grid = image_rect_in_roi(sample.rect, sample.roi)
                 if grid is None:  # guarded by validate_store already
@@ -536,9 +639,19 @@ def learn_profile(
                         f"{entry.path} - {exc}"
                     )
                     continue
-                hue_parts.append(hue[y0:y1, x0:x1].ravel())
-                sat_parts.append(sat[y0:y1, x0:x1].ravel())
-                val_parts.append(val[y0:y1, x0:x1].ravel())
+                img_hue_parts.append(hue[y0:y1, x0:x1].ravel())
+                img_sat_parts.append(sat[y0:y1, x0:x1].ravel())
+                img_val_parts.append(val[y0:y1, x0:x1].ravel())
+            img_px = int(sum(part.size for part in img_hue_parts))
+            if img_px == 0:
+                continue
+            hue_parts.extend(img_hue_parts)
+            sat_parts.extend(img_sat_parts)
+            val_parts.extend(img_val_parts)
+            # One image, one vote: every pixel carries 1/(pixels of its
+            # image), so a huge rectangle in one frame cannot outvote
+            # several small clean ones from other frames.
+            weight_parts.append(np.full(img_px, 1.0 / img_px))
         try:
             if not hue_parts:
                 raise CalibrationError(
@@ -550,6 +663,7 @@ def learn_profile(
                 np.concatenate(sat_parts),
                 np.concatenate(val_parts),
                 bin_id=decl.id,
+                weights=np.concatenate(weight_parts),
             )
         except CalibrationError as exc:
             untrained[decl.id] = str(exc)
@@ -616,44 +730,110 @@ def learn_profile(
         denom = int(poly.sum()) if poly is not None else mask.size
         return mask, denom
 
-    # 1.5) Shape models from the PRESENT-labeled images, referenced
-    # exactly through the bin's sample rectangles: the observed shape
-    # is the connected component touching a rect the user drew on the
-    # lid - never "the largest blob", which under harsh light can be a
-    # background object and would poison the learned shape forever.
-    # Present images without current-epoch rects contribute no shape
-    # observation (their area evidence below stays untouched).
+    # Interior depth of the region universe per image (polygon mask,
+    # or the full crop for a rectangle region - there the crop edge is
+    # the drawn boundary). Same grid as the color masks.
+    depth_cache: dict[str, np.ndarray] = {}
+
+    def depth_for(path: str) -> np.ndarray:
+        if path not in depth_cache:
+            poly = poly_for(path)
+            if poly is None:
+                _hue, sat, _val = hsv_for(path, store.roi)
+                universe = np.ones(sat.shape, dtype=bool)
+            else:
+                universe = poly
+            depth_cache[path] = interior_depth(universe)
+        return depth_cache[path]
+
+    def seed_for(entry, model_id: str, shape: tuple[int, int]) -> np.ndarray:
+        height, width = shape
+        seed = np.zeros(shape, dtype=bool)
+        for sample in entry.samples.get(model_id, []):
+            grid = image_rect_in_roi(sample.rect, store.roi)
+            if grid is None:
+                continue
+            try:
+                x0, y0, x1, y1 = rect_to_pixels(
+                    grid.x, grid.y, grid.w, grid.h, width, height
+                )
+            except RoiError:
+                continue
+            seed[y0:y1, x0:x1] = True
+        return seed
+
+    def banded_bin_mask(entry_path: str, model: BinModel):
+        """masked_bin_mask plus the bin's edge-band filter: exactly the
+        pixels detection will count (pipeline identity, shared
+        edge_band_filter). Whole boundary-touching components that
+        never reach the learned depth are dropped; nothing else
+        changes, in particular not the denominator. Every calibrated
+        lid observation passes by construction (touching lids reach
+        the band, since the band is the minimum of their observed
+        depths minus slack; interior lids are never filtered)."""
+        mask, denom = masked_bin_mask(entry_path, model)
+        band_frac = edge_band_min_frac(model)
+        if band_frac is None:
+            return mask, denom
+        band_px = band_frac * mask.shape[1]
+        if band_px <= 1.0:
+            # One pixel or less on this grid removes nothing (every
+            # region pixel has depth >= 1) - same no-op identity as in
+            # detect().
+            return mask, denom
+        return edge_band_filter(mask, depth_for(entry_path), band_px), denom
+
+    # 1.5a) UNBANDED shape observations from the PRESENT-labeled
+    # images, referenced exactly through the bin's sample rectangles:
+    # the observed shape is the connected component touching a rect the
+    # user drew on the lid - never "the largest blob", which under
+    # harsh light can be a background object and would poison the
+    # learned shape forever. Present images without current-epoch rects
+    # contribute no observation (their area evidence below stays
+    # untouched). Observations whose component TOUCHES the region
+    # boundary additionally record how deep it reaches - the evidence
+    # behind the edge band. Interior observations carry NO information
+    # about the reach of a boundary-touching lid (their depth measures
+    # the parking position, not lid geometry) and must not vote, or
+    # the band would silently veto legitimate lids parked against the
+    # contour. Depths are normalized by the working grid width so the
+    # band survives resolution changes (working_width None runs on
+    # native crops). All of this MUST be measured unbanded (anything
+    # else is circular).
     shape_obs: dict[str, list[tuple[int, int, int, int]]] = {}
+    edge_depths: dict[str, list[float]] = {}
     for model in bins:
         observations: list[tuple[int, int, int, int]] = []
+        touch_depths: list[float] = []
         for entry in usable_images:
             if model.id not in entry.present:
                 continue
-            rects = entry.samples.get(model.id, [])
-            if not rects:
+            if not entry.samples.get(model.id):
                 continue
             mask, denom = masked_bin_mask(entry.path, model)
-            height, width = mask.shape
-            seed = np.zeros_like(mask)
-            for sample in rects:
-                grid = image_rect_in_roi(sample.rect, store.roi)
-                if grid is None:
-                    continue
-                try:
-                    x0, y0, x1, y1 = rect_to_pixels(
-                        grid.x, grid.y, grid.w, grid.h, width, height
-                    )
-                except RoiError:
-                    continue
-                seed[y0:y1, x0:x1] = True
-            component = seeded_component(mask, seed)
+            component = seeded_component(
+                mask, seed_for(entry, model.id, mask.shape)
+            )
             if component is None:
                 continue
             ys, xs = np.nonzero(component)
             box_w = int(xs.max()) - int(xs.min()) + 1
             box_h = int(ys.max()) - int(ys.min()) + 1
             observations.append((int(component.sum()), box_w, box_h, denom))
+            depth = depth_for(entry.path)
+            if bool((depth[component] == 1).any()):
+                touch_depths.append(
+                    float(depth[component].max()) / mask.shape[1]
+                )
         shape_obs[model.id] = observations
+        edge_depths[model.id] = touch_depths
+    for model in bins:
+        model.learning_stats.update(learn_edge_band(edge_depths[model.id]))
+
+    # No banded re-measurement of shapes is needed: the reach filter
+    # only drops WHOLE components, and every calibrated lid component
+    # reaches the band by construction, so the observations above are
+    # exactly what detection will see.
     # Pooled lid-aspect span across ALL bins: the installation's
     # measured scale of position-induced aspect variation (each bin is
     # a lid observed at a different spot).
@@ -680,6 +860,8 @@ def learn_profile(
     for model in bins:
         pos_areas: list[float] = []
         neg_areas: list[float] = []
+        band_frac = edge_band_min_frac(model)
+        clutter_max: float | None = None
         for entry in usable_images:
             if model.id in entry.present:
                 target = pos_areas
@@ -687,24 +869,72 @@ def learn_profile(
                 target = neg_areas
             else:
                 continue
-            mask, denom = masked_bin_mask(entry.path, model)
+            mask, denom = banded_bin_mask(entry.path, model)
+            if target is neg_areas and band_frac is not None:
+                # Diagnosis on the RAW poly-masked mask: how deep does
+                # boundary-attached clutter reach in this bin's color?
+                # A component entering from outside must cross the
+                # outermost region pixel layer (depth == 1) - a
+                # structural criterion, no threshold. Normalized by the
+                # grid width like the band itself.
+                raw_mask, _raw_denom = masked_bin_mask(entry.path, model)
+                depth = depth_for(entry.path)
+                attached = seeded_component(raw_mask, raw_mask & (depth == 1))
+                if attached is not None:
+                    reach = float(depth[attached].max()) / raw_mask.shape[1]
+                    clutter_max = (
+                        reach
+                        if clutter_max is None
+                        else max(clutter_max, reach)
+                    )
             selected = select_component(mask, model, denom)
             area_frac = (selected[0] / denom) if selected else 0.0
             if target is pos_areas and area_frac <= 0.0:
-                # The shape filter (or the region) leaves no plausible
-                # blob in a present-labeled image: exclude the
-                # observation with a warning instead of hard-failing
-                # the bin (same policy as stale-geometry evidence).
-                warnings.append(
-                    f"bin {model.id}: present-labeled {entry.path} yields "
-                    "no plausible blob under the current region/shape "
-                    "model - observation excluded (the threshold is then "
-                    "learned without this worst case; if this happens for "
-                    "typical frames, widen the region or add samples from "
-                    "such frames)"
-                )
+                # The region, the shape filter or the edge band leaves
+                # no plausible blob in a present-labeled image: exclude
+                # the observation with a warning instead of hard-failing
+                # the bin (same policy as stale-geometry evidence). When
+                # the edge band is the cause, say so - the cure is a
+                # sample rect on this pose, which gives the pose a vote
+                # in the band.
+                banded_away = False
+                if band_frac is not None:
+                    raw_mask, raw_denom = masked_bin_mask(entry.path, model)
+                    raw_sel = select_component(raw_mask, model, raw_denom)
+                    banded_away = raw_sel is not None and raw_sel[0] > 0
+                if banded_away:
+                    warnings.append(
+                        f"bin {model.id}: present-labeled {entry.path} "
+                        "loses its only plausible blob to the edge band "
+                        "(boundary-touching, shallower than every "
+                        "calibrated touching lid) - observation excluded; "
+                        "draw a sample rect on this pose so the band "
+                        "learns it"
+                    )
+                else:
+                    warnings.append(
+                        f"bin {model.id}: present-labeled {entry.path} "
+                        "yields no plausible blob under the current "
+                        "region/shape model - observation excluded (the "
+                        "threshold is then learned without this worst "
+                        "case; if this happens for typical frames, widen "
+                        "the region or add samples from such frames)"
+                    )
                 continue
             target.append(area_frac)
+        if band_frac is not None:
+            model.learning_stats["region_edge_clutter_max_frac"] = clutter_max
+            separable = clutter_max is None or clutter_max < band_frac
+            model.learning_stats["region_edge_separable"] = separable
+            if not separable:
+                warnings.append(
+                    f"bin {model.id}: boundary clutter in absent frames "
+                    f"reaches interior depth {clutter_max:.4f} of the grid "
+                    f"width, at or beyond the learned edge band of "
+                    f"{band_frac:.4f} - such clutter still counts toward "
+                    "detection; check the region contour or add absent "
+                    "labels from that light"
+                )
         try:
             result = learn_area_threshold(pos_areas, neg_areas, bin_id=model.id)
         except CalibrationError as exc:
