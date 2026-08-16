@@ -232,6 +232,9 @@ class WastebinCalibrationCard extends HTMLElement {
       if (value === "absent") absent.push(binId);
     }
     if (!present.length && !absent.length) {
+      // Nothing declared yet: take the user to the row where that
+      // happens instead of only complaining about it.
+      this._setMode("label");
       return this._setStatus(this._t.declare_first);
     }
     try {
@@ -1074,8 +1077,15 @@ class WastebinCalibrationCard extends HTMLElement {
         .vertex { fill: var(--primary-color); stroke: #fff; stroke-width: .3; }
         .vertex.first { fill: var(--accent-color); }
         #status { margin-top: 8px; font-size: 13px; color: var(--secondary-text-color); min-height: 1.2em; }
+        #run-info { font-size: 13px; color: var(--secondary-text-color); }
+        #run-actions { margin-bottom: 4px; }
       </style>
       <ha-card>
+        <div class="actions" id="run-actions">
+          <button id="start-run">${t.start_run}</button>
+          <button id="stop-run" style="display:none">${t.stop_run}</button>
+          <span id="run-info"></span>
+        </div>
         <div class="toolbar">
           <button id="capture">${t.capture}</button>
           <button data-mode="view" class="active">${t.view}</button>
@@ -1107,11 +1117,6 @@ class WastebinCalibrationCard extends HTMLElement {
         <div class="actions" id="label-actions" style="display:none">
           <span id="label-bins" class="actions"></span>
           <button id="save-labels">${t.save_labels}</button>
-          <button id="start-run">${t.start_run}</button>
-          <button id="stop-run" style="display:none">${t.stop_run}</button>
-        </div>
-        <div class="actions" id="run-actions">
-          <span id="run-info"></span>
         </div>
         <div id="status"></div>
       </ha-card>
