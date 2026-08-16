@@ -27,8 +27,9 @@ bins**:
 
 1. You define the camera, a region of interest (where bins can stand)
    and your bins (any number, any colors).
-2. You draw one small rectangle on each lid in a few snapshots and
-   label a handful of images ("blue bin present / absent").
+2. You mark each lid with five taps in a few snapshots (four corners
+   plus the centre) and label a handful of images ("blue bin present /
+   absent").
 3. The detector learns everything else from that: per-bin hue bands
    (circular statistics), saturation/brightness floors, and the minimum
    blob area that separates "present" from "absent", computed
@@ -46,7 +47,10 @@ pure numpy) and takes milliseconds on a Raspberry Pi.
   them (`grayscale_suspect`) instead of guessing. Gate your automation
   on the sun, keep the last daylight state at night.
 - **Bins must differ in color.** Two same-colored bins cannot be told
-  apart by a color detector. That is inherent, not a bug.
+  apart by a color detector. That is inherent, not a bug: since v0.6.0
+  they additionally compete for every pixel, so both end up with a
+  fragment of the shared color and the relearn reports how little each
+  one keeps.
 - **Grey and black lids cannot be color-calibrated.** A hue-based
   detector has nothing to lock onto on an achromatic surface (in
   Germany that is typically the black residual-waste bin). Practical
@@ -133,6 +137,35 @@ bins:
 In the card, "Draw region" replaces the rectangle mode: tap to add
 points, tap the first point to close, drag points to adjust, then
 apply - the relearn runs automatically and keeps all evidence.
+
+## Bins exclude each other, and lids are marked by points (v0.6.0)
+
+**Two bins can never occupy the same spot**, so detection now enforces
+that physically:
+
+- Every pixel belongs to at most ONE bin. When two learned color bands
+  overlap (the learner warns about it), a contested pixel goes to the
+  bin whose learned color it is closest to, in degrees. Ties go to
+  nobody, which also makes the result independent of bin order.
+- A blob detected INSIDE another bin's detected area cannot be a bin:
+  a white sticker on a brown lid is a hole in the brown blob, and a
+  candidate sitting in that hole is dropped. Only a bin whose own
+  calibration separates and whose blob is at least the weakest lid ever
+  confirmed for it may veto another - a bin that its own numbers call
+  unreliable never erases someone else's evidence. Where an enclosure
+  exists but no container qualifies, the bin is reported as contested
+  and held instead of flipping.
+- Resolution runs to a fixed point (a vetoed bin re-selects elsewhere,
+  and that new blob is checked again), and thresholds are learned under
+  exactly the same rules, so measurement and detection stay identical.
+
+**Marking a lid takes five taps instead of a drawn rectangle**: the
+four corners (a little inside the rim) and the centre. Each point
+becomes its own sample patch, sized from the distance to its nearest
+neighbour, so the pooled sample carries the light GRADIENT across the
+lid (sunlit corner versus shaded corner) instead of one rectangle's
+average. Fewer or more points work too; the patch size always derives
+from the points themselves.
 
 ## Region-edge band and one-vote-per-image (v0.5.2)
 

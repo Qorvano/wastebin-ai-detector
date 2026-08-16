@@ -55,6 +55,8 @@ from .detect import (
     bin_mask,
     edge_band_filter,
     edge_band_min_frac,
+    exclusive_bin_masks,
+    resolve_candidates,
     row_duplicate_fraction,
     select_component,
 )
@@ -721,15 +723,6 @@ def learn_profile(
                 )
         return poly_cache[path]
 
-    def masked_bin_mask(entry_path: str, model: BinModel):
-        hue, sat, val = hsv_for(entry_path, store.roi)
-        mask = bin_mask(hue, sat, val, model)
-        poly = poly_for(entry_path)
-        if poly is not None:
-            mask &= poly
-        denom = int(poly.sum()) if poly is not None else mask.size
-        return mask, denom
-
     # Interior depth of the region universe per image (polygon mask,
     # or the full crop for a rectangle region - there the crop edge is
     # the drawn boundary). Same grid as the color masks.
@@ -762,16 +755,56 @@ def learn_profile(
             seed[y0:y1, x0:x1] = True
         return seed
 
-    def banded_bin_mask(entry_path: str, model: BinModel):
-        """masked_bin_mask plus the bin's edge-band filter: exactly the
-        pixels detection will count (pipeline identity, shared
-        edge_band_filter). Whole boundary-touching components that
-        never reach the learned depth are dropped; nothing else
-        changes, in particular not the denominator. Every calibrated
-        lid observation passes by construction (touching lids reach
-        the band, since the band is the minimum of their observed
-        depths minus slack; interior lids are never filtered)."""
-        mask, denom = masked_bin_mask(entry_path, model)
+    # Exclusive per-image masks over the CURRENT competitor set: a
+    # pixel belongs to at most one bin, so two bins whose learned
+    # bands overlap can no longer both count it. Cached per image and
+    # rebuilt whenever the competitor set changes (see the elimination
+    # loop below), because a pixel's winner depends on who competes.
+    exclusive_cache: dict[str, list[np.ndarray]] = {}
+
+    # How much of each bin's plain color mask goes to a competitor?
+    # Pure measurement, reported with the existing overlap warning: two
+    # bins with nearly identical learned colors shred each other, and
+    # the resulting threshold can collapse to a few pixels.
+    exclusive_kept: dict[str, int] = {}
+    exclusive_total: dict[str, int] = {}
+
+    def exclusive_masks_for(path: str, models: list[BinModel]):
+        if path not in exclusive_cache:
+            hue, sat, val = hsv_for(path, store.roi)
+            plain = [bin_mask(hue, sat, val, m) for m in models]
+            masks = exclusive_bin_masks(
+                hue, sat, val, models, enabled=True
+            )
+            for model, before, after in zip(models, plain, masks):
+                exclusive_total[model.id] = exclusive_total.get(
+                    model.id, 0
+                ) + int(before.sum())
+                exclusive_kept[model.id] = exclusive_kept.get(
+                    model.id, 0
+                ) + int(after.sum())
+            exclusive_cache[path] = masks
+        return exclusive_cache[path]
+
+    def layer1_mask(entry_path: str, model: BinModel, models: list[BinModel]):
+        """The bin's exclusive color mask under the current region."""
+        index = models.index(model)
+        mask = exclusive_masks_for(entry_path, models)[index]
+        poly = poly_for(entry_path)
+        if poly is not None:
+            mask = mask & poly
+        denom = int(poly.sum()) if poly is not None else mask.size
+        return mask, denom
+
+    def banded_bin_mask(
+        entry_path: str, model: BinModel, models: list[BinModel]
+    ):
+        """layer1_mask plus the bin's edge-band filter: exactly the
+        pixels detection counts before the occupancy veto (pipeline
+        identity, shared edge_band_filter). Whole boundary-touching
+        components that never reach the learned depth are dropped;
+        nothing else changes, in particular not the denominator."""
+        mask, denom = layer1_mask(entry_path, model, models)
         band_frac = edge_band_min_frac(model)
         if band_frac is None:
             return mask, denom
@@ -783,169 +816,343 @@ def learn_profile(
             return mask, denom
         return edge_band_filter(mask, depth_for(entry_path), band_px), denom
 
-    # 1.5a) UNBANDED shape observations from the PRESENT-labeled
-    # images, referenced exactly through the bin's sample rectangles:
-    # the observed shape is the connected component touching a rect the
-    # user drew on the lid - never "the largest blob", which under
-    # harsh light can be a background object and would poison the
-    # learned shape forever. Present images without current-epoch rects
-    # contribute no observation (their area evidence below stays
-    # untouched). Observations whose component TOUCHES the region
-    # boundary additionally record how deep it reaches - the evidence
-    # behind the edge band. Interior observations carry NO information
-    # about the reach of a boundary-touching lid (their depth measures
-    # the parking position, not lid geometry) and must not vote, or
-    # the band would silently veto legitimate lids parked against the
-    # contour. Depths are normalized by the working grid width so the
-    # band survives resolution changes (working_width None runs on
-    # native crops). All of this MUST be measured unbanded (anything
-    # else is circular).
-    shape_obs: dict[str, list[tuple[int, int, int, int]]] = {}
-    edge_depths: dict[str, list[float]] = {}
-    for model in bins:
-        observations: list[tuple[int, int, int, int]] = []
-        touch_depths: list[float] = []
-        for entry in usable_images:
-            if model.id not in entry.present:
-                continue
-            if not entry.samples.get(model.id):
-                continue
-            mask, denom = masked_bin_mask(entry.path, model)
-            component = seeded_component(
-                mask, seed_for(entry, model.id, mask.shape)
-            )
-            if component is None:
-                continue
-            ys, xs = np.nonzero(component)
-            box_w = int(xs.max()) - int(xs.min()) + 1
-            box_h = int(ys.max()) - int(ys.min()) + 1
-            observations.append((int(component.sum()), box_w, box_h, denom))
-            depth = depth_for(entry.path)
-            if bool((depth[component] == 1).any()):
-                touch_depths.append(
-                    float(depth[component].max()) / mask.shape[1]
+    def _lost_to_the_band(
+        entry_path: str, model: BinModel, models: list[BinModel]
+    ) -> bool:
+        """Would this frame have had a plausible blob WITHOUT the edge
+        band? Measured on the unbanded layer-1 mask, because the banded
+        candidate cannot answer it (it is already filtered)."""
+        if edge_band_min_frac(model) is None:
+            return False
+        raw_mask, raw_denom = layer1_mask(entry_path, model, models)
+        raw = select_component(raw_mask, model, raw_denom)
+        return raw is not None and raw[0] > 0
+
+    def universe_for(path: str) -> np.ndarray:
+        poly = poly_for(path)
+        if poly is not None:
+            return poly
+        _hue, sat, _val = hsv_for(path, store.roi)
+        return np.ones(sat.shape, dtype=bool)
+
+    # The competition set must equal the set that ships in the profile,
+    # or a bin that steals pixels while learning but never reports
+    # would leave the survivors' thresholds measured against a
+    # competitor detection does not have. A bin that cannot learn a
+    # threshold is dropped and everything is recomputed; the set only
+    # shrinks, and dropping a competitor can only make the survivors'
+    # areas larger, so a drop can never cause a new failure - the loop
+    # terminates, in practice after one round.
+    competitors = list(bins)
+    # Warnings about bins that dropped out survive the round that
+    # dropped them (round-local warnings are discarded when the set
+    # changes and everything is recomputed).
+    dropout_warnings: list[str] = []
+    while True:
+        exclusive_cache.clear()
+        exclusive_kept.clear()
+        exclusive_total.clear()
+        # Stats measured against the PREVIOUS competitor set would be
+        # stale now (a dropped competitor changes every mask), so no
+        # round may inherit them.
+        for model in competitors:
+            for key in (
+                "region_edge_clutter_max_frac",
+                "region_edge_separable",
+                "veto_qualify_min_area_frac",
+                "veto_qualify_separable",
+                "veto_qualify_provisional",
+            ):
+                model.learning_stats.pop(key, None)
+        round_warnings: list[str] = []
+        round_untrained: dict[str, str] = {}
+
+        # 1.5a) UNBANDED shape observations from the PRESENT-labeled
+        # images, referenced exactly through the bin's sample
+        # rectangles: the observed shape is the connected component
+        # touching a rect the user drew on the lid - never "the largest
+        # blob", which under harsh light can be a background object and
+        # would poison the learned shape forever. Present images
+        # without current-epoch rects contribute no observation (their
+        # area evidence below stays untouched). Observations whose
+        # component TOUCHES the region boundary additionally record how
+        # deep it reaches - the evidence behind the edge band. Interior
+        # observations carry NO information about the reach of a
+        # boundary-touching lid (their depth measures the parking
+        # position, not lid geometry) and must not vote, or the band
+        # would silently veto legitimate lids parked against the
+        # contour. Depths are normalized by the working grid width so
+        # the band survives resolution changes (working_width None runs
+        # on native crops). All of this MUST be measured unbanded
+        # (anything else is circular). The occupancy veto is
+        # deliberately NOT applied here: it can only delete whole
+        # components, never reshape one, so it could only discard the
+        # user's own seeded ground truth.
+        shape_obs: dict[str, list[tuple[int, int, int, int]]] = {}
+        edge_depths: dict[str, list[float]] = {}
+        for model in competitors:
+            observations: list[tuple[int, int, int, int]] = []
+            touch_depths: list[float] = []
+            for entry in usable_images:
+                if model.id not in entry.present:
+                    continue
+                if not entry.samples.get(model.id):
+                    continue
+                mask, denom = layer1_mask(entry.path, model, competitors)
+                component = seeded_component(
+                    mask, seed_for(entry, model.id, mask.shape)
                 )
-        shape_obs[model.id] = observations
-        edge_depths[model.id] = touch_depths
-    for model in bins:
-        model.learning_stats.update(learn_edge_band(edge_depths[model.id]))
-
-    # No banded re-measurement of shapes is needed: the reach filter
-    # only drops WHOLE components, and every calibrated lid component
-    # reaches the band by construction, so the observations above are
-    # exactly what detection will see.
-    # Pooled lid-aspect span across ALL bins: the installation's
-    # measured scale of position-induced aspect variation (each bin is
-    # a lid observed at a different spot).
-    all_aspects = [
-        math.log(w / h)
-        for obs in shape_obs.values()
-        for (_a, w, h, _d) in obs
-    ]
-    pooled_span = (
-        max(all_aspects) - min(all_aspects) if len(all_aspects) >= 2 else 0.0
-    )
-    for model in bins:
-        if shape_obs[model.id]:
-            model.learning_stats.update(
-                shape_bounds(shape_obs[model.id], pooled_span)
-            )
-
-    # 2) Area thresholds on top of the final color AND shape models,
-    # computed under the CURRENT region only, with exactly the
-    # plausible-only component selection detection uses (pipeline
-    # identity: thresholds must be learned on the areas that will be
-    # measured at runtime).
-    trained: list[BinModel] = []
-    for model in bins:
-        pos_areas: list[float] = []
-        neg_areas: list[float] = []
-        band_frac = edge_band_min_frac(model)
-        clutter_max: float | None = None
-        for entry in usable_images:
-            if model.id in entry.present:
-                target = pos_areas
-            elif model.id in entry.absent:
-                target = neg_areas
-            else:
-                continue
-            mask, denom = banded_bin_mask(entry.path, model)
-            if target is neg_areas and band_frac is not None:
-                # Diagnosis on the RAW poly-masked mask: how deep does
-                # boundary-attached clutter reach in this bin's color?
-                # A component entering from outside must cross the
-                # outermost region pixel layer (depth == 1) - a
-                # structural criterion, no threshold. Normalized by the
-                # grid width like the band itself.
-                raw_mask, _raw_denom = masked_bin_mask(entry.path, model)
+                if component is None:
+                    continue
+                ys, xs = np.nonzero(component)
+                box_w = int(xs.max()) - int(xs.min()) + 1
+                box_h = int(ys.max()) - int(ys.min()) + 1
+                observations.append(
+                    (int(component.sum()), box_w, box_h, denom)
+                )
                 depth = depth_for(entry.path)
-                attached = seeded_component(raw_mask, raw_mask & (depth == 1))
-                if attached is not None:
-                    reach = float(depth[attached].max()) / raw_mask.shape[1]
-                    clutter_max = (
-                        reach
-                        if clutter_max is None
-                        else max(clutter_max, reach)
+                if bool((depth[component] == 1).any()):
+                    touch_depths.append(
+                        float(depth[component].max()) / mask.shape[1]
                     )
-            selected = select_component(mask, model, denom)
-            area_frac = (selected[0] / denom) if selected else 0.0
-            if target is pos_areas and area_frac <= 0.0:
-                # The region, the shape filter or the edge band leaves
-                # no plausible blob in a present-labeled image: exclude
-                # the observation with a warning instead of hard-failing
-                # the bin (same policy as stale-geometry evidence). When
-                # the edge band is the cause, say so - the cure is a
-                # sample rect on this pose, which gives the pose a vote
-                # in the band.
-                banded_away = False
-                if band_frac is not None:
-                    raw_mask, raw_denom = masked_bin_mask(entry.path, model)
-                    raw_sel = select_component(raw_mask, model, raw_denom)
-                    banded_away = raw_sel is not None and raw_sel[0] > 0
-                if banded_away:
-                    warnings.append(
-                        f"bin {model.id}: present-labeled {entry.path} "
-                        "loses its only plausible blob to the edge band "
-                        "(boundary-touching, shallower than every "
-                        "calibrated touching lid) - observation excluded; "
-                        "draw a sample rect on this pose so the band "
-                        "learns it"
-                    )
-                else:
-                    warnings.append(
-                        f"bin {model.id}: present-labeled {entry.path} "
-                        "yields no plausible blob under the current "
-                        "region/shape model - observation excluded (the "
-                        "threshold is then learned without this worst "
-                        "case; if this happens for typical frames, widen "
-                        "the region or add samples from such frames)"
-                    )
-                continue
-            target.append(area_frac)
-        if band_frac is not None:
-            model.learning_stats["region_edge_clutter_max_frac"] = clutter_max
-            separable = clutter_max is None or clutter_max < band_frac
-            model.learning_stats["region_edge_separable"] = separable
-            if not separable:
-                warnings.append(
-                    f"bin {model.id}: boundary clutter in absent frames "
-                    f"reaches interior depth {clutter_max:.4f} of the grid "
-                    f"width, at or beyond the learned edge band of "
-                    f"{band_frac:.4f} - such clutter still counts toward "
-                    "detection; check the region contour or add absent "
-                    "labels from that light"
+            shape_obs[model.id] = observations
+            edge_depths[model.id] = touch_depths
+        for model in competitors:
+            model.learning_stats.update(learn_edge_band(edge_depths[model.id]))
+
+        # No banded re-measurement of shapes is needed: the reach filter
+        # only drops WHOLE components, and every calibrated lid
+        # component reaches the band by construction, so the
+        # observations above are exactly what detection will see.
+        # Pooled lid-aspect span across ALL bins: the installation's
+        # measured scale of position-induced aspect variation (each bin
+        # is a lid observed at a different spot).
+        all_aspects = [
+            math.log(w / h)
+            for obs in shape_obs.values()
+            for (_a, w, h, _d) in obs
+        ]
+        pooled_span = (
+            max(all_aspects) - min(all_aspects)
+            if len(all_aspects) >= 2
+            else 0.0
+        )
+        for model in competitors:
+            if shape_obs[model.id]:
+                model.learning_stats.update(
+                    shape_bounds(shape_obs[model.id], pooled_span)
                 )
-        try:
-            result = learn_area_threshold(pos_areas, neg_areas, bin_id=model.id)
-        except CalibrationError as exc:
-            untrained[model.id] = str(exc)
-            warnings.append(f"bin {model.id}: untrained - {exc}")
+
+        # 2a) Areas under the pixel layer only. Their outcome becomes
+        # each bin's qualification for the occupancy veto: only a bin
+        # whose own calibration separates, is not provisional and whose
+        # blob is at least the weakest lid ever confirmed for it may
+        # erase another bin's evidence.
+        qualified_failures: list[str] = []
+        zero_area_positives: dict[str, list[str]] = {}
+        for model in competitors:
+            pos_areas: list[float] = []
+            neg_areas: list[float] = []
+            for entry in usable_images:
+                if model.id in entry.present:
+                    target = pos_areas
+                elif model.id in entry.absent:
+                    target = neg_areas
+                else:
+                    continue
+                mask, denom = banded_bin_mask(entry.path, model, competitors)
+                selected = select_component(mask, model, denom)
+                area_frac = (selected[0] / denom) if selected else 0.0
+                if target is pos_areas and area_frac <= 0.0:
+                    zero_area_positives.setdefault(model.id, []).append(
+                        entry.path
+                    )
+                    continue
+                target.append(area_frac)
+            try:
+                pass_a = learn_area_threshold(
+                    pos_areas, neg_areas, bin_id=model.id
+                )
+            except CalibrationError as exc:
+                round_untrained[model.id] = str(exc)
+                dropout_warnings.append(f"bin {model.id}: untrained - {exc}")
+                # A bin that drops out here never reaches pass 2b, so
+                # the per-image diagnosis explaining WHY it has no
+                # usable positive must be emitted now or never.
+                for path in zero_area_positives.get(model.id, []):
+                    dropout_warnings.append(
+                        f"bin {model.id}: present-labeled {path} yields no "
+                        "plausible blob under the current region/shape "
+                        "model - observation excluded"
+                    )
+                qualified_failures.append(model.id)
+                continue
+            model.learning_stats["veto_qualify_min_area_frac"] = (
+                pass_a.stats.get("min_pos_area_frac")
+            )
+            model.learning_stats["veto_qualify_separable"] = bool(
+                pass_a.stats.get("separable", False)
+            )
+            model.learning_stats["veto_qualify_provisional"] = bool(
+                pass_a.stats.get("provisional", True)
+            )
+        if qualified_failures:
+            competitors = [
+                m for m in competitors if m.id not in qualified_failures
+            ]
+            untrained.update(round_untrained)
+            if not competitors:
+                break
             continue
-        warnings.extend(result.warnings)
-        model.min_area_frac = result.min_area_frac
-        model.learning_stats.update(result.stats)
-        trained.append(model)
-    bins = trained
+
+        # 2b) Final areas under BOTH layers, measured exactly as
+        # detection measures them (shared resolve_candidates), images
+        # outer because the veto is a relation between bins in one
+        # frame.
+        pos_by_bin: dict[str, list[float]] = {m.id: [] for m in competitors}
+        neg_by_bin: dict[str, list[float]] = {m.id: [] for m in competitors}
+        clutter_by_bin: dict[str, float | None] = {
+            m.id: None for m in competitors
+        }
+        for entry in usable_images:
+            hue, sat, val = hsv_for(entry.path, store.roi)
+            poly = poly_for(entry.path)
+            depth = depth_for(entry.path)
+            denom = int(poly.sum()) if poly is not None else hue.size
+            candidates = resolve_candidates(
+                hue,
+                sat,
+                val,
+                competitors,
+                universe=universe_for(entry.path),
+                region=poly,
+                depth=depth,
+                denom=denom,
+                exclusion=True,
+            )
+            for model, cand in zip(competitors, candidates):
+                if model.id in entry.present:
+                    target = pos_by_bin[model.id]
+                elif model.id in entry.absent:
+                    target = neg_by_bin[model.id]
+                else:
+                    continue
+                band_frac = edge_band_min_frac(model)
+                if target is neg_by_bin[model.id] and band_frac is not None:
+                    # Diagnosis on the unbanded layer-1 mask: how deep
+                    # does boundary-attached clutter reach in this bin's
+                    # color? A component entering from outside must
+                    # cross the outermost region pixel layer (depth ==
+                    # 1) - a structural criterion, no threshold.
+                    raw_mask, _raw_denom = layer1_mask(
+                        entry.path, model, competitors
+                    )
+                    attached = seeded_component(
+                        raw_mask, raw_mask & (depth == 1)
+                    )
+                    if attached is not None:
+                        reach = (
+                            float(depth[attached].max()) / raw_mask.shape[1]
+                        )
+                        previous = clutter_by_bin[model.id]
+                        clutter_by_bin[model.id] = (
+                            reach if previous is None else max(previous, reach)
+                        )
+                area_frac = cand.area / denom
+                if target is pos_by_bin[model.id] and area_frac <= 0.0:
+                    # The region, the shape filter, the edge band or
+                    # another bin's detected area leaves no plausible
+                    # blob in a present-labeled image: exclude the
+                    # observation with a warning instead of hard-failing
+                    # the bin (same policy as stale-geometry evidence),
+                    # naming the cause so the cure is obvious.
+                    if cand.excluded_by is not None:
+                        round_warnings.append(
+                            f"bin {model.id}: present-labeled {entry.path} "
+                            f"lies inside the detected area of "
+                            f"{cand.excluded_by} - observation excluded; "
+                            "two bins cannot occupy the same spot, so "
+                            "check the labels or the samples of both"
+                        )
+                    elif _lost_to_the_band(entry.path, model, competitors):
+                        round_warnings.append(
+                            f"bin {model.id}: present-labeled {entry.path} "
+                            "loses its only plausible blob to the edge "
+                            "band (boundary-touching, shallower than "
+                            "every calibrated touching lid) - observation "
+                            "excluded; draw a sample rect on this pose so "
+                            "the band learns it"
+                        )
+                    else:
+                        round_warnings.append(
+                            f"bin {model.id}: present-labeled {entry.path} "
+                            "yields no plausible blob under the current "
+                            "region/shape model - observation excluded "
+                            "(the threshold is then learned without this "
+                            "worst case; if this happens for typical "
+                            "frames, widen the region or add samples from "
+                            "such frames)"
+                        )
+                    continue
+                target.append(area_frac)
+
+        trained: list[BinModel] = []
+        final_failures: list[str] = []
+        for model in competitors:
+            band_frac = edge_band_min_frac(model)
+            if band_frac is not None:
+                clutter_max = clutter_by_bin[model.id]
+                model.learning_stats["region_edge_clutter_max_frac"] = (
+                    clutter_max
+                )
+                separable = clutter_max is None or clutter_max < band_frac
+                model.learning_stats["region_edge_separable"] = separable
+                if not separable:
+                    round_warnings.append(
+                        f"bin {model.id}: boundary clutter in absent frames "
+                        f"reaches interior depth {clutter_max:.4f} of the "
+                        f"grid width, at or beyond the learned edge band of "
+                        f"{band_frac:.4f} - such clutter still counts toward "
+                        "detection; check the region contour or add absent "
+                        "labels from that light"
+                    )
+            try:
+                result = learn_area_threshold(
+                    pos_by_bin[model.id],
+                    neg_by_bin[model.id],
+                    bin_id=model.id,
+                )
+            except CalibrationError as exc:
+                round_untrained[model.id] = str(exc)
+                dropout_warnings.append(f"bin {model.id}: untrained - {exc}")
+                final_failures.append(model.id)
+                continue
+            round_warnings.extend(result.warnings)
+            model.min_area_frac = result.min_area_frac
+            model.learning_stats.update(result.stats)
+            trained.append(model)
+        if final_failures:
+            # The round is recomputed without these bins, so their
+            # per-image diagnoses would otherwise be lost with the
+            # round-local warnings - they are the only explanation of
+            # why the bin disappeared.
+            dropout_warnings.extend(
+                w
+                for w in round_warnings
+                if any(w.startswith(f"bin {b}: ") for b in final_failures)
+            )
+            competitors = [m for m in competitors if m.id not in final_failures]
+            untrained.update(round_untrained)
+            if not competitors:
+                break
+            continue
+        untrained.update(round_untrained)
+        warnings.extend(round_warnings)
+        competitors = trained
+        break
+
+    warnings.extend(dropout_warnings)
+    bins = competitors
     if not bins:
         raise CalibrationError(
             "no bin could be trained: "
@@ -998,16 +1205,28 @@ def learn_profile(
         "max_row_dup_frac": row_dup_max,
     }
 
+    for model in bins:
+        total = exclusive_total.get(model.id, 0)
+        model.learning_stats["exclusive_keep_frac"] = (
+            1.0 if total == 0 else exclusive_kept.get(model.id, 0) / total
+        )
+
     # 4) Ambiguity diagnosis: overlapping learned hue bands.
     for i, a in enumerate(bins):
         for b in bins[i + 1 :]:
             if _hue_bands_overlap(a, b):
+                losses = " ".join(
+                    f"{m.id} keeps "
+                    f"{m.learning_stats.get('exclusive_keep_frac', 1.0):.0%} "
+                    "of its matching pixels."
+                    for m in (a, b)
+                )
                 warnings.append(
                     f"bins {a.id} and {b.id}: learned hue bands overlap "
                     f"({a.hue_center_deg:.0f}°±{a.hue_tol_deg:.0f}° vs "
-                    f"{b.hue_center_deg:.0f}°±{b.hue_tol_deg:.0f}°) - one bin "
-                    "can produce blobs in both masks; results for these two "
-                    "bins are not independent"
+                    f"{b.hue_center_deg:.0f}°±{b.hue_tol_deg:.0f}°) - every "
+                    "contested pixel goes to the closer color, so the two "
+                    f"bins compete for evidence. {losses}"
                 )
 
     profile = Profile(
@@ -1025,5 +1244,8 @@ def learn_profile(
         ),
         daylight_stats=daylight_stats,
         bins=bins,
+        # Thresholds above were measured under mutual exclusion, so
+        # detection must apply it too (see resolve_candidates).
+        mutual_exclusion=True,
     )
     return profile, warnings

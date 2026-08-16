@@ -116,17 +116,22 @@ def edge_band_filter(
 
 def select_component(
     mask, model: BinModel, denom: int
-) -> tuple[int, tuple[int, int, int, int], tuple[float, float]] | None:
-    """The LARGEST PLAUSIBLE component of a bin's color mask.
+) -> tuple[
+    int, tuple[int, int, int, int], tuple[float, float], tuple[int, int]
+] | None:
+    """The LARGEST PLAUSIBLE component of a bin's color mask, as
+    (area, half-open box, centroid, seed pixel).
 
     Shared by detection and area learning (pipeline identity: learned
     thresholds must be computed on exactly the areas detection sees).
     No plausible component means no evidence: honest zero, so a hedge
     fringe or a sunlit body streak can no longer stand in for a lid.
+    The seed pixel lets callers re-derive the exact pixel set without
+    a second labelling pass.
     """
-    for area, box, centroid in component_regions(mask):
+    for area, box, centroid, seed in component_regions(mask, with_seed=True):
         if shape_plausible(model, area / denom, box, area):
-            return area, box, centroid
+            return area, box, centroid, seed
     return None
 
 
@@ -190,14 +195,340 @@ def row_duplicate_fraction(arr: np.ndarray) -> float:
     return float(dup.sum() / pair_has_signal.sum())
 
 
+def bin_match(
+    hue: np.ndarray, sat: np.ndarray, val: np.ndarray, model: BinModel
+) -> tuple[np.ndarray, np.ndarray]:
+    """Acceptance mask plus circular hue distance for one bin.
+
+    The mask is the unchanged gate. The distance is the gate's own
+    statistic in degrees, used to rank competing claims for a pixel.
+    Deliberately NOT divided by the bin's tolerance: the tolerance is
+    the 95th percentile spread of that bin's samples, i.e. a measure
+    of how heterogeneous its calibration light was, not of color
+    identity. Ranking by the ratio would hand a pixel to whichever bin
+    was sampled most sloppily - measured: a lid at 59 deg, 1 deg from
+    its own bin (tolerance 7) and 3 deg from a neighbour (tolerance
+    30), went entirely to the neighbour. Degrees are the same physical
+    unit for every bin, so the closer color wins. Unmatched hue is
+    infinitely far.
+    """
+    dist = circular_dist_deg(hue, model.hue_center_deg)
+    # Undefined hue (grey pixel) can never match a color model.
+    dist = np.where(np.isnan(dist), np.inf, dist)
+    match = (
+        (dist <= model.hue_tol_deg)
+        & (sat >= model.sat_min)
+        & (val >= model.val_min)
+    )
+    return match, dist
+
+
 def bin_mask(
     hue: np.ndarray, sat: np.ndarray, val: np.ndarray, model: BinModel
 ) -> np.ndarray:
     """Boolean mask of pixels matching one bin's learned color model."""
-    dist = circular_dist_deg(hue, model.hue_center_deg)
-    # Undefined hue (grey pixel) can never match a color model.
-    dist = np.where(np.isnan(dist), np.inf, dist)
-    return (dist <= model.hue_tol_deg) & (sat >= model.sat_min) & (val >= model.val_min)
+    return bin_match(hue, sat, val, model)[0]
+
+
+def exclusive_bin_masks(
+    hue: np.ndarray,
+    sat: np.ndarray,
+    val: np.ndarray,
+    models: list[BinModel],
+    *,
+    enabled: bool,
+) -> list[np.ndarray]:
+    """Per-bin masks in which every pixel belongs to at most one bin.
+
+    A pixel shows ONE object, so when two learned color bands overlap
+    (the learner warns about exactly that) both bins claiming the same
+    pixel is physically impossible. Each contested pixel goes to the
+    bin whose learned color it is CLOSEST to, in degrees (see
+    bin_match). An exact tie carries no information about which bin it
+    belongs to, so the pixel goes to nobody; that also makes the result
+    independent of the order of ``models``.
+
+    The masks are always a subset of the plain per-bin masks: a pixel
+    accepted by exactly one bin is never touched, so an installation
+    whose bands do not overlap is bit-identical to the pre-exclusion
+    behavior. ``enabled=False`` returns exactly those plain masks
+    (profiles learned before exclusion measured their thresholds
+    without it).
+    """
+    matches, dists = [], []
+    for model in models:
+        match, dist = bin_match(hue, sat, val, model)
+        matches.append(match)
+        dists.append(dist)
+    if not enabled or len(models) < 2:
+        return matches
+    best = np.full(hue.shape, np.inf)
+    for match, dist in zip(matches, dists):
+        scored = np.where(match, dist, np.inf)
+        np.minimum(best, scored, out=best)
+    # A pixel is contested-and-undecided when two accepted claims share
+    # the minimum exactly; count winners to detect that structurally.
+    winners = np.zeros(hue.shape, dtype=np.int_)
+    for match, dist in zip(matches, dists):
+        winners += (match & (dist == best)).astype(np.int_)
+    unique = winners == 1
+    return [
+        match & (dist == best) & unique
+        for match, dist in zip(matches, dists)
+    ]
+
+
+def component_holes(
+    component: np.ndarray, universe: np.ndarray, depth: np.ndarray
+) -> np.ndarray | None:
+    """The region pixels enclosed by ``component`` (its holes).
+
+    Free pixels that cannot be reached from the outermost region layer
+    (interior depth 1, the same structural criterion the edge band
+    uses) without crossing the component are inside it. The flood is
+    8-connected like the component machinery in ccl.py, which is what
+    makes containment all-or-nothing: another bin's candidate lies
+    wholly inside the holes or wholly outside, never partly, so a veto
+    can only ever remove a whole candidate and never reshape a
+    surviving one. Returns None when the outside is unreachable (a
+    color ringing the entire region), where "inside" is meaningless.
+    """
+    free = universe & ~component
+    outside = seeded_component(free, free & (depth == 1))
+    if outside is None:
+        return None
+    return free & ~outside
+
+
+def veto_qualified(model: BinModel, provisional_area_frac: float) -> bool:
+    """May this bin's detected area veto another bin inside it?
+
+    Only a bin that is itself credible evidence may erase another
+    bin's: its calibration must separate (a bin whose own learned
+    threshold misclassifies calibration images - the field case of a
+    brown model that also matches brick pavement - could otherwise
+    delete a real lid), it must not rest on a provisional threshold,
+    and its current blob must be at least the weakest lid the user
+    ever confirmed for it. All three come from learned statistics; the
+    area bar is an observed calibration extremum, not a chosen value.
+    """
+    stats = model.learning_stats
+    if not stats.get("veto_qualify_separable", False):
+        return False
+    if stats.get("veto_qualify_provisional", True):
+        return False
+    bar = stats.get("veto_qualify_min_area_frac")
+    if bar is None:
+        return False
+    return provisional_area_frac >= float(bar)
+
+
+@dataclass
+class Candidate:
+    """One bin's selected blob after exclusion has been resolved."""
+
+    area: int
+    box: tuple[int, int, int, int] | None
+    centroid: tuple[float, float] | None
+    provisional_area: int
+    excluded_by: str | None = None
+    conflict_with: str | None = None
+
+
+def resolve_candidates(
+    hue: np.ndarray,
+    sat: np.ndarray,
+    val: np.ndarray,
+    models: list[BinModel],
+    *,
+    universe: np.ndarray,
+    region: np.ndarray | None,
+    depth: np.ndarray,
+    denom: int,
+    exclusion: bool,
+    veto: bool = True,
+) -> list[Candidate]:
+    """Select every bin's blob under the exclusion rules.
+
+    THE identity contract: detection and area learning both call this
+    and nothing else, so thresholds are always learned on exactly the
+    pixels detection counts. Two physical statements are applied:
+    pixels belong to at most one bin (exclusive_bin_masks), and a bin
+    detected inside another bin's detected area cannot exist
+    (component_holes veto).
+
+    Resolution runs to a FIXED POINT rather than in a single pass:
+    vetoing a bin moves its blob elsewhere, and the new blob may
+    enclose a third bin that the first pass never looked at. Enclosure
+    is antisymmetric, so the enclosure chain has no cycles and is at
+    most one deep per bin - the loop therefore terminates after at
+    most len(models) rounds, and every round strictly shrinks at least
+    one mask.
+
+    ``veto=False`` applies the pixel layer only. Learning needs that
+    mode for the pass that establishes each bin's qualification bar,
+    which the veto layer then consumes - the one genuine cycle between
+    the two layers, cut by measuring before vetoing rather than by
+    iterating.
+    """
+    masks = exclusive_bin_masks(hue, sat, val, models, enabled=exclusion)
+    apply_veto = exclusion and veto
+    prepared: list[np.ndarray] = []
+    for model, mask in zip(models, masks):
+        if region is not None:
+            mask = mask & region
+        band_frac = edge_band_min_frac(model)
+        if band_frac is not None:
+            band_px = band_frac * mask.shape[1]
+            if band_px > 1.0:
+                mask = edge_band_filter(mask, depth, band_px)
+        prepared.append(mask)
+    provisional = [
+        select_component(mask, model, denom)
+        for mask, model in zip(prepared, models)
+    ]
+    if not apply_veto:
+        results = []
+        for selected in provisional:
+            if selected is None:
+                results.append(Candidate(0, None, None, 0))
+            else:
+                area, box, centroid, _seed = selected
+                results.append(Candidate(area, box, centroid, area))
+        return results
+
+    n = len(models)
+    active = list(prepared)
+    selected = list(provisional)
+    excluded_by: list[str | None] = [None] * n
+    containers: list[list[int]] = [[] for _ in range(n)]
+    for _round in range(n):
+        # Enclosure is decided independently of who may veto, so that
+        # an enclosure by a NOT-credible container is still reported as
+        # a conflict instead of silently disappearing. bbox nesting is
+        # an exact necessary condition, used only to skip the flood
+        # fill; every verdict below is pixel-exact.
+        holes: list[np.ndarray | None] = [None] * n
+        for j, sel_j in enumerate(selected):
+            if sel_j is None:
+                continue
+            if not any(
+                i != j
+                and selected[i] is not None
+                and _box_inside(selected[i][1], sel_j[1])
+                for i in range(n)
+            ):
+                continue
+            component = seeded_component(
+                active[j], _seed_mask(active[j], sel_j[3])
+            )
+            if component is not None:
+                holes[j] = component_holes(component, universe, depth)
+        containers = [[] for _ in range(n)]
+        if any(hole is not None for hole in holes):
+            for i, sel_i in enumerate(selected):
+                if sel_i is None:
+                    continue
+                blob = None
+                for j, hole in enumerate(holes):
+                    if i == j or hole is None:
+                        continue
+                    if not _box_inside(sel_i[1], selected[j][1]):
+                        continue
+                    if blob is None:
+                        blob = seeded_component(
+                            active[i], _seed_mask(active[i], sel_i[3])
+                        )
+                        if blob is None:
+                            break
+                    if not bool((blob & ~hole).any()):
+                        containers[i].append(j)
+        # Only a bin that is credible evidence itself may erase
+        # another's, and a container that is itself enclosed by a
+        # qualified container may not (that is what resolves a nest of
+        # three without any ordering).
+        qualified = [
+            selected[j] is not None
+            and holes[j] is not None
+            and veto_qualified(models[j], selected[j][0] / denom)
+            for j in range(n)
+        ]
+        vetoers = [
+            qualified[j]
+            and not any(qualified[k] for k in containers[j])
+            for j in range(n)
+        ]
+        changed = False
+        for i in range(n):
+            legal = [j for j in containers[i] if vetoers[j]]
+            if not legal:
+                continue
+            mask = active[i]
+            for j in legal:
+                mask = mask & ~holes[j]
+            active[i] = mask
+            # Name the largest legal container, tie-broken by bin id:
+            # a deterministic choice that does not depend on the order
+            # of ``models``.
+            excluded_by[i] = min(
+                (models[j] for j in legal),
+                key=lambda m: (-selected[models.index(m)][0], m.id),
+            ).id
+            changed = True
+        if not changed:
+            break
+        selected = [
+            select_component(mask, model, denom)
+            for mask, model in zip(active, models)
+        ]
+
+    results = []
+    for i, model in enumerate(models):
+        sel = selected[i]
+        prov = provisional[i]
+        prov_area = 0 if prov is None else prov[0]
+        if sel is None:
+            results.append(
+                Candidate(0, None, None, prov_area, excluded_by=excluded_by[i])
+            )
+            continue
+        area, box, centroid, _seed = sel
+        # Enclosed, but by no container credible enough to veto: report
+        # the conflict instead of acting on it.
+        conflict = (
+            None
+            if excluded_by[i] is not None or not containers[i]
+            else models[containers[i][0]].id
+        )
+        results.append(
+            Candidate(
+                area,
+                box,
+                centroid,
+                prov_area,
+                excluded_by=excluded_by[i],
+                conflict_with=conflict,
+            )
+        )
+    return results
+
+
+def _seed_mask(mask: np.ndarray, pixel: tuple[int, int]) -> np.ndarray:
+    """One-pixel seed for re-deriving a component's exact pixel set."""
+    seed = np.zeros_like(mask)
+    seed[pixel[0], pixel[1]] = True
+    return seed
+
+
+def _box_inside(
+    inner: tuple[int, int, int, int], outer: tuple[int, int, int, int]
+) -> bool:
+    return (
+        inner[0] >= outer[0]
+        and inner[1] >= outer[1]
+        and inner[2] <= outer[2]
+        and inner[3] <= outer[3]
+    )
 
 
 @dataclass
@@ -214,6 +545,12 @@ class BinResult:
     # [x, y, w, h] and centroid [cx, cy]. None when nothing matched.
     bbox: tuple[float, float, float, float] | None = None
     centroid: tuple[float, float] | None = None
+    # Mutual exclusion: what the blob measured before another bin's
+    # detected area vetoed it, which bin that was, and whether an
+    # enclosure was seen but left unresolved.
+    provisional_area_frac: float = 0.0
+    excluded_by: str | None = None
+    exclusion_conflict: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         # Values are serialized unrounded: any display rounding could
@@ -229,6 +566,9 @@ class BinResult:
             "uncertain": self.uncertain,
             "bbox": None if self.bbox is None else list(self.bbox),
             "centroid": None if self.centroid is None else list(self.centroid),
+            "provisional_area_frac": self.provisional_area_frac,
+            "excluded_by": self.excluded_by,
+            "exclusion_conflict": self.exclusion_conflict,
         }
 
 
@@ -349,34 +689,37 @@ def detect(img: Image.Image, profile: Profile) -> DetectionResult:
     # the exact pre-polygon fast path.
     poly = _cached_region_mask(profile, width, height, actual_roi)
     denom = int(poly.sum()) if poly is not None else total
+    universe = (
+        np.ones((height, width), dtype=bool) if poly is None else poly
+    )
+    depth = _cached_interior_depth(profile, width, height, actual_roi)
+    candidates = resolve_candidates(
+        hue,
+        sat,
+        val,
+        profile.bins,
+        universe=universe,
+        region=poly,
+        depth=depth,
+        denom=denom,
+        exclusion=profile.mutual_exclusion,
+    )
     results: list[BinResult] = []
-    for model in profile.bins:
-        mask = bin_mask(hue, sat, val, model)
-        if poly is not None:
-            mask &= poly
-        # Edge band: boundary-touching candidates must reach the
-        # learned lid depth (see edge_band_filter); thresholds were
-        # measured with exactly this filter (banded_bin_mask in learn).
-        # Fraction -> pixels on THIS grid; a band of one pixel or less
-        # removes nothing (every region pixel has depth >= 1).
-        band_frac = edge_band_min_frac(model)
-        if band_frac is not None:
-            band_px = band_frac * width
-            if band_px > 1.0:
-                depth = _cached_interior_depth(
-                    profile, width, height, actual_roi
-                )
-                mask = edge_band_filter(mask, depth, band_px)
-        selected = select_component(mask, model, denom)
-        if selected is None:
-            area, bbox, centroid = 0, None, None
-        else:
-            area, box_px, centroid_px = selected
-            bbox = _mask_box_to_image(box_px, width, height, actual_roi)
-            centroid = _mask_point_to_image(
-                centroid_px, width, height, actual_roi
+    for model, cand in zip(profile.bins, candidates):
+        bbox = (
+            None
+            if cand.box is None
+            else _mask_box_to_image(cand.box, width, height, actual_roi)
+        )
+        centroid = (
+            None
+            if cand.centroid is None
+            else _mask_point_to_image(
+                cand.centroid, width, height, actual_roi
             )
-        frac = area / denom
+        )
+        frac = cand.area / denom
+        conflict = cand.conflict_with is not None
         results.append(
             BinResult(
                 id=model.id,
@@ -385,9 +728,17 @@ def detect(img: Image.Image, profile: Profile) -> DetectionResult:
                 area_frac=frac,
                 min_area_frac=model.min_area_frac,
                 margin=frac / model.min_area_frac,
-                uncertain=is_uncertain(frac, model.learning_stats),
+                # An unresolved enclosure (the container is not credible
+                # enough to veto) is reported, never acted on: hold the
+                # last safe state instead of flipping on contested
+                # evidence.
+                uncertain=is_uncertain(frac, model.learning_stats)
+                or (conflict and frac >= model.min_area_frac),
                 bbox=bbox,
                 centroid=centroid,
+                provisional_area_frac=cand.provisional_area / denom,
+                excluded_by=cand.excluded_by,
+                exclusion_conflict=conflict,
             )
         )
     median_sat = float(np.median(sat))

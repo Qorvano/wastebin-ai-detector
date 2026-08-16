@@ -85,11 +85,18 @@ def largest_component_area(mask: np.ndarray) -> int:
 
 def component_regions(
     mask: np.ndarray,
-) -> list[tuple[int, tuple[int, int, int, int], tuple[float, float]]]:
+    *,
+    with_seed: bool = False,
+) -> list[tuple]:
     """All 8-connected components as (area, half-open box, centroid),
     sorted by area descending. Same runs/union-find scheme as
     :func:`largest_component_area` (untouched for its callers), with
     per-component extent and first moments carried through the merges.
+
+    ``with_seed=True`` appends a (y, x) pixel that provably belongs to
+    the component, so callers can re-derive its exact pixel set with
+    :func:`seeded_component`. A bounding box cannot serve that purpose:
+    two components may share one.
     """
     mask = np.asarray(mask)
     if mask.ndim != 2:
@@ -105,6 +112,7 @@ def component_regions(
     max_y: list[int] = []
     sum_x: list[float] = []
     sum_y: list[float] = []
+    seed: list[tuple[int, int]] = []
 
     def find(i: int) -> int:
         root = i
@@ -158,6 +166,7 @@ def component_regions(
                 max_y.append(y)
                 sum_x.append(0.0)
                 sum_y.append(0.0)
+                seed.append((y, b0))
             root = find(label)
             n = b1 - b0
             size[root] += n
@@ -177,6 +186,7 @@ def component_regions(
             (min_x[i], min_y[i], max_x[i] + 1, max_y[i] + 1),
             (sum_x[i] / size[i], sum_y[i] / size[i]),
         )
+        + ((seed[i],) if with_seed else ())
         for i in range(len(parent))
         if find(i) == i and size[i] > 0
     ]

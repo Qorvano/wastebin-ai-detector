@@ -23,6 +23,11 @@ from .detect import (
     BinResult,
     DetectionResult,
     bin_mask,
+    bin_match,
+    component_holes,
+    exclusive_bin_masks,
+    resolve_candidates,
+    veto_qualified,
     detect,
     detect_file,
     is_uncertain,
@@ -94,6 +99,11 @@ from .store import (
 
 __all__ = [
     "bin_mask",
+    "bin_match",
+    "component_holes",
+    "exclusive_bin_masks",
+    "resolve_candidates",
+    "veto_qualified",
     "BinDecl",
     "BinModel",
     "BinResult",

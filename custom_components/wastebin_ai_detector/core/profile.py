@@ -89,6 +89,11 @@ class Profile:
     # Optional polygon region (rings, image-relative) refining the roi
     # bbox; None = whole bbox (pre-polygon semantics).
     roi_polygons: list | None = None
+    # Were this profile's thresholds measured with mutual exclusion
+    # between bins? Default False so a profile learned before the rule
+    # keeps being detected exactly as it was measured; learn_profile
+    # sets it True.
+    mutual_exclusion: bool = False
 
 
 def validate_profile(profile: Profile) -> None:
@@ -201,6 +206,28 @@ def validate_profile(profile: Profile) -> None:
                         "region_edge_depth_min_frac missing or not a "
                         f"finite number >= 0: {band!r}"
                     )
+        # The veto-qualification stats decide whether this bin may
+        # erase another bin's evidence: a hand-edited profile must not
+        # smuggle in values that crash detection or silently blind a
+        # bin (same policy as the shape and edge-band stats).
+        bar = b.learning_stats.get("veto_qualify_min_area_frac")
+        if bar is not None:
+            if (
+                isinstance(bar, bool)
+                or not isinstance(bar, (int, float))
+                or not math.isfinite(float(bar))
+                or not 0.0 <= float(bar) <= 1.0
+            ):
+                raise ProfileError(
+                    f"bin {b.id}: learning_stats.veto_qualify_min_area_frac "
+                    f"is not a finite fraction in [0, 1]: {bar!r}"
+                )
+        for key in ("veto_qualify_separable", "veto_qualify_provisional"):
+            flag = b.learning_stats.get(key)
+            if flag is not None and not isinstance(flag, bool):
+                raise ProfileError(
+                    f"bin {b.id}: learning_stats.{key} is not a bool: {flag!r}"
+                )
         # These two stats feed the ambiguity interval in detection, so
         # hand-edited profiles must not smuggle in broken values.
         for key in ("min_pos_area_frac", "max_neg_area_frac"):
@@ -230,6 +257,7 @@ def profile_to_dict(profile: Profile) -> dict[str, Any]:
         "daylight_val_max": data["daylight_val_max"],
         "row_dup_max": data["row_dup_max"],
         "roi_polygons": data["roi_polygons"],
+        "mutual_exclusion": data["mutual_exclusion"],
         "daylight_stats": data["daylight_stats"],
         "bins": data["bins"],
     }
@@ -248,6 +276,7 @@ def profile_from_dict(data: dict[str, Any]) -> Profile:
             overexposure_clip_max=float(data.get("overexposure_clip_max", 1.0)),
             daylight_val_max=float(data.get("daylight_val_max", 1.0)),
             row_dup_max=float(data.get("row_dup_max", 1.0)),
+            mutual_exclusion=bool(data.get("mutual_exclusion", False)),
             roi_polygons=(
                 None
                 if data.get("roi_polygons") is None

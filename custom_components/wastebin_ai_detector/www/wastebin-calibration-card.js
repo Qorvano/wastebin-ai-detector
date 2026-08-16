@@ -40,14 +40,15 @@ const TEXTS = {
     unset: "-",
     save_labels: "Save presence",
     need_capture: "Capture a snapshot first - marks and presence attach to an archived file.",
-    draw_first: "Draw a rectangle first.",
+    draw_first: "Mark at least two points on the lid first.",
     need_closed: "Close the contour first (tap the first point).",
     marked_pre: "Marked ",
     marked_post: " - color sample and “here” saved.",
     draw_next: "Drag the next rectangle.",
     all_marked: "All bins marked.",
     pick_bin: "Which bin is that? Tap it.",
-    mark_hint: "Drag a rectangle over a lid, then tap the bin it shows. That states: THIS is that bin, and it is here.",
+    mark_hint: "Tap the four corners of a lid (a little inside the rim) and its centre, then tap the bin it belongs to. Corner patches capture the light gradient across the lid, not just its average.",
+    points_left: " more point(s) recommended.",
     presence_hint: "For bins without a mark: tap to set here/away, then save. Away shots are the valuable negative examples.",
     nothing_set: "Nothing set - tap the bin buttons first.",
     sample_outside: "Warning: the mark lies (partly) outside the region - the detector cannot measure that lid until the region covers it.",
@@ -72,14 +73,15 @@ const TEXTS = {
     unset: "-",
     save_labels: "Anwesenheit speichern",
     need_capture: "Bitte nehmen Sie zuerst einen Schnappschuss auf - Markierungen und Anwesenheit gehören zu einer archivierten Datei.",
-    draw_first: "Bitte zeichnen Sie zuerst ein Rechteck.",
+    draw_first: "Bitte markieren Sie zuerst mindestens zwei Punkte auf dem Deckel.",
     need_closed: "Bitte schließen Sie zuerst die Kontur (ersten Punkt antippen).",
     marked_pre: "",
     marked_post: " markiert - Farb-Sample und „da“ gespeichert.",
     draw_next: "Ziehen Sie das nächste Rechteck.",
     all_marked: "Alle Tonnen markiert.",
     pick_bin: "Welche Tonne ist das? Bitte antippen.",
-    mark_hint: "Ziehen Sie ein Rechteck über einen Deckel und tippen Sie dann die Tonne an, die es zeigt. Das sagt: DAS ist diese Tonne, und sie ist da.",
+    mark_hint: "Tippen Sie die vier Ecken eines Deckels an (etwas innerhalb des Randes) und einmal die Mitte, dann die zugehörige Tonne. Die Eckproben erfassen den Lichtverlauf über den Deckel, nicht nur seinen Mittelwert.",
+    points_left: " weitere Punkte empfohlen.",
     presence_hint: "Für Tonnen ohne Markierung: Tippen Sie den Button an (da/weg) und speichern Sie. Weggestellte Tonnen liefern die wertvollen Abwesend-Beispiele.",
     nothing_set: "Keine Angabe gesetzt - bitte tippen Sie zuerst die Tonnen-Buttons an.",
     sample_outside: "Hinweis: Die Markierung liegt (teilweise) außerhalb der Region - diesen Deckel kann der Detektor erst messen, wenn die Region ihn abdeckt.",
@@ -91,10 +93,13 @@ const TEXTS = {
   },
 };
 
-/* Rectangles smaller than this fraction of the frame are accidental
- * click jitter, not a drawn box: at a 4K frame this is still < 8 px,
- * far below any lid or region a user would intentionally mark. */
-const MIN_DRAW_FRAC = 0.002;
+/* One lid is marked by its four corners plus its centre: five points
+ * spread over the surface, so the pooled sample carries the light
+ * GRADIENT across the lid (sunlit corner vs shaded corner) instead of
+ * one rectangle's average. Not a tuning value - it is the geometry of
+ * a quadrilateral lid, and fewer or more points still work (the patch
+ * size derives from the points themselves). */
+const LID_POINTS_RECOMMENDED = 5;
 /* Coordinate resolution sent to the services: 1e-4 of the frame is
  * sub-pixel for any camera up to 10000 px wide, so rounding here can
  * never move a rectangle by a visible amount. */
@@ -119,7 +124,7 @@ class WastebinCalibrationCard extends HTMLElement {
     super();
     this.attachShadow({ mode: "open" });
     this._mode = "view";
-    this._drawn = null; // sample rect {x,y,w,h} image-relative
+    this._points = []; // [[x, y], ...] lid points, image-relative
     this._saving = false;
     this._dragStart = null;
     this._filename = null;
@@ -145,6 +150,7 @@ class WastebinCalibrationCard extends HTMLElement {
     const saved = SESSIONS.get(this._sessionKey);
     if (saved) {
       this._mode = saved.mode;
+      this._points = saved.points || [];
       this._filename = saved.filename;
       this._marks = saved.marks;
       this._labels = saved.labels;
@@ -157,6 +163,7 @@ class WastebinCalibrationCard extends HTMLElement {
     if (!this._sessionKey) return;
     SESSIONS.set(this._sessionKey, {
       mode: this._mode,
+      points: this._points,
       filename: this._filename,
       marks: this._marks,
       labels: this._labels,
@@ -250,8 +257,8 @@ class WastebinCalibrationCard extends HTMLElement {
       this._labels = {};
       this._savedLabels = {};
       this._marks = {};
-      this._drawn = null;
-      this._paintDrawn();
+      this._points = [];
+      this._paintPoints();
       this._paintMarks();
       this._renderMarkRow();
       await this._showArchivedFrame();
@@ -351,7 +358,7 @@ class WastebinCalibrationCard extends HTMLElement {
 
   async _saveSample(binId) {
     if (!this._filename) return this._setStatus(this._t.need_capture);
-    if (!this._drawn) return this._setStatus(this._t.draw_first);
+    if (this._points.length < 2) return this._setStatus(this._t.draw_first);
     this._saving = true; /* one statement at a time */
     this._renderMarkRow();
     try {
@@ -363,45 +370,49 @@ class WastebinCalibrationCard extends HTMLElement {
   }
 
   async _saveSampleInner(binId) {
-    const r = this._drawn;
+    const patches = this._patches();
     const bin = this._config.bins.find((b) => b.id === binId);
     const name = bin ? bin.name : binId;
-    /* 9-point probe (corners, edge midpoints, center): still an
-     * approximation for exotic concavities, but catches rects that
-     * span holes or bridge a concave mouth, which corner-only
+    /* 9-point probe per patch (corners, edge midpoints, centre): still
+     * an approximation for exotic concavities, but catches patches
+     * that span holes or bridge a concave mouth, which corner-only
      * checks miss. The authoritative veto stays in learning_view. */
-    const probes = [];
-    for (const fx of [0, 0.5, 1]) {
-      for (const fy of [0, 0.5, 1]) {
-        probes.push([r.x + fx * r.w, r.y + fy * r.h]);
+    const outside = patches.some((r) => {
+      for (const fx of [0, 0.5, 1]) {
+        for (const fy of [0, 0.5, 1]) {
+          if (!this._pointInRegion(r.x + fx * r.w, r.y + fy * r.h)) return true;
+        }
+      }
+      return false;
+    });
+    for (const r of patches) {
+      try {
+        await this._svc("add_sample", {
+          filename: this._filename,
+          bin: binId,
+          rect: [
+            this._round(r.x),
+            this._round(r.y),
+            this._round(r.w),
+            this._round(r.h),
+          ],
+          space: "image",
+        });
+      } catch (err) {
+        return this._setStatus(this._t.error + (err.message || err));
       }
     }
-    const outside = probes.some(([cx, cy]) => !this._pointInRegion(cx, cy));
-    try {
-      await this._svc("add_sample", {
-        filename: this._filename,
-        bin: binId,
-        rect: [
-          this._round(r.x),
-          this._round(r.y),
-          this._round(r.w),
-          this._round(r.h),
-        ],
-        space: "image",
-      });
-    } catch (err) {
-      return this._setStatus(this._t.error + (err.message || err));
-    }
     /* The store appends samples, it never replaces - so the overlay
-     * keeps every saved rect too (marking the same bin again shows
-     * both, matching what the server holds). */
-    (this._marks[binId] = this._marks[binId] || []).push({ ...r });
-    this._drawn = null;
-    this._paintDrawn();
+     * keeps every saved patch too (marking the same bin again shows
+     * both sets, matching what the server holds). */
+    const saved = this._marks[binId] || (this._marks[binId] = []);
+    saved.push(...patches);
+    this._points = [];
+    this._paintPoints();
     this._renderMarkRow();
     this._persist();
-    /* One gesture, one statement: the mark is "THIS is that bin, and
-     * it is here", so the present label is saved in the same step.
+    /* One gesture, one statement: the marked lid is "THIS is that bin,
+     * and it is here", so the present label is saved in the same step.
      * set_labels merges per bin - other bins are never clobbered. */
     let relearn = null;
     try {
@@ -416,10 +427,10 @@ class WastebinCalibrationCard extends HTMLElement {
       this._renderLabelRow();
       this._persist();
     } catch (err) {
-      /* The sample IS stored, only the presence statement failed. Show
-       * it as a PENDING "here" (chip and mark tag get the dirty star),
-       * so "Save presence" completes the statement - re-drawing would
-       * append a second sample to the store instead. */
+      /* The samples ARE stored, only the presence statement failed.
+       * Show it as a PENDING "here" (chip and mark tag get the dirty
+       * star), so "Save presence" completes the statement - marking
+       * again would append a second set of patches instead. */
       this._labels[binId] = "present";
       this._renderLabelRow();
       return this._setStatus(
@@ -427,7 +438,7 @@ class WastebinCalibrationCard extends HTMLElement {
           (outside ? " " + this._t.sample_outside : "")
       );
     }
-    /* Re-assert the mode: the card stays ready for the next rectangle
+    /* Re-assert the mode: the card stays ready for the next lid
      * without any button in between, even if something rebuilt the
      * action row while the relearn was running. */
     this._setMode("sample");
@@ -439,6 +450,43 @@ class WastebinCalibrationCard extends HTMLElement {
         " " +
         (missing.length ? this._t.draw_next : this._t.all_marked)
     );
+  }
+
+  _frameAspect() {
+    /* Width/height of the analysed frame in PIXELS: relative
+     * coordinates are per-axis fractions, so distances must be
+     * un-squashed before they can be compared geometrically. */
+    const img = this.shadowRoot.getElementById("cam");
+    if (img && img.naturalWidth && img.naturalHeight) {
+      return img.naturalWidth / img.naturalHeight;
+    }
+    const rect = this.shadowRoot.getElementById("stage").getBoundingClientRect();
+    return rect.height ? rect.width / rect.height : 1;
+  }
+
+  _patches() {
+    /* One square patch per marked point, as large as the user's own
+     * points allow: half the distance to the nearest other point, so
+     * patches never overlap and their size is derived from the marked
+     * geometry instead of being a chosen number. Squares are square in
+     * PIXELS, and are clamped into the frame. */
+    const aspect = this._frameAspect();
+    const scaled = this._points.map(([x, y]) => [x * aspect, y]);
+    return this._points.map(([x, y], i) => {
+      let nearest = Infinity;
+      scaled.forEach(([sx, sy], j) => {
+        if (i === j) return;
+        const d = Math.hypot(scaled[i][0] - sx, scaled[i][1] - sy);
+        if (d < nearest) nearest = d;
+      });
+      const r = nearest / 2;
+      const rx = r / aspect;
+      const x0 = Math.max(x - rx, 0);
+      const y0 = Math.max(y - r, 0);
+      const x1 = Math.min(x + rx, 1);
+      const y1 = Math.min(y + r, 1);
+      return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+    });
   }
 
   async _saveLabels() {
@@ -500,10 +548,15 @@ class WastebinCalibrationCard extends HTMLElement {
   _onDown(ev) {
     if (this._mode === "sample") {
       ev.preventDefault();
-      const stage = this.shadowRoot.getElementById("stage");
-      if (stage.setPointerCapture) stage.setPointerCapture(ev.pointerId);
-      this._dragStart = this._pointerPos(ev);
-      this._drawn = null;
+      const pos = this._pointerPos(ev);
+      this._points.push([pos.x, pos.y]);
+      this._paintPoints();
+      this._renderMarkRow();
+      this._persist();
+      const left = LID_POINTS_RECOMMENDED - this._points.length;
+      this._setStatus(
+        left > 0 ? left + this._t.points_left : this._t.pick_bin
+      );
       return;
     }
     if (this._mode !== "region") return;
@@ -532,18 +585,6 @@ class WastebinCalibrationCard extends HTMLElement {
   }
 
   _onMove(ev) {
-    if (this._mode === "sample" && this._dragStart) {
-      ev.preventDefault();
-      const cur = this._pointerPos(ev);
-      this._drawn = {
-        x: Math.min(this._dragStart.x, cur.x),
-        y: Math.min(this._dragStart.y, cur.y),
-        w: Math.abs(cur.x - this._dragStart.x),
-        h: Math.abs(cur.y - this._dragStart.y),
-      };
-      this._paintDrawn();
-      return;
-    }
     if (this._mode === "region" && this._dragVertex !== null) {
       ev.preventDefault();
       const pos = this._pointerPos(ev);
@@ -553,20 +594,7 @@ class WastebinCalibrationCard extends HTMLElement {
   }
 
   _onUp() {
-    if (this._dragStart) {
-      this._dragStart = null;
-      if (
-        this._drawn &&
-        (this._drawn.w < MIN_DRAW_FRAC || this._drawn.h < MIN_DRAW_FRAC)
-      ) {
-        this._drawn = null;
-        this._paintDrawn();
-      }
-      if (this._mode === "sample") {
-        this._renderMarkRow();
-        if (this._drawn) this._setStatus(this._t.pick_bin);
-      }
-    }
+    this._dragStart = null;
     this._dragVertex = null;
   }
 
@@ -587,19 +615,35 @@ class WastebinCalibrationCard extends HTMLElement {
 
   // -- painting --------------------------------------------------------
 
-  _paintDrawn() {
-    const box = this.shadowRoot.getElementById("drawn");
-    if (!box) return;
-    if (!this._drawn) {
-      box.style.display = "none";
+  _paintPoints() {
+    /* The marked points and the patches derived from them: what the
+     * user tapped and what will actually be sampled. */
+    const layer = this.shadowRoot.getElementById("points");
+    if (!layer) return;
+    if (this._mode !== "sample" || !this._points.length) {
+      layer.replaceChildren();
       return;
     }
-    box.style.display = "block";
-    box.style.left = this._drawn.x * 100 + "%";
-    box.style.top = this._drawn.y * 100 + "%";
-    box.style.width = this._drawn.w * 100 + "%";
-    box.style.height = this._drawn.h * 100 + "%";
-    box.className = "rect sample";
+    const boxes = [];
+    if (this._points.length >= 2) {
+      for (const r of this._patches()) {
+        const div = document.createElement("div");
+        div.className = "rect sample";
+        div.style.left = r.x * 100 + "%";
+        div.style.top = r.y * 100 + "%";
+        div.style.width = r.w * 100 + "%";
+        div.style.height = r.h * 100 + "%";
+        boxes.push(div);
+      }
+    }
+    for (const [x, y] of this._points) {
+      const dot = document.createElement("div");
+      dot.className = "lid-point";
+      dot.style.left = x * 100 + "%";
+      dot.style.top = y * 100 + "%";
+      boxes.push(dot);
+    }
+    layer.replaceChildren(...boxes);
   }
 
   _paintMarks() {
@@ -764,7 +808,6 @@ class WastebinCalibrationCard extends HTMLElement {
 
   _setMode(mode) {
     this._mode = mode;
-    this._drawn = null;
     for (const btn of this.shadowRoot.querySelectorAll("[data-mode]")) {
       btn.classList.toggle("active", btn.dataset.mode === mode);
     }
@@ -785,7 +828,7 @@ class WastebinCalibrationCard extends HTMLElement {
     }
     if (mode === "label") this._setStatus(this._t.presence_hint);
     this._persist();
-    this._paintDrawn();
+    this._paintPoints();
     this._paintMarks();
     this._paintRegion();
     this._updateOverlay();
@@ -814,7 +857,7 @@ class WastebinCalibrationCard extends HTMLElement {
      * which is also the affordance telling the user to draw first. */
     const row = this.shadowRoot.getElementById("mark-bins");
     if (!row) return;
-    const ready = Boolean(this._drawn) && !this._saving;
+    const ready = this._points.length >= 2 && !this._saving;
     row.replaceChildren(
       ...this._config.bins.map((bin) => {
         const btn = document.createElement("button");
@@ -897,7 +940,12 @@ class WastebinCalibrationCard extends HTMLElement {
           box-shadow: 0 0 0 1px var(--primary-color) inset;
         }
         button:disabled { opacity: .5; cursor: wait; }
-        #overlay, #marks { position: absolute; inset: 0; pointer-events: none; }
+        #overlay, #marks, #points { position: absolute; inset: 0; pointer-events: none; }
+        .lid-point {
+          position: absolute; width: 10px; height: 10px; margin: -5px 0 0 -5px;
+          border-radius: 50%; background: var(--accent-color);
+          border: 2px solid #fff; box-sizing: border-box; pointer-events: none;
+        }
         #region-svg {
           position: absolute; inset: 0; width: 100%; height: 100%;
           pointer-events: none; display: none;
@@ -909,7 +957,6 @@ class WastebinCalibrationCard extends HTMLElement {
         }
         .vertex { fill: var(--primary-color); stroke: #fff; stroke-width: .3; }
         .vertex.first { fill: var(--accent-color); }
-        #drawn { display: none; }
         #status { margin-top: 8px; font-size: 13px; color: var(--secondary-text-color); min-height: 1.2em; }
       </style>
       <ha-card>
@@ -924,13 +971,13 @@ class WastebinCalibrationCard extends HTMLElement {
           <img id="cam" alt="camera" />
           <div id="overlay"></div>
           <div id="marks"></div>
+          <div id="points"></div>
           <svg id="region-svg" viewBox="0 0 100 100" preserveAspectRatio="none">
             <path id="region-dim" d="" />
             <polyline id="region-line" points="" />
             <g id="region-points"></g>
           </svg>
-          <div id="drawn" class="rect"></div>
-        </div>
+          </div>
         <div class="actions" id="region-actions" style="display:none">
           <button id="apply-region">${t.apply_region}</button>
           <button id="undo-vertex">${t.undo}</button>
@@ -938,6 +985,7 @@ class WastebinCalibrationCard extends HTMLElement {
         </div>
         <div class="actions" id="sample-actions" style="display:none">
           <span id="mark-bins" class="actions"></span>
+          <button id="undo-point">${t.undo}</button>
           <button id="clear-sample">${t.clear}</button>
         </div>
         <div class="actions" id="label-actions" style="display:none">
@@ -959,10 +1007,17 @@ class WastebinCalibrationCard extends HTMLElement {
       this._clearRegion();
     this.shadowRoot.getElementById("save-labels").onclick = () =>
       this._saveLabels();
-    this.shadowRoot.getElementById("clear-sample").onclick = () => {
-      this._drawn = null;
-      this._paintDrawn();
+    this.shadowRoot.getElementById("undo-point").onclick = () => {
+      this._points.pop();
+      this._paintPoints();
       this._renderMarkRow();
+      this._persist();
+    };
+    this.shadowRoot.getElementById("clear-sample").onclick = () => {
+      this._points = [];
+      this._paintPoints();
+      this._renderMarkRow();
+      this._persist();
     };
     this._renderMarkRow();
     const stage = this.shadowRoot.getElementById("stage");

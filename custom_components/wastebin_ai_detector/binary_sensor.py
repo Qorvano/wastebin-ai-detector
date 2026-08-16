@@ -95,6 +95,13 @@ class WastebinPresenceSensor(
         if result.bbox is not None:
             attributes["bbox"] = list(result.bbox)
             attributes["centroid"] = list(result.centroid)
+        # Mutual exclusion: two bins cannot occupy the same spot, so a
+        # blob inside another bin's detected area is not this bin.
+        if result.excluded_by is not None:
+            attributes["excluded_by"] = result.excluded_by
+            attributes["provisional_area_frac"] = result.provisional_area_frac
+        if result.exclusion_conflict:
+            attributes["exclusion_conflict"] = True
         # The suspect flags of the PUBLISHED result are False by
         # construction (gated frames are never published); the hold
         # timestamps are the meaningful diagnostics.
