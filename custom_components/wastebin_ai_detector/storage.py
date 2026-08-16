@@ -221,9 +221,6 @@ class WastebinStorage:
         self._store = Store(hass, STORAGE_VERSION, f"{DOMAIN}.{entry.entry_id}")
         self.calibration: CalibrationStore = empty_store_from_entry(entry)
         self.profile: Profile | None = None
-        # Learning starts enabled: a fresh installation is exactly the
-        # phase in which snapshots must be collected.
-        self.learning: bool = True
         # [median_sat, median_val, clip_frac] per analyzed daylight
         # frame, in capture order; feeds derive_quality_gates so the
         # light gates widen automatically from unlabeled frames.
@@ -283,7 +280,6 @@ class WastebinStorage:
             self.calibration = store_from_dict(raw)
         if data.get("profile"):
             self.profile = profile_from_dict(data["profile"])
-        self.learning = bool(data.get("learning", True))
         self.auto_paused = data.get("auto_paused")
         declaration = data.get("learning_declaration")
         self.learning_declaration = (
@@ -379,7 +375,6 @@ class WastebinStorage:
                 "profile": (
                     profile_to_dict(self.profile) if self.profile else None
                 ),
-                "learning": self.learning,
                 "auto_paused": self.auto_paused,
                 "learning_declaration": self.learning_declaration,
                 "gate_samples": self.gate_samples,

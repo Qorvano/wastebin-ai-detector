@@ -177,15 +177,19 @@ async def test_setup_before_calibration(hass: HomeAssistant) -> None:
     sensor_id = registry.async_get_entity_id(
         "binary_sensor", DOMAIN, f"{entry.entry_id}_gelbe_tonne"
     )
-    switch_id = registry.async_get_entity_id(
-        "switch", DOMAIN, f"{entry.entry_id}_learning"
-    )
     status_id = registry.async_get_entity_id(
         "sensor", DOMAIN, f"{entry.entry_id}_status"
     )
-    assert sensor_id and switch_id and status_id
+    assert sensor_id and status_id
     assert hass.states.get(sensor_id).state == "unavailable"
-    assert hass.states.get(switch_id).state == "on"
+    # The learning switch is gone: a run is declared and ended, not
+    # toggled, so there is nothing left for a flag to control.
+    assert (
+        registry.async_get_entity_id(
+            "switch", DOMAIN, f"{entry.entry_id}_learning"
+        )
+        is None
+    )
     # The status sensor must explain WHY presence is unavailable.
     assert hass.states.get(status_id).state == "not_calibrated"
 
@@ -1335,7 +1339,6 @@ async def test_a_declared_learning_run_collects_by_itself(
         await hass.services.async_call(
             DOMAIN, "stop_learning", {}, blocking=True, return_response=True
         )
-        assert storage.learning is False
         assert storage.learning_declaration is None
 
 
@@ -1482,3 +1485,32 @@ async def test_a_running_learning_run_rejects_an_unknown_declaration(
                     return_response=True,
                 )
         assert entry.runtime_data.storage.learning_declaration is None
+
+
+async def test_a_leftover_learning_switch_is_removed_on_setup(
+    hass: HomeAssistant,
+) -> None:
+    """An installation that had the switch must not keep a permanently
+    unavailable entity behind after the update."""
+    entry = MockConfigEntry(
+        domain=DOMAIN, data=ENTRY_DATA, title="Test", minor_version=2
+    )
+    entry.add_to_hass(hass)
+    registry = er.async_get(hass)
+    stale = registry.async_get_or_create(
+        "switch",
+        DOMAIN,
+        f"{entry.entry_id}_learning",
+        config_entry=entry,
+        suggested_object_id="test_learning",
+    )
+    assert registry.async_get(stale.entity_id) is not None
+
+    feed = _CameraFeed(_scene_jpeg(with_yellow=True))
+    with patch(
+        "custom_components.wastebin_ai_detector.coordinator.async_get_image",
+        new=feed,
+    ):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+    assert registry.async_get(stale.entity_id) is None

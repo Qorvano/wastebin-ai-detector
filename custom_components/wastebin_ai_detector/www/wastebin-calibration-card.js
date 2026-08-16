@@ -60,7 +60,7 @@ const TEXTS = {
     points_left: " more point(s) recommended.",
     presence_hint: "For bins without a mark: tap to set here/away, then save. Away shots are the valuable negative examples.",
     nothing_set: "Nothing set - tap the bin buttons first.",
-    sample_outside: "Warning: the mark lies (partly) outside the region - the detector cannot measure that lid until the region covers it.",
+    sample_outside: "Warning: a marked point lies outside the region - the detector can only measure this lid once the region covers it.",
     region_set: "Region updated; relearn runs in the background.",
     multi_ring: "This region has several contours; applying will replace all of them with the drawn one.",
     labels_saved: "Presence saved. Relearn: ",
@@ -102,7 +102,7 @@ const TEXTS = {
     points_left: " weitere Punkte empfohlen.",
     presence_hint: "Für Tonnen ohne Markierung: Tippen Sie den Button an (da/weg) und speichern Sie. Weggestellte Tonnen liefern die wertvollen Abwesend-Beispiele.",
     nothing_set: "Keine Angabe gesetzt - bitte tippen Sie zuerst die Tonnen-Buttons an.",
-    sample_outside: "Hinweis: Die Markierung liegt (teilweise) außerhalb der Region - diesen Deckel kann der Detektor erst messen, wenn die Region ihn abdeckt.",
+    sample_outside: "Hinweis: Ein markierter Punkt liegt außerhalb der Region - diesen Deckel kann der Detektor erst messen, wenn die Region ihn abdeckt.",
     region_set: "Region aktualisiert; das Neu-Lernen läuft im Hintergrund.",
     multi_ring: "Diese Region hat mehrere Konturen; Übernehmen ersetzt sie durch die gezeichnete.",
     labels_saved: "Anwesenheit gespeichert. Neu-Lernen: ",
@@ -486,18 +486,16 @@ class WastebinCalibrationCard extends HTMLElement {
     const patches = this._patches();
     const bin = this._config.bins.find((b) => b.id === binId);
     const name = bin ? bin.name : binId;
-    /* 9-point probe per patch (corners, edge midpoints, centre): still
-     * an approximation for exotic concavities, but catches patches
-     * that span holes or bridge a concave mouth, which corner-only
-     * checks miss. The authoritative veto stays in learning_view. */
-    const outside = patches.some((r) => {
-      for (const fx of [0, 0.5, 1]) {
-        for (const fy of [0, 0.5, 1]) {
-          if (!this._pointInRegion(r.x + fx * r.w, r.y + fy * r.h)) return true;
-        }
-      }
-      return false;
-    });
+    /* Warn about the POINTS the user tapped, not about the corners of
+     * the patches derived from them. Regions are drawn tightly around
+     * the bins, so a patch on a lid corner routinely crosses the
+     * contour by a pixel or two - warning about that fired on every
+     * bin at once and meant nothing. A tap outside the region is a
+     * real mistake and the only thing worth saying. The authoritative
+     * veto stays in learning_view either way. */
+    const outside = this._points.some(
+      ([px, py]) => !this._pointInRegion(px, py)
+    );
     for (const r of patches) {
       try {
         await this._svc("add_sample", {
@@ -578,22 +576,33 @@ class WastebinCalibrationCard extends HTMLElement {
   }
 
   _patches() {
-    /* One square patch per marked point, as large as the user's own
-     * points allow: half the distance to the nearest other point, so
-     * patches never overlap and their size is derived from the marked
-     * geometry instead of being a chosen number. Squares are square in
-     * PIXELS, and are clamped into the frame. */
+    /* One square patch per marked point, all the SAME size: half the
+     * smallest distance between any two marked points. Sizing each
+     * patch by its own nearest neighbour instead made corner patches
+     * grow far larger than centre ones and pushed them over the lid
+     * edge and out of the region - measured in the field on all three
+     * bins at once. One uniform, conservative size derives from the
+     * user's own geometry, keeps every patch clear of its neighbours,
+     * and treats every marked spot as the equally important sample it
+     * is. Squares are square in PIXELS (relative coordinates are
+     * per-axis fractions) and are clamped into the frame.
+     */
     const aspect = this._frameAspect();
     const scaled = this._points.map(([x, y]) => [x * aspect, y]);
-    return this._points.map(([x, y], i) => {
-      let nearest = Infinity;
-      scaled.forEach(([sx, sy], j) => {
-        if (i === j) return;
-        const d = Math.hypot(scaled[i][0] - sx, scaled[i][1] - sy);
-        if (d < nearest) nearest = d;
-      });
-      const r = nearest / 2;
-      const rx = r / aspect;
+    let closest = Infinity;
+    for (let i = 0; i < scaled.length; i++) {
+      for (let j = i + 1; j < scaled.length; j++) {
+        const d = Math.hypot(
+          scaled[i][0] - scaled[j][0],
+          scaled[i][1] - scaled[j][1]
+        );
+        if (d < closest) closest = d;
+      }
+    }
+    if (!Number.isFinite(closest)) return [];
+    const r = closest / 2;
+    const rx = r / aspect;
+    return this._points.map(([x, y]) => {
       const x0 = Math.max(x - rx, 0);
       const y0 = Math.max(y - r, 0);
       const x1 = Math.min(x + rx, 1);
@@ -601,133 +610,6 @@ class WastebinCalibrationCard extends HTMLElement {
       return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
     });
   }
-
-  async _saveLabels() {
-    if (this._session()) return this._setStatus(this._t.run_locked);
-    if (!this._filename) return this._setStatus(this._t.need_capture);
-    const present = [];
-    const absent = [];
-    for (const [binId, state] of Object.entries(this._labels)) {
-      if (state === "present") present.push(binId);
-      if (state === "absent") absent.push(binId);
-    }
-    if (!present.length && !absent.length) {
-      return this._setStatus(this._t.nothing_set);
-    }
-    const button = this.shadowRoot.getElementById("save-labels");
-    button.disabled = true; /* no double submit while the call runs */
-    try {
-      const result = await this._svc(
-        "label_image",
-        { filename: this._filename, present, absent },
-        true
-      );
-      const relearn = result?.response?.relearn || "?";
-      const warnings = result?.response?.warnings || [];
-      this._savedLabels = { ...this._labels };
-      this._renderLabelRow();
-      this._persist();
-      this._setStatus(
-        this._t.labels_saved + relearn +
-        (warnings.length ? " (" + warnings.length + " warnings)" : "")
-      );
-    } catch (err) {
-      this._setStatus(this._t.error + (err.message || err));
-    } finally {
-      button.disabled = false;
-    }
-  }
-
-  // -- pointer handling ------------------------------------------------
-
-  _pointerPos(ev) {
-    const rect = this.shadowRoot.getElementById("stage").getBoundingClientRect();
-    return {
-      x: Math.min(Math.max((ev.clientX - rect.left) / rect.width, 0), 1),
-      y: Math.min(Math.max((ev.clientY - rect.top) / rect.height, 0), 1),
-    };
-  }
-
-  _vertexAt(pos) {
-    const rect = this.shadowRoot.getElementById("stage").getBoundingClientRect();
-    for (let i = 0; i < this._polygon.length; i++) {
-      const [vx, vy] = this._polygon[i];
-      const dx = (vx - pos.x) * rect.width;
-      const dy = (vy - pos.y) * rect.height;
-      if (Math.hypot(dx, dy) <= VERTEX_HIT_RADIUS_PX) return i;
-    }
-    return -1;
-  }
-
-  _onDown(ev) {
-    if (this._mode === "sample") {
-      ev.preventDefault();
-      const pos = this._pointerPos(ev);
-      this._points.push([pos.x, pos.y]);
-      this._paintPoints();
-      this._renderMarkRow();
-      this._persist();
-      const left = LID_POINTS_RECOMMENDED - this._points.length;
-      this._setStatus(
-        left > 0 ? left + this._t.points_left : this._t.pick_bin
-      );
-      return;
-    }
-    if (this._mode !== "region") return;
-    ev.preventDefault();
-    const stage = this.shadowRoot.getElementById("stage");
-    if (stage.setPointerCapture) stage.setPointerCapture(ev.pointerId);
-    const pos = this._pointerPos(ev);
-    const hit = this._vertexAt(pos);
-    if (hit >= 0) {
-      if (
-        !this._polygonClosed &&
-        hit === 0 &&
-        this._polygon.length >= 3
-      ) {
-        this._polygonClosed = true;
-        this._paintRegion();
-        return;
-      }
-      this._dragVertex = hit;
-      return;
-    }
-    if (!this._polygonClosed) {
-      this._polygon.push([pos.x, pos.y]);
-      this._paintRegion();
-    }
-  }
-
-  _onMove(ev) {
-    if (this._mode === "region" && this._dragVertex !== null) {
-      ev.preventDefault();
-      const pos = this._pointerPos(ev);
-      this._polygon[this._dragVertex] = [pos.x, pos.y];
-      this._paintRegion();
-    }
-  }
-
-  _onUp() {
-    this._dragStart = null;
-    this._dragVertex = null;
-  }
-
-  _undoVertex() {
-    if (this._polygonClosed) {
-      this._polygonClosed = false;
-    } else {
-      this._polygon.pop();
-    }
-    this._paintRegion();
-  }
-
-  _clearRegion() {
-    this._polygon = [];
-    this._polygonClosed = false;
-    this._paintRegion();
-  }
-
-  // -- painting --------------------------------------------------------
 
   _paintPoints() {
     /* The marked points and the patches derived from them: what the

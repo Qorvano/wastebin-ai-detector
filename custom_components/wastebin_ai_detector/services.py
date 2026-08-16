@@ -482,7 +482,6 @@ def async_setup_services(hass: HomeAssistant) -> None:
             **{b: "present" for b in present},
             **{b: "absent" for b in absent},
         }
-        storage.learning = True
         storage.auto_paused = None
         await storage.async_save()
         # The card reads the running run from the status sensor, so it
@@ -502,7 +501,6 @@ def async_setup_services(hass: HomeAssistant) -> None:
             len(v)
             for v in reservoir_by_situation(storage.calibration).values()
         )
-        storage.learning = False
         storage.learning_declaration = None
         await storage.async_save()
         await entry.runtime_data.coordinator.async_request_refresh()

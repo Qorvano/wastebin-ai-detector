@@ -1,9 +1,9 @@
 """Wastebin AI Detector: camera-based waste-bin presence detection.
 
-Phase 2 wiring: config flow, one binary_sensor per bin, a learning-mode
-switch with an internal daylight snapshot collector, and calibration
-services (capture / add_sample / label_image / relearn). The detection
-core in ``core/`` stays HA-free and is reused unchanged.
+Phase 2 wiring: config flow, one binary_sensor per bin, a snapshot
+collector that runs during a declared learning run, and calibration
+services (capture / add_sample / label_image / relearn / start_learning).
+The detection core in ``core/`` stays HA-free and is reused unchanged.
 
 Phase 2.3: entry.data is the authority for the ACTIVE configuration
 (camera, ROI, bin lifecycle) and is reconciled into the calibration
@@ -46,7 +46,6 @@ PLATFORMS = [
     Platform.BINARY_SENSOR,
     Platform.BUTTON,
     Platform.SENSOR,
-    Platform.SWITCH,
 ]
 
 
@@ -148,6 +147,7 @@ async def async_setup_entry(
         await storage.async_save()
 
     _prune_retired_entities(hass, entry)
+    _prune_removed_entities(hass, entry)
 
     coordinator = WastebinCoordinator(hass, entry, storage)
     # A plain refresh, not first_refresh: before the first calibration
@@ -232,6 +232,36 @@ async def _async_relearn_after_reconfigure(
             "relearn after reconfiguration finished with warnings: %s",
             "; ".join(result["warnings"]),
         )
+
+
+# Entities that used to exist and no longer do. Left behind they show
+# up as permanently unavailable and invite the user to press them.
+REMOVED_UNIQUE_ID_SUFFIXES = (
+    # The learning switch: a learning run is declared and ended through
+    # the card (or start_learning / stop_learning), so a separate
+    # on/off flag had nothing left to control.
+    ("switch", "_learning"),
+)
+
+
+def _prune_removed_entities(
+    hass: HomeAssistant, entry: WastebinConfigEntry
+) -> None:
+    registry = er.async_get(hass)
+    for reg_entry in er.async_entries_for_config_entry(
+        registry, entry.entry_id
+    ):
+        for domain, suffix in REMOVED_UNIQUE_ID_SUFFIXES:
+            if (
+                reg_entry.domain == domain
+                and reg_entry.unique_id == f"{entry.entry_id}{suffix}"
+            ):
+                _LOGGER.info(
+                    "removing %s: the entity no longer exists in this "
+                    "version",
+                    reg_entry.entity_id,
+                )
+                registry.async_remove(reg_entry.entity_id)
 
 
 def _prune_retired_entities(

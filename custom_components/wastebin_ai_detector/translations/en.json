@@ -122,11 +122,6 @@
     }
   },
   "entity": {
-    "switch": {
-      "learning": {
-        "name": "Learning mode"
-      }
-    },
     "button": {
       "detect_now": {
         "name": "Detect now"

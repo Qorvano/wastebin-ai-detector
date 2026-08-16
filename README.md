@@ -148,6 +148,9 @@ one. Now you declare the situation once and let the system work:
    the bins that are out, **away** for the ones that are not.
 3. Press **Start learning run**.
 
+There is no separate learning switch any more: a run is declared and
+ended, and outside a run nothing is captured at all.
+
 From then on the integration captures on its own at the configured
 interval and records every usable frame as an observation of exactly
 that declared situation. Manual capturing and marking are locked while

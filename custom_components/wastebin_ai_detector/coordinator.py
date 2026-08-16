@@ -518,7 +518,10 @@ class LearningCollector:
             self._unsub = None
 
     async def _async_interval(self, _now: datetime) -> None:
-        if not self._storage.learning:
+        if self._storage.learning_declaration is None:
+            # A declared run IS learning mode: without one there is
+            # nothing a captured frame could mean, so nothing is
+            # captured (and the archive stops growing for nothing).
             return
         # Computed from the configured location, independent of the sun
         # entity. IR/greyscale night frames carry no color information;
