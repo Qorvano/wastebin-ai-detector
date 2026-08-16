@@ -44,9 +44,10 @@ const TEXTS = {
     need_closed: "Close the contour first (tap the first point).",
     marked_pre: "Marked ",
     marked_post: " - color sample and “here” saved.",
-    next_pre: "Next:",
+    draw_next: "Drag the next rectangle.",
     all_marked: "All bins marked.",
-    mark_hint: "Pick a bin, drag a rectangle over its lid, then OK. That states: THIS is that bin, and it is here.",
+    pick_bin: "Which bin is that? Tap it.",
+    mark_hint: "Drag a rectangle over a lid, then tap the bin it shows. That states: THIS is that bin, and it is here.",
     presence_hint: "For bins without a mark: tap to set here/away, then save. Away shots are the valuable negative examples.",
     nothing_set: "Nothing set - tap the bin buttons first.",
     sample_outside: "Warning: the mark lies (partly) outside the region - the detector cannot measure that lid until the region covers it.",
@@ -75,9 +76,10 @@ const TEXTS = {
     need_closed: "Bitte schließen Sie zuerst die Kontur (ersten Punkt antippen).",
     marked_pre: "",
     marked_post: " markiert - Farb-Sample und „da“ gespeichert.",
-    next_pre: "Als Nächstes:",
+    draw_next: "Ziehen Sie das nächste Rechteck.",
     all_marked: "Alle Tonnen markiert.",
-    mark_hint: "Wählen Sie eine Tonne, ziehen Sie ein Rechteck über ihren Deckel, dann OK. Das sagt: DAS ist diese Tonne, und sie ist da.",
+    pick_bin: "Welche Tonne ist das? Bitte antippen.",
+    mark_hint: "Ziehen Sie ein Rechteck über einen Deckel und tippen Sie dann die Tonne an, die es zeigt. Das sagt: DAS ist diese Tonne, und sie ist da.",
     presence_hint: "Für Tonnen ohne Markierung: Tippen Sie den Button an (da/weg) und speichern Sie. Weggestellte Tonnen liefern die wertvollen Abwesend-Beispiele.",
     nothing_set: "Keine Angabe gesetzt - bitte tippen Sie zuerst die Tonnen-Buttons an.",
     sample_outside: "Hinweis: Die Markierung liegt (teilweise) außerhalb der Region - diesen Deckel kann der Detektor erst messen, wenn die Region ihn abdeckt.",
@@ -103,18 +105,27 @@ const COORD_DECIMALS = 4;
  * that range so neighboring vertices stay individually grabbable). */
 const VERTEX_HIT_RADIUS_PX = 14;
 
+/* Session state that must survive ELEMENT RECREATION: Home Assistant
+ * rebuilds dashboard cards on all kinds of updates, and every mark
+ * triggers a relearn that changes entity states. A rebuilt element
+ * would silently drop the capture, the marks and the current mode -
+ * the user then has to press the mode button again before they can
+ * draw, which is exactly the friction this store removes. Keyed by the
+ * card's target so two cards on one dashboard stay independent. */
+const SESSIONS = new Map();
+
 class WastebinCalibrationCard extends HTMLElement {
   constructor() {
     super();
     this.attachShadow({ mode: "open" });
     this._mode = "view";
     this._drawn = null; // sample rect {x,y,w,h} image-relative
+    this._saving = false;
     this._dragStart = null;
     this._filename = null;
     this._labels = {}; // presence chips (mirror of what save would send)
     this._savedLabels = {}; // presence last persisted for _filename
     this._marks = {}; // binId -> rect, marks saved on _filename this session
-    this._sampleBin = null;
     this._status = "";
     this._imgCounter = 0;
     this._polygon = []; // [[x,y], ...] image-relative, being edited
@@ -130,14 +141,43 @@ class WastebinCalibrationCard extends HTMLElement {
       throw new Error("bins is required: a list of {id, name}");
     }
     this._config = config;
-    this._sampleBin = config.bins[0].id;
+    this._sessionKey = (config.entry_id || "") + "|" + config.camera;
+    const saved = SESSIONS.get(this._sessionKey);
+    if (saved) {
+      this._mode = saved.mode;
+      this._filename = saved.filename;
+      this._marks = saved.marks;
+      this._labels = saved.labels;
+      this._savedLabels = saved.savedLabels;
+    }
     this._render();
+  }
+
+  _persist() {
+    if (!this._sessionKey) return;
+    SESSIONS.set(this._sessionKey, {
+      mode: this._mode,
+      filename: this._filename,
+      marks: this._marks,
+      labels: this._labels,
+      savedLabels: this._savedLabels,
+    });
   }
 
   set hass(hass) {
     this._hass = hass;
     this._t = TEXTS[(hass.language || "en").startsWith("de") ? "de" : "en"];
     if (!this._built) this._render();
+    if (
+      this._filename &&
+      !this._frameShown &&
+      (this._mode === "sample" || this._mode === "label")
+    ) {
+      /* Restored session (or a rebuilt element): put the archived frame
+       * the marks belong to back on screen, once. */
+      this._frameShown = true;
+      this._showArchivedFrame();
+    }
     this._updateImage();
     this._updateOverlay();
     this._maybePrefillRegion();
@@ -206,15 +246,23 @@ class WastebinCalibrationCard extends HTMLElement {
     try {
       const result = await this._svc("capture_snapshot", {}, true);
       this._filename = result?.response?.filename || null;
+      this._frameShown = true;
       this._labels = {};
       this._savedLabels = {};
       this._marks = {};
       this._drawn = null;
       this._paintDrawn();
       this._paintMarks();
-      this._setStatus(this._t.captured + (this._filename || "?"));
+      this._renderMarkRow();
       await this._showArchivedFrame();
       this._renderLabelRow();
+      /* A fresh capture exists to be marked: enter mark mode right
+       * away so the standard pass is capture -> drag -> tap bin ->
+       * drag -> tap bin, with no mode button in between. */
+      this._setMode("sample");
+      this._setStatus(
+        this._t.captured + (this._filename || "?") + " " + this._t.mark_hint
+      );
     } catch (err) {
       this._setStatus(this._t.error + (err.message || err));
     }
@@ -301,21 +349,21 @@ class WastebinCalibrationCard extends HTMLElement {
     return inside;
   }
 
-  async _saveSample() {
+  async _saveSample(binId) {
     if (!this._filename) return this._setStatus(this._t.need_capture);
     if (!this._drawn) return this._setStatus(this._t.draw_first);
-    const button = this.shadowRoot.getElementById("save-sample");
-    button.disabled = true; /* one statement at a time - no double OK */
+    this._saving = true; /* one statement at a time */
+    this._renderMarkRow();
     try {
-      await this._saveSampleInner();
+      await this._saveSampleInner(binId);
     } finally {
-      button.disabled = false;
+      this._saving = false;
+      this._renderMarkRow();
     }
   }
 
-  async _saveSampleInner() {
+  async _saveSampleInner(binId) {
     const r = this._drawn;
-    const binId = this._sampleBin;
     const bin = this._config.bins.find((b) => b.id === binId);
     const name = bin ? bin.name : binId;
     /* 9-point probe (corners, edge midpoints, center): still an
@@ -350,6 +398,8 @@ class WastebinCalibrationCard extends HTMLElement {
     (this._marks[binId] = this._marks[binId] || []).push({ ...r });
     this._drawn = null;
     this._paintDrawn();
+    this._renderMarkRow();
+    this._persist();
     /* One gesture, one statement: the mark is "THIS is that bin, and
      * it is here", so the present label is saved in the same step.
      * set_labels merges per bin - other bins are never clobbered. */
@@ -364,6 +414,7 @@ class WastebinCalibrationCard extends HTMLElement {
       this._labels[binId] = "present";
       this._savedLabels[binId] = "present";
       this._renderLabelRow();
+      this._persist();
     } catch (err) {
       /* The sample IS stored, only the presence statement failed. Show
        * it as a PENDING "here" (chip and mark tag get the dirty star),
@@ -376,30 +427,17 @@ class WastebinCalibrationCard extends HTMLElement {
           (outside ? " " + this._t.sample_outside : "")
       );
     }
-    /* Auto-advance: the standard pass is draw+OK once per bin, so the
-     * selection jumps to the next bin without a mark on this capture -
-     * no dropdown round-trip between bins. The save runs a relearn and
-     * can take seconds, during which the dropdown stays usable: a
-     * selection the user changed meanwhile is THEIR statement about
-     * the next rect and must never be overwritten (silently saving a
-     * rect under the wrong bin is exactly the cross-bin poisoning this
-     * release exists to prevent). */
-    const next = this._config.bins.find((b) => !this._marks[b.id]);
-    const advanced = next && this._sampleBin === binId;
-    if (advanced) {
-      this._sampleBin = next.id;
-      const select = this.shadowRoot.getElementById("sample-bin");
-      if (select) select.value = next.id;
-    }
+    /* Re-assert the mode: the card stays ready for the next rectangle
+     * without any button in between, even if something rebuilt the
+     * action row while the relearn was running. */
+    this._setMode("sample");
+    const missing = this._config.bins.filter((b) => !this._marks[b.id]);
     this._setStatus(
       this._t.marked_pre + name + this._t.marked_post +
         (relearn && relearn !== "ok" ? " (" + relearn + ")" : "") +
         (outside ? " " + this._t.sample_outside : "") +
-        (advanced
-          ? " " + this._t.next_pre + " " + next.name
-          : next
-            ? ""
-            : " " + this._t.all_marked)
+        " " +
+        (missing.length ? this._t.draw_next : this._t.all_marked)
     );
   }
 
@@ -426,6 +464,7 @@ class WastebinCalibrationCard extends HTMLElement {
       const warnings = result?.response?.warnings || [];
       this._savedLabels = { ...this._labels };
       this._renderLabelRow();
+      this._persist();
       this._setStatus(
         this._t.labels_saved + relearn +
         (warnings.length ? " (" + warnings.length + " warnings)" : "")
@@ -522,6 +561,10 @@ class WastebinCalibrationCard extends HTMLElement {
       ) {
         this._drawn = null;
         this._paintDrawn();
+      }
+      if (this._mode === "sample") {
+        this._renderMarkRow();
+        if (this._drawn) this._setStatus(this._t.pick_bin);
       }
     }
     this._dragVertex = null;
@@ -734,8 +777,14 @@ class WastebinCalibrationCard extends HTMLElement {
     this.shadowRoot.getElementById("stage").style.cursor =
       mode === "region" || mode === "sample" ? "crosshair" : "default";
     if (mode === "region") this._setStatus(this._t.region_hint);
-    if (mode === "sample") this._setStatus(this._t.mark_hint);
+    if (mode === "sample") {
+      this._renderMarkRow();
+      if (this._status !== this._t.pick_bin) {
+        this._setStatus(this._t.mark_hint);
+      }
+    }
     if (mode === "label") this._setStatus(this._t.presence_hint);
+    this._persist();
     this._paintDrawn();
     this._paintMarks();
     this._paintRegion();
@@ -755,6 +804,28 @@ class WastebinCalibrationCard extends HTMLElement {
     if (next === undefined) delete this._labels[binId];
     else this._labels[binId] = next;
     this._renderLabelRow();
+  }
+
+  _renderMarkRow() {
+    /* The bin choice IS the gesture's second half: drag a rectangle,
+     * then tap the bin it shows. No dropdown to pre-select and no mode
+     * button in between, so a full pass is drag/tap per bin. Buttons
+     * stay disabled until a rectangle exists (and while a save runs),
+     * which is also the affordance telling the user to draw first. */
+    const row = this.shadowRoot.getElementById("mark-bins");
+    if (!row) return;
+    const ready = Boolean(this._drawn) && !this._saving;
+    row.replaceChildren(
+      ...this._config.bins.map((bin) => {
+        const btn = document.createElement("button");
+        const marked = (this._marks[bin.id] || []).length;
+        btn.textContent = bin.name + (marked ? " \u2713" : "");
+        btn.className = "chip" + (marked ? " present" : "");
+        btn.disabled = !ready;
+        btn.onclick = () => this._saveSample(bin.id);
+        return btn;
+      })
+    );
   }
 
   _renderLabelRow() {
@@ -866,8 +937,7 @@ class WastebinCalibrationCard extends HTMLElement {
           <button id="clear-region">${t.clear}</button>
         </div>
         <div class="actions" id="sample-actions" style="display:none">
-          <select id="sample-bin"></select>
-          <button id="save-sample">OK</button>
+          <span id="mark-bins" class="actions"></span>
           <button id="clear-sample">${t.clear}</button>
         </div>
         <div class="actions" id="label-actions" style="display:none">
@@ -887,23 +957,14 @@ class WastebinCalibrationCard extends HTMLElement {
       this._undoVertex();
     this.shadowRoot.getElementById("clear-region").onclick = () =>
       this._clearRegion();
-    this.shadowRoot.getElementById("save-sample").onclick = () =>
-      this._saveSample();
     this.shadowRoot.getElementById("save-labels").onclick = () =>
       this._saveLabels();
     this.shadowRoot.getElementById("clear-sample").onclick = () => {
       this._drawn = null;
       this._paintDrawn();
+      this._renderMarkRow();
     };
-    const binSelect = this.shadowRoot.getElementById("sample-bin");
-    for (const bin of this._config.bins) {
-      const option = document.createElement("option");
-      option.value = bin.id;
-      option.textContent = bin.name; /* config text: never innerHTML */
-      binSelect.appendChild(option);
-    }
-    binSelect.value = this._sampleBin;
-    binSelect.onchange = () => (this._sampleBin = binSelect.value);
+    this._renderMarkRow();
     const stage = this.shadowRoot.getElementById("stage");
     stage.onpointerdown = (ev) => this._onDown(ev);
     stage.onpointermove = (ev) => this._onMove(ev);

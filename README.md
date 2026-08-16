@@ -184,11 +184,15 @@ entities:            # optional: live detection overlay
 - **Draw region** tap points around every spot bins can ever stand and
   apply (runs through the same lossless path as the reconfigure
   dialog, via the `set_roi` service).
-- **Mark bins** (v0.5.1) pick a bin, drag a rectangle over its lid,
-  OK. One gesture is one statement: "THIS is that bin, and it is
+- **Mark bins** (v0.5.3) drag a rectangle over a lid, then tap the bin
+  it shows. One gesture is one statement: "THIS is that bin, and it is
   here". The card saves the color sample and the present label
-  together and shows the mark on the image; relearn runs
-  automatically.
+  together, shows the mark on the image and stays ready for the next
+  rectangle; relearn runs automatically. A capture enters this mode by
+  itself, so a full pass is capture, then drag/tap per bin - no mode
+  button and no dropdown in between. The session (capture, marks,
+  mode) survives dashboard rebuilds, which HA does on every state
+  change a relearn causes.
 - **Presence** covers the two remaining cases: a bin that is here
   without a usable lid mark, and a bin that is away (the valuable
   negative examples). Toggle and save; unsaved changes are starred.
