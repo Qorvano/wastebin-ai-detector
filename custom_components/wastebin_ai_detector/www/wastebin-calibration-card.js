@@ -611,6 +611,133 @@ class WastebinCalibrationCard extends HTMLElement {
     });
   }
 
+  async _saveLabels() {
+    if (this._session()) return this._setStatus(this._t.run_locked);
+    if (!this._filename) return this._setStatus(this._t.need_capture);
+    const present = [];
+    const absent = [];
+    for (const [binId, state] of Object.entries(this._labels)) {
+      if (state === "present") present.push(binId);
+      if (state === "absent") absent.push(binId);
+    }
+    if (!present.length && !absent.length) {
+      return this._setStatus(this._t.nothing_set);
+    }
+    const button = this.shadowRoot.getElementById("save-labels");
+    button.disabled = true; /* no double submit while the call runs */
+    try {
+      const result = await this._svc(
+        "label_image",
+        { filename: this._filename, present, absent },
+        true
+      );
+      const relearn = result?.response?.relearn || "?";
+      const warnings = result?.response?.warnings || [];
+      this._savedLabels = { ...this._labels };
+      this._renderLabelRow();
+      this._persist();
+      this._setStatus(
+        this._t.labels_saved + relearn +
+        (warnings.length ? " (" + warnings.length + " warnings)" : "")
+      );
+    } catch (err) {
+      this._setStatus(this._t.error + (err.message || err));
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  // -- pointer handling ------------------------------------------------
+
+  _pointerPos(ev) {
+    const rect = this.shadowRoot.getElementById("stage").getBoundingClientRect();
+    return {
+      x: Math.min(Math.max((ev.clientX - rect.left) / rect.width, 0), 1),
+      y: Math.min(Math.max((ev.clientY - rect.top) / rect.height, 0), 1),
+    };
+  }
+
+  _vertexAt(pos) {
+    const rect = this.shadowRoot.getElementById("stage").getBoundingClientRect();
+    for (let i = 0; i < this._polygon.length; i++) {
+      const [vx, vy] = this._polygon[i];
+      const dx = (vx - pos.x) * rect.width;
+      const dy = (vy - pos.y) * rect.height;
+      if (Math.hypot(dx, dy) <= VERTEX_HIT_RADIUS_PX) return i;
+    }
+    return -1;
+  }
+
+  _onDown(ev) {
+    if (this._mode === "sample") {
+      ev.preventDefault();
+      const pos = this._pointerPos(ev);
+      this._points.push([pos.x, pos.y]);
+      this._paintPoints();
+      this._renderMarkRow();
+      this._persist();
+      const left = LID_POINTS_RECOMMENDED - this._points.length;
+      this._setStatus(
+        left > 0 ? left + this._t.points_left : this._t.pick_bin
+      );
+      return;
+    }
+    if (this._mode !== "region") return;
+    ev.preventDefault();
+    const stage = this.shadowRoot.getElementById("stage");
+    if (stage.setPointerCapture) stage.setPointerCapture(ev.pointerId);
+    const pos = this._pointerPos(ev);
+    const hit = this._vertexAt(pos);
+    if (hit >= 0) {
+      if (
+        !this._polygonClosed &&
+        hit === 0 &&
+        this._polygon.length >= 3
+      ) {
+        this._polygonClosed = true;
+        this._paintRegion();
+        return;
+      }
+      this._dragVertex = hit;
+      return;
+    }
+    if (!this._polygonClosed) {
+      this._polygon.push([pos.x, pos.y]);
+      this._paintRegion();
+    }
+  }
+
+  _onMove(ev) {
+    if (this._mode === "region" && this._dragVertex !== null) {
+      ev.preventDefault();
+      const pos = this._pointerPos(ev);
+      this._polygon[this._dragVertex] = [pos.x, pos.y];
+      this._paintRegion();
+    }
+  }
+
+  _onUp() {
+    this._dragStart = null;
+    this._dragVertex = null;
+  }
+
+  _undoVertex() {
+    if (this._polygonClosed) {
+      this._polygonClosed = false;
+    } else {
+      this._polygon.pop();
+    }
+    this._paintRegion();
+  }
+
+  _clearRegion() {
+    this._polygon = [];
+    this._polygonClosed = false;
+    this._paintRegion();
+  }
+
+  // -- painting --------------------------------------------------------
+
   _paintPoints() {
     /* The marked points and the patches derived from them: what the
      * user tapped and what will actually be sampled. */
