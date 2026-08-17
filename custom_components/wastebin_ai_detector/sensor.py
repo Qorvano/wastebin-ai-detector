@@ -23,6 +23,7 @@ from .const import (
     CONF_ROI_W,
     CONF_ROI_X,
     CONF_ROI_Y,
+    CONF_TRUST_MARKS,
     DOMAIN,
     STATUS_OUTCOMES,
 )
@@ -101,6 +102,12 @@ class WastebinStatusSensor(
         # The declaration IS the running learning run: the card reads
         # it to know whether manual capturing is currently locked.
         auto["declaration"] = runtime.storage.learning_declaration
+        # Which rules the collected evidence was gathered under: the
+        # card says so while a run is going, because the same reservoir
+        # means something different in each mode.
+        auto["trust_marks"] = bool(
+            self._entry.options.get(CONF_TRUST_MARKS, False)
+        )
         auto.update(runtime.collector.auto_diagnostics)
         attributes["auto_sampling"] = auto
         return attributes

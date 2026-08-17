@@ -211,6 +211,7 @@ def learn_color_model(
     *,
     bin_id: str = "?",
     weights: np.ndarray | None = None,
+    trust_marks: bool = False,
 ) -> ColorLearnResult:
     """Learn one bin's color model from pooled sample pixels (1-D arrays).
 
@@ -220,6 +221,21 @@ def learn_color_model(
     coherent pixels only. Field measurements showed that plain
     percentiles break as soon as more than the percentile share of the
     sample is junk.
+
+    ``trust_marks`` takes the user's rectangles at their word: nothing
+    about the colour of a marked patch is fatal any more. The
+    saturation and brightness FLOORS are learned from every sampled
+    pixel instead of the coherent ones only, a pool without a coherent
+    majority is learned rather than refused, and so is one whose band
+    ends up covering half the colour circle; each of those refusals
+    becomes a warning. This is what makes a washed-out lid detectable -
+    under flat overcast light a pale lid carries so little chroma that
+    its hue scatters, the mixture files those pixels as junk, and the
+    floors stay where only a saturated lid can reach them. The price is
+    a lower floor at runtime, which admits more background, so the hue
+    band is still learned from the coherent pixels wherever there are
+    any: colour identity stays as discriminative as the light allows,
+    and only "how pale may it be" opens up unconditionally.
 
     Optional ``weights`` (per pixel, aligned with the pooled arrays)
     weight every statistic - the caller uses 1/(pixels of that image)
@@ -339,7 +355,18 @@ def learn_color_model(
     # Weighted pools vote per IMAGE, unweighted ones per pixel; the
     # messages below must name the unit they actually measured.
     unit = "pixels" if w_valid is None else "evidence (one vote per image)"
-    if coherent_share <= COHERENT_MAJORITY_MIN:
+    if trust_marks:
+        # The user drew these rectangles on the lid; a minority hue
+        # cluster is still a hue, and it is the only estimate of the
+        # colour there is. Loud, not fatal.
+        if coherent_share <= COHERENT_MAJORITY_MIN:
+            warnings.append(
+                f"bin {bin_id}: only {coherent_share:.0%} of the sample "
+                f"{unit} is coherent - learning it anyway because the "
+                "marks are trusted; the colour band rests on a minority "
+                "of the sampled pixels"
+            )
+    elif coherent_share <= COHERENT_MAJORITY_MIN:
         raise CalibrationError(
             f"bin {bin_id}: only {coherent_share:.0%} of the sample "
             f"{unit} is coherent ({n_coherent} of {n_valid} pixels lie in "
@@ -350,10 +377,16 @@ def learn_color_model(
         )
 
     center = fit.center_deg
-    dist = circular_dist_deg(valid_hue[coherent], center)
+    # The band normally rests on the coherent pixels. When the marks are
+    # trusted and the mixture found NO coherent pixel at all, there is
+    # no such subset to measure - the whole marked pool is then the only
+    # statement about the colour there is, and a percentile over an
+    # empty array would raise instead.
+    band_mask = slice(None) if (trust_marks and not n_coherent) else coherent
+    dist = circular_dist_deg(valid_hue[band_mask], center)
     tol = pct(
         dist,
-        None if w_valid is None else w_valid[coherent],
+        None if w_valid is None else w_valid[band_mask],
         HUE_TOL_PERCENTILE,
     )
     if tol <= 0.0:
@@ -362,25 +395,50 @@ def learn_color_model(
         # the band non-empty without admitting any neighboring value.
         tol = finest_quantum_deg / 2.0
     if 2.0 * tol >= DEGENERATE_HUE_BAND_DEG:
-        raise CalibrationError(
+        if not trust_marks:
+            raise CalibrationError(
+                f"bin {bin_id}: learned hue band ±{tol:.1f}° covers at least "
+                f"half the color circle (resultant R={resultant:.3f}) - the "
+                "samples have no consistent color. Re-draw them on a colored "
+                "lid area; grey/black lids cannot be color-calibrated - "
+                "attach a small colored marker to the lid and sample that "
+                "instead"
+            )
+        # Trusting the marks means this is an observation, not a veto:
+        # the band is as wide as the light left it. Detection still
+        # assigns a contested pixel to the NEAREST hue centre, so a wide
+        # band claims pixels no other bin is closer to rather than
+        # everything - which is the behaviour worth watching in the yard.
+        warnings.append(
             f"bin {bin_id}: learned hue band ±{tol:.1f}° covers at least half "
-            f"the color circle (resultant R={resultant:.3f}) - the samples "
-            "have no consistent color. Re-draw them on a colored lid area; "
-            "grey/black lids cannot be color-calibrated - attach a small "
-            "colored marker to the lid and sample that instead"
+            f"the color circle (resultant R={resultant:.3f}) - learning it "
+            "anyway because the marks are trusted; this bin can barely be "
+            "told apart by colour and will claim a lot of the region"
         )
     # Floors from the coherent pixels only: junk (overexposed, greyish)
     # pixels must not drag them toward zero, or the runtime mask would
-    # re-admit exactly the junk the mixture just removed.
-    w_coherent = None if w_valid is None else w_valid[coherent]
-    sat_min = pct(sat_valid[coherent], w_coherent, SV_MIN_PERCENTILE)
-    val_min = pct(val_valid[coherent], w_coherent, SV_MIN_PERCENTILE)
+    # re-admit exactly the junk the mixture just removed. With
+    # trust_marks the opposite is wanted: the pale pixels ARE the lid
+    # under flat light, and a floor that excludes them makes that
+    # condition undetectable.
+    floor_mask = slice(None) if trust_marks else coherent
+    w_floor = (
+        None
+        if w_valid is None
+        else (w_valid if trust_marks else w_valid[coherent])
+    )
+    sat_min = pct(sat_valid[floor_mask], w_floor, SV_MIN_PERCENTILE)
+    val_min = pct(val_valid[floor_mask], w_floor, SV_MIN_PERCENTILE)
     # Order-statistics-derived warning (no chosen cutoff): if
     # q/100·(n−1) < 1, the q-th percentile IS the sample minimum, i.e.
     # the sample is too small for the percentile to differ from min.
-    if SV_MIN_PERCENTILE / 100.0 * (n_coherent - 1) < 1.0:
+    # It has to count the pool the floors were actually taken over, or
+    # it reports on a set the percentile never saw.
+    n_floor = n_valid if trust_marks else n_coherent
+    floor_unit = "sample" if trust_marks else "coherent sample"
+    if SV_MIN_PERCENTILE / 100.0 * (n_floor - 1) < 1.0:
         warnings.append(
-            f"bin {bin_id}: only {n_coherent} coherent sample pixels - the "
+            f"bin {bin_id}: only {n_floor} {floor_unit} pixels - the "
             f"{SV_MIN_PERCENTILE:g}th percentile equals the sample minimum; "
             "draw larger sample rectangles"
         )
@@ -388,11 +446,18 @@ def learn_color_model(
     # documented capacity of HUE_TOL_PERCENTILE): model is learned from
     # the coherent majority, but the sample spot deserves a re-draw.
     if junk_fraction > (100.0 - HUE_TOL_PERCENTILE) / 100.0:
+        # Naming the pool the band actually came from: "the coherent
+        # majority" is untrue whenever the trust path learned from a
+        # minority, and the two warnings would then contradict each other.
+        source = (
+            "the coherent pixels"
+            if trust_marks
+            else "the coherent majority"
+        )
         warnings.append(
             f"bin {bin_id}: {junk_fraction:.0%} of the sample {unit} is "
-            "junk (overexposed or off-color); the model was learned from "
-            "the coherent majority - consider re-drawing this sample in "
-            "better light"
+            f"junk (overexposed or off-color); the model was learned from "
+            f"{source} - consider re-drawing this sample in better light"
         )
     return ColorLearnResult(
         hue_center_deg=center,
@@ -407,6 +472,7 @@ def learn_color_model(
             # per-image weights these differ by design.
             "junk_fraction": junk_fraction,
             "junk_fraction_is_per_image": w_valid is not None,
+            "trust_marks": trust_marks,
             "mixture_weight": fit.weight,
             "kappa": fit.kappa,
             "em_iterations": fit.n_iter,
@@ -594,7 +660,10 @@ def misclassified_manual_labels(
 
 
 def learn_profile(
-    store: CalibrationStore, store_path: str | Path
+    store: CalibrationStore,
+    store_path: str | Path,
+    *,
+    trust_marks: bool = False,
 ) -> tuple[Profile, list[str]]:
     """Full recomputation: store → profile. Returns (profile, warnings).
 
@@ -725,6 +794,7 @@ def learn_profile(
                 np.concatenate(val_parts),
                 bin_id=decl.id,
                 weights=np.concatenate(weight_parts),
+                trust_marks=trust_marks,
             )
         except CalibrationError as exc:
             untrained[decl.id] = str(exc)

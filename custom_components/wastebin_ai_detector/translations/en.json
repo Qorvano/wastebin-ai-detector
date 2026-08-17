@@ -113,10 +113,12 @@
         "data": {
           "scan_interval_minutes": "Detection interval",
           "capture_interval_minutes": "Learning capture interval",
-          "confirm_scans": "Confirmation scans for state changes"
+          "confirm_scans": "Confirmation scans for state changes",
+          "trust_marks": "Train everything (experiment)"
         },
         "data_description": {
-          "confirm_scans": "1 = a clear detection switches immediately. Higher values require that many consecutive clear detections before a sensor changes state."
+          "confirm_scans": "1 = a clear detection switches immediately. Higher values require that many consecutive clear detections before a sensor changes state.",
+          "trust_marks": "Take the drawn marks at their word: colour floors are learned from every marked pixel, a sample without a coherent majority is still learned, and a learning run keeps what it collects even when the measurement on hand-labeled images gets worse. Makes pale, washed-out lids detectable at the cost of more background matches."
         }
       }
     }

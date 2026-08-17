@@ -202,6 +202,37 @@ What keeps an unattended run from slowly corrupting the models:
 `discard_auto_evidence` / `restore_auto_evidence` take everything a run
 collected out of or back into training in one call.
 
+### Train everything (v0.7.5, off by default)
+
+The safety rails above have a cost: under flat overcast light a pale
+lid carries so little chroma that its hue scatters, the patch is filed
+as incoherent and the frame is refused - so the washed-out condition
+one most wants to learn is the one that never gets learned. The
+integration option **Train everything** turns the three judgements
+about light into observations:
+
+- nothing about the colour of a marked patch is fatal any more: a patch
+  without a coherent majority is learned, and so is one whose hue band
+  ends up covering half the colour circle. Both refusals become
+  warnings;
+- the saturation and brightness floors come from every marked pixel
+  rather than only the coherent ones (the hue band still comes from the
+  coherent pixels wherever there are any, so colour identity stays as
+  discriminative as the light allows);
+- an overexposed frame is collected instead of refused;
+- the holdout test still runs and still reports, but it no longer
+  discards the evidence or pauses the run.
+
+Two gates stay in place, because they are not about light: a broken
+keyframe is corrupted data, and a greyscale night frame has no hue at
+all - learning from it would drag every saturation floor to zero and
+with it any ability to tell the bins apart.
+
+Expect more background matches in exchange for detection that keeps
+working in glare. The card marks a run collecting under this mode, and
+a forced adoption is reported in the relearn response (`auto.forced`)
+and as a warning.
+
 ## Bins exclude each other, and lids are marked by points (v0.6.0)
 
 **Two bins can never occupy the same spot**, so detection now enforces

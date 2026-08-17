@@ -519,3 +519,157 @@ class TestEvidenceSemantics:
         )
         # Three sample images: two manual plus the run's frame.
         assert with_run.bins[0].learning_stats["n_sample_images"] == 3
+
+
+class TestTrustMarks:
+    """The experiment switch: take the drawn marks at their word.
+
+    Under flat overcast light a pale lid carries so little chroma that
+    its hue scatters; the mixture files those pixels as junk, and the
+    saturation floor then stays where only a saturated lid reaches it -
+    so exactly the condition one wants to learn stays undetectable.
+    """
+
+    def _pool(self):
+        import numpy as np
+
+        # A saturated lid (coherent) plus a pale one: with almost no
+        # chroma left the hue is noise, so it scatters over the whole
+        # circle - which is exactly how the mixture files it as junk.
+        n_bright, n_pale = 250, 200
+        hue = np.concatenate(
+            [
+                np.linspace(58.0, 62.0, n_bright),
+                np.linspace(0.0, 360.0, n_pale, endpoint=False),
+            ]
+        )
+        sat = np.concatenate(
+            [np.full(n_bright, 0.80), np.full(n_pale, 0.12)]
+        )
+        val = np.concatenate(
+            [np.full(n_bright, 0.75), np.full(n_pale, 0.70)]
+        )
+        return hue, sat, val
+
+    def test_pale_pixels_lower_the_floor_only_when_marks_are_trusted(self):
+        from wastebin_ai_detector.core.learn import learn_color_model
+
+        hue, sat, val = self._pool()
+        strict = learn_color_model(hue, sat, val, bin_id="gelb")
+        trusting = learn_color_model(
+            hue, sat, val, bin_id="gelb", trust_marks=True
+        )
+        # Strict keeps the floor at the saturated lid; trusting lets the
+        # pale one in.
+        assert strict.sat_min > 0.5
+        assert trusting.sat_min < 0.2
+        # The hue band stays learned from the coherent pixels either
+        # way, so colour identity is not given up.
+        assert trusting.hue_center_deg == pytest.approx(
+            strict.hue_center_deg, abs=1.0
+        )
+        assert trusting.stats["trust_marks"] is True
+
+    def test_a_pool_without_a_majority_is_refused_but_can_be_trusted(self):
+        import numpy as np
+
+        from wastebin_ai_detector.core.errors import CalibrationError
+        from wastebin_ai_detector.core.learn import learn_color_model
+
+        # Two thirds scattered: no coherent majority left.
+        hue = np.concatenate(
+            [np.linspace(59.0, 61.0, 100), np.linspace(0.0, 360.0, 300)]
+        )
+        sat = np.full(hue.size, 0.6)
+        val = np.full(hue.size, 0.7)
+        with pytest.raises(CalibrationError):
+            learn_color_model(hue, sat, val, bin_id="gelb")
+        result = learn_color_model(
+            hue, sat, val, bin_id="gelb", trust_marks=True
+        )
+        assert result.stats["junk_fraction"] > 0.5
+        assert any("trusted" in w for w in result.warnings)
+
+    def test_a_band_covering_half_the_circle_is_learned_when_trusted(self):
+        """The refusal that would otherwise still block the mode.
+
+        Relaxing only the majority guard was not enough: a pool whose
+        coherent pixels are themselves spread wide produces a band over
+        half the colour circle, and that raised too - so the washed-out
+        frame stayed refused with the option on.
+        """
+        import numpy as np
+
+        from wastebin_ai_detector.core.errors import CalibrationError
+        from wastebin_ai_detector.core.learn import learn_color_model
+
+        # One broad population: coherent by the mixture's reckoning, but
+        # spanning far too much of the circle to be a colour.
+        hue = np.linspace(0.0, 200.0, 600)
+        sat = np.full(hue.size, 0.30)
+        val = np.full(hue.size, 0.60)
+        with pytest.raises(CalibrationError, match="half the color circle"):
+            learn_color_model(hue, sat, val, bin_id="gelb")
+        result = learn_color_model(
+            hue, sat, val, bin_id="gelb", trust_marks=True
+        )
+        assert 2.0 * result.hue_tol_deg >= 180.0
+        assert any("claim a lot of the region" in w for w in result.warnings)
+
+    def test_a_pool_without_a_single_coherent_pixel_still_learns(self):
+        """The headline case taken to its limit.
+
+        When the hue is pure noise the mixture can leave NO coherent
+        pixel at all. The band then has no coherent subset to rest on,
+        and a percentile over that empty subset would raise - so the
+        whole marked pool becomes the band's evidence.
+        """
+        import numpy as np
+
+        from wastebin_ai_detector.core.learn import learn_color_model
+
+        hue = np.linspace(0.0, 360.0, 900, endpoint=False)
+        sat = np.full(hue.size, 0.04)
+        val = np.full(hue.size, 0.85)
+        result = learn_color_model(
+            hue, sat, val, bin_id="gelb", trust_marks=True
+        )
+        assert result.stats["n_coherent_px"] == 0
+        assert np.isfinite(result.hue_center_deg)
+        assert np.isfinite(result.hue_tol_deg)
+        # The floors come from the pool, so they are real numbers rather
+        # than the "nothing reaches this" values a coherent-only pool
+        # would have produced.
+        assert 0.0 <= result.sat_min <= 0.04
+        assert np.isfinite(result.val_min)
+
+    def test_learn_profile_forwards_the_flag(self, tmp_path):
+        """The wire from the service down to the colour model: without
+        it the option would be a no-op for the profile detection runs
+        on."""
+        from scenes import YELLOW, make_scene
+
+        from wastebin_ai_detector.core.learn import learn_profile
+
+        store = CalibrationStore(
+            roi=Roi(0.0, 0.0, 1.0, 1.0),
+            working_width=160,
+            resample="bilinear",
+            bins=[BinDecl("gelb", "Gelb")],
+        )
+        lid = (0.30, 0.30, 0.20, 0.20)
+        for i in range(2):
+            name = f"f{i}.png"
+            make_scene(rects=[(YELLOW, *lid)], seed=i).save(
+                tmp_path / name, format="PNG"
+            )
+            store.add_sample(name, "gelb", Rect(0.34, 0.34, 0.06, 0.06))
+            store.set_labels(name, present=["gelb"])
+        make_scene(rects=[], seed=9).save(tmp_path / "none.png", format="PNG")
+        store.set_labels("none.png", absent=["gelb"])
+        plain, _w = learn_profile(store, tmp_path / "s.json")
+        trusting, _w2 = learn_profile(
+            store, tmp_path / "s.json", trust_marks=True
+        )
+        assert plain.bins[0].learning_stats["trust_marks"] is False
+        assert trusting.bins[0].learning_stats["trust_marks"] is True

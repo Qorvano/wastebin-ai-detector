@@ -29,6 +29,7 @@ from .const import (
     CONF_ROI_X,
     CONF_ROI_Y,
     CONF_SCAN_INTERVAL,
+    CONF_TRUST_MARKS,
     CONF_VIEW_GENERATION,
     CONF_WORKING_WIDTH,
     DEFAULT_CAPTURE_INTERVAL_MIN,
@@ -553,6 +554,10 @@ class WastebinOptionsFlow(OptionsFlow):
                             mode=selector.NumberSelectorMode.BOX,
                         )
                     ),
+                    vol.Required(
+                        CONF_TRUST_MARKS,
+                        default=options.get(CONF_TRUST_MARKS, False),
+                    ): selector.BooleanSelector(),
                 }
             ),
         )

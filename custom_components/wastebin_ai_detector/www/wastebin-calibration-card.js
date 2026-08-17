@@ -44,6 +44,7 @@ const TEXTS = {
     run_hint: "Declare what is standing there right now, then start. The system captures and learns on its own until you end the run - leave the bins exactly as declared.",
     run_active: "Learning run active: ",
     run_paused: "PAUSED, nothing is being collected: ",
+    run_trusting: " - training everything it sees",
     run_started: "Learning run started. The system now captures on its own.",
     run_stopped: "Learning run ended. Collected frames: ",
     run_locked: "A learning run is active - end it to capture or mark by hand.",
@@ -87,6 +88,7 @@ const TEXTS = {
     run_hint: "Erklären Sie, was gerade dasteht, und starten Sie dann. Das System nimmt selbstständig auf und lernt daraus, bis Sie den Lauf beenden - lassen Sie die Tonnen bitte genau so stehen.",
     run_active: "Lernlauf läuft: ",
     run_paused: "PAUSIERT, es wird nichts gesammelt: ",
+    run_trusting: " - trainiert alles, was es sieht",
     run_started: "Lernlauf gestartet. Das System nimmt jetzt selbst auf.",
     run_stopped: "Lernlauf beendet. Gesammelte Aufnahmen: ",
     run_locked: "Ein Lernlauf läuft - bitte beenden Sie ihn, um selbst aufzunehmen oder zu markieren.",
@@ -317,6 +319,7 @@ class WastebinCalibrationCard extends HTMLElement {
         "/" +
         (session.capacity_per_situation ?? "?") +
         ")" +
+        (session.trust_marks ? this._t.run_trusting : "") +
         (session.paused ? " - " + this._t.run_paused + session.paused : "");
       info.classList.toggle("warn", Boolean(session.paused));
     } else {

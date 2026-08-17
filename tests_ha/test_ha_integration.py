@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -1409,6 +1410,205 @@ async def test_collected_evidence_is_dropped_when_it_would_regress(
         )
         assert storage.auto_paused is None
         assert storage.calibration.get_image("auto.jpg").excluded is False
+
+
+async def test_train_everything_overrules_the_refusal(
+    hass: HomeAssistant,
+) -> None:
+    """Same refusal, option on: the verdict is still measured and
+    reported, but it no longer discards the evidence or pauses the run.
+
+    That is the experiment the option exists for - the user wants the
+    washed-out profiles IN the model and will judge the result from
+    detection in the field, not from this measurement."""
+    from custom_components.wastebin_ai_detector.const import CONF_TRUST_MARKS
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data=ENTRY_DATA,
+        options={CONF_TRUST_MARKS: True},
+        title="Test",
+        minor_version=2,
+    )
+    entry.add_to_hass(hass)
+    feed = _CameraFeed(_scene_jpeg(with_yellow=True))
+    with patch(
+        "custom_components.wastebin_ai_detector.coordinator.async_get_image",
+        new=feed,
+    ), patch(
+        "custom_components.wastebin_ai_detector.coordinator.is_up",
+        return_value=True,
+    ):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        await _calibrate_yellow(hass)
+        storage = entry.runtime_data.storage
+
+        from custom_components.wastebin_ai_detector.core import AutoStamp
+        from custom_components.wastebin_ai_detector.core.store import Rect
+
+        storage.calibration.record_auto_frame(
+            "auto.jpg",
+            AutoStamp(0.5, 0.5),
+            samples={"gelbe_tonne": [Rect(0.35, 0.35, 0.10, 0.10)]},
+            present=["gelbe_tonne"],
+            absent=[],
+        )
+        with patch(
+            "custom_components.wastebin_ai_detector.services.adoption_verdict"
+        ) as verdict:
+            from custom_components.wastebin_ai_detector.core import (
+                AdoptionVerdict,
+            )
+
+            verdict.return_value = AdoptionVerdict(
+                False, ["gelbe_tonne: stopped separating"], {}
+            )
+            response = await hass.services.async_call(
+                DOMAIN, "relearn", {}, blocking=True, return_response=True
+            )
+
+        assert storage.calibration.get_image("auto.jpg").excluded is False
+        assert storage.auto_paused is None
+        # Reported, not hidden: the user can see it went the wrong way.
+        assert response["auto"]["adopted"] is True
+        assert response["auto"]["forced"] is True
+        assert response["auto"]["regressions"]
+        assert any("train-everything" in w for w in response["warnings"])
+
+
+async def test_train_everything_lets_an_overexposed_frame_be_collected(
+    hass: HomeAssistant,
+) -> None:
+    """The gate that blocks exactly the frames the mode wants.
+
+    A frame brighter than anything in the calibration set is refused as
+    "overexposed" by default; with the option on it is evaluated for
+    the reservoir instead. The greyscale gate stays either way - a
+    night frame has no hue to learn from at all.
+    """
+    from custom_components.wastebin_ai_detector.coordinator import (
+        _evaluate_auto_frame,
+    )
+
+    entry = MockConfigEntry(
+        domain=DOMAIN, data=ENTRY_DATA, title="Test", minor_version=2
+    )
+    entry.add_to_hass(hass)
+    feed = _CameraFeed(_scene_jpeg(with_yellow=True))
+    with patch(
+        "custom_components.wastebin_ai_detector.coordinator.async_get_image",
+        new=feed,
+    ), patch(
+        "custom_components.wastebin_ai_detector.coordinator.is_up",
+        return_value=True,
+    ):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        await _calibrate_yellow(hass)
+        storage = entry.runtime_data.storage
+        profile = storage.profile
+
+    from custom_components.wastebin_ai_detector.core.autosample import (
+        reference_rects,
+    )
+
+    frame = _scene_jpeg(with_yellow=True)
+    # The very rects the collector would re-apply, so this exercises
+    # the real path rather than a hand-built stand-in.
+    refs = reference_rects(storage.calibration)
+    assert refs
+
+    def _run(*, overexposed, greyscale, trust):
+        from custom_components.wastebin_ai_detector.core.detect import detect
+
+        real = detect
+
+        def fake(img, prof):
+            result = real(img, prof)
+            return replace(
+                result,
+                overexposure_suspect=overexposed,
+                grayscale_suspect=greyscale,
+            )
+
+        with patch(
+            "custom_components.wastebin_ai_detector.coordinator.detect",
+            new=fake,
+        ):
+            return _evaluate_auto_frame(frame, profile, refs, [], trust)
+
+    assert _run(overexposed=True, greyscale=False, trust=False)["reason"] == (
+        "overexposed"
+    )
+    assert _run(overexposed=True, greyscale=False, trust=True)["reason"] != (
+        "overexposed"
+    )
+    # No colour at all is still no colour, whatever the option says.
+    assert _run(overexposed=False, greyscale=True, trust=True)["reason"] == (
+        "greyscale"
+    )
+
+
+async def test_the_collector_passes_the_live_option_into_the_gates(
+    hass: HomeAssistant,
+) -> None:
+    """The wiring itself: whatever the option says right now is what the
+    frame is judged by, without a restart in between."""
+    from custom_components.wastebin_ai_detector.const import CONF_TRUST_MARKS
+
+    entry = MockConfigEntry(
+        domain=DOMAIN, data=ENTRY_DATA, title="Test", minor_version=2
+    )
+    entry.add_to_hass(hass)
+    feed = _CameraFeed(_scene_jpeg(with_yellow=True))
+    with patch(
+        "custom_components.wastebin_ai_detector.coordinator.async_get_image",
+        new=feed,
+    ), patch(
+        "custom_components.wastebin_ai_detector.coordinator.is_up",
+        return_value=True,
+    ):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        await _calibrate_yellow(hass)
+        await hass.services.async_call(
+            DOMAIN,
+            "start_learning",
+            {"present": ["gelbe_tonne"]},
+            blocking=True,
+            return_response=True,
+        )
+        collector = entry.runtime_data.collector
+
+        seen = []
+
+        def _spy(data, profile, references, retained, trust_marks=False):
+            seen.append(trust_marks)
+            return {"accept": False, "reason": "spy", "evict": None}
+
+        with patch(
+            "custom_components.wastebin_ai_detector.coordinator"
+            "._evaluate_auto_frame",
+            new=_spy,
+        ):
+            await collector._async_interval(dt_util.now())
+            assert seen == [False]
+            hass.config_entries.async_update_entry(
+                entry, options={**entry.options, CONF_TRUST_MARKS: True}
+            )
+            await hass.async_block_till_done()
+            # The reload rebuilds the runtime, so ask it for the run and
+            # the collector again rather than reusing stale objects.
+            await hass.services.async_call(
+                DOMAIN,
+                "start_learning",
+                {"present": ["gelbe_tonne"]},
+                blocking=True,
+                return_response=True,
+            )
+            await entry.runtime_data.collector._async_interval(dt_util.now())
+        assert seen == [False, True]
 
 
 async def test_a_learning_run_can_declare_a_bin_away(hass: HomeAssistant) -> None:

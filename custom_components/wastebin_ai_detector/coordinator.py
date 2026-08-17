@@ -38,6 +38,7 @@ from .const import (
     CONF_CAPTURE_INTERVAL,
     CONF_CONFIRM_SCANS,
     CONF_SCAN_INTERVAL,
+    CONF_TRUST_MARKS,
     DEFAULT_CAPTURE_INTERVAL_MIN,
     DEFAULT_CONFIRM_SCANS,
     DEFAULT_SCAN_INTERVAL_MIN,
@@ -397,6 +398,7 @@ def _evaluate_auto_frame(
     profile: Profile,
     references: dict[str, list],
     retained: list[tuple[str, tuple[float, float]]],
+    trust_marks: bool = False,
 ) -> dict[str, Any]:
     """Decide whether this frame earns a slot in the reservoir.
 
@@ -412,6 +414,15 @@ def _evaluate_auto_frame(
     "only sample when it matches the current model" would reject
     exactly the frames carrying new information - a lid in light the
     models have never seen - which is what the collection exists for.
+
+    With trust_marks the two gates that judge the LIGHT of a still
+    colourful frame step aside: an overexposed frame and a patch whose
+    hue has scattered are precisely the washed-out conditions the mode
+    exists to learn. The two that judge whether there is any usable
+    colour at all stay: a broken keyframe is corrupted data rather than
+    a light condition, and a greyscale night frame carries no hue to
+    learn - training on it would drag every saturation floor to zero
+    and with it any ability to tell the bins apart.
     """
     img = load_image_rgb_bytes(data)
     result = detect(img, profile)
@@ -419,7 +430,7 @@ def _evaluate_auto_frame(
         return {"accept": False, "reason": "frame_integrity", "evict": None}
     if result.grayscale_suspect:
         return {"accept": False, "reason": "greyscale", "evict": None}
-    if result.overexposure_suspect:
+    if result.overexposure_suspect and not trust_marks:
         return {"accept": False, "reason": "overexposed", "evict": None}
     # Coherence: every referenced patch must show one colour. A rect
     # that has slid half onto the ground (a bin was moved despite the
@@ -429,7 +440,9 @@ def _evaluate_auto_frame(
         if hue.size == 0:
             return {"accept": False, "reason": "empty_patch", "evict": None}
         try:
-            learn_color_model(hue, sat, val, bin_id=bin_id)
+            learn_color_model(
+                hue, sat, val, bin_id=bin_id, trust_marks=trust_marks
+            )
         except CalibrationError:
             return {"accept": False, "reason": "incoherent_patch", "evict": None}
     coord = (result.median_sat, result.median_val)
@@ -602,6 +615,7 @@ class LearningCollector:
                 profile,
                 references,
                 list(retained),
+                bool(self._entry.options.get(CONF_TRUST_MARKS, False)),
             )
         except WastebinError as err:
             _LOGGER.debug("learning run skipped this frame: %s", err)

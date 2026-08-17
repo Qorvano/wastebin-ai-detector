@@ -113,10 +113,12 @@
         "data": {
           "scan_interval_minutes": "Erkennungsintervall",
           "capture_interval_minutes": "Lern-Aufnahmeintervall",
-          "confirm_scans": "Bestätigungs-Scans für Zustandswechsel"
+          "confirm_scans": "Bestätigungs-Scans für Zustandswechsel",
+          "trust_marks": "Alles trainieren (Experiment)"
         },
         "data_description": {
-          "confirm_scans": "1 = eine eindeutige Erkennung schaltet sofort. Höhere Werte verlangen so viele aufeinanderfolgende eindeutige Erkennungen, bevor ein Sensor den Zustand wechselt."
+          "confirm_scans": "1 = eine eindeutige Erkennung schaltet sofort. Höhere Werte verlangen so viele aufeinanderfolgende eindeutige Erkennungen, bevor ein Sensor den Zustand wechselt.",
+          "trust_marks": "Nimmt die gesetzten Marken beim Wort: Farb-Untergrenzen werden aus allen markierten Pixeln gelernt, eine Probe ohne kohärente Mehrheit wird trotzdem gelernt, und ein Lernlauf behält das Gesammelte auch dann, wenn die Messung auf handbestätigten Bildern schlechter wird. Macht blasse, ausgewaschene Deckel erkennbar, um den Preis von mehr Hintergrund-Treffern."
         }
       }
     }

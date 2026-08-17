@@ -16,6 +16,10 @@ CONF_BIN_NAME = "name"
 CONF_SCAN_INTERVAL = "scan_interval_minutes"
 CONF_CAPTURE_INTERVAL = "capture_interval_minutes"
 CONF_CONFIRM_SCANS = "confirm_scans"
+# Experiment switch: take the drawn marks at their word (see
+# learn_color_model) and let a learning run keep what it collects even
+# when the measurement on hand-labeled images gets worse.
+CONF_TRUST_MARKS = "trust_marks"
 # Monotone counter in entry.data: bumped when the user declares the
 # scene->frame mapping changed (camera swapped/re-aimed); reconciled
 # into the store's view_epoch on setup.

@@ -36,6 +36,7 @@ from .const import (
     CONF_ROI_W,
     CONF_ROI_X,
     CONF_ROI_Y,
+    CONF_TRUST_MARKS,
     CONF_WORKING_WIDTH,
     CONF_CAMERA,
     ATTR_ABSENT,
@@ -292,6 +293,11 @@ async def async_relearn(hass: HomeAssistant, entry: ConfigEntry) -> dict[str, An
         calibration = store_from_dict(store_to_dict(storage.calibration))
         anchor = store_anchor(hass, entry.entry_id)
         adoption: dict[str, Any] | None = None
+        trust_marks = bool(entry.options.get(CONF_TRUST_MARKS, False))
+
+        def _learn(target_store):
+            return learn_profile(target_store, anchor, trust_marks=trust_marks)
+
         try:
             if has_auto_evidence(calibration):
                 # Learn twice: once on the user's own evidence alone,
@@ -302,10 +308,10 @@ async def async_relearn(hass: HomeAssistant, entry: ConfigEntry) -> dict[str, An
                 # touch, which is what keeps it from grading its own
                 # homework.
                 baseline, _base_warnings = await hass.async_add_executor_job(
-                    learn_profile, without_auto_evidence(calibration), anchor
+                    _learn, without_auto_evidence(calibration)
                 )
                 candidate, warnings = await hass.async_add_executor_job(
-                    learn_profile, calibration, anchor
+                    _learn, calibration
                 )
                 verdict = adoption_verdict(baseline, candidate)
                 # Holdout: whatever the run collected, the resulting
@@ -328,15 +334,29 @@ async def async_relearn(hass: HomeAssistant, entry: ConfigEntry) -> dict[str, An
                 mistakes = [m for m in candidate_mistakes if m not in known]
                 regressions = [*verdict.regressions, *mistakes]
                 adoption = {
-                    "adopted": not regressions,
+                    # "adopted" reports what is actually in use;
+                    # "forced" says the measurement spoke against it and
+                    # train-everything overruled the veto.
+                    "adopted": not regressions or trust_marks,
+                    "forced": bool(regressions) and trust_marks,
                     "regressions": regressions,
                     "gaps": verdict.gaps,
                 }
                 verdict = AdoptionVerdict(
                     not regressions, regressions, verdict.gaps
                 )
-                if verdict.adopt:
+                if verdict.adopt or trust_marks:
+                    # "Train everything": the verdict is still measured
+                    # and reported, but it no longer vetoes - that is
+                    # the whole point of the experiment.
                     profile = candidate
+                    if not verdict.adopt:
+                        warnings = [
+                            *warnings,
+                            "adopted anyway (train-everything is on); the "
+                            "measurement on hand-labeled images got worse: "
+                            + "; ".join(regressions),
+                        ]
                 else:
                     # Keep what the human evidence alone says, set the
                     # collected part aside (reversibly) and stop
@@ -354,7 +374,7 @@ async def async_relearn(hass: HomeAssistant, entry: ConfigEntry) -> dict[str, An
                     ]
             else:
                 profile, warnings = await hass.async_add_executor_job(
-                    learn_profile, calibration, anchor
+                    _learn, calibration
                 )
         except WastebinError as err:
             # No issue is created here: interactive callers see the
@@ -488,7 +508,12 @@ def async_setup_services(hass: HomeAssistant) -> None:
         # while re-marking is still cheap.
         fragile = []
         profile = storage.profile
-        if profile is not None:
+        # ... unless the marks are trusted, where none of that can
+        # happen: the model is learned anyway and the adoption test no
+        # longer vetoes, so warning about it would be plainly false.
+        if profile is not None and not entry.options.get(
+            CONF_TRUST_MARKS, False
+        ):
             for model in profile.bins:
                 if model.id not in present:
                     continue
