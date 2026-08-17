@@ -43,6 +43,7 @@ const TEXTS = {
     stop_run: "End learning run",
     run_hint: "Declare what is standing there right now, then start. The system captures and learns on its own until you end the run - leave the bins exactly as declared.",
     run_active: "Learning run active: ",
+    run_paused: "PAUSED, nothing is being collected: ",
     run_started: "Learning run started. The system now captures on its own.",
     run_stopped: "Learning run ended. Collected frames: ",
     run_locked: "A learning run is active - end it to capture or mark by hand.",
@@ -85,6 +86,7 @@ const TEXTS = {
     stop_run: "Lernlauf beenden",
     run_hint: "Erklären Sie, was gerade dasteht, und starten Sie dann. Das System nimmt selbstständig auf und lernt daraus, bis Sie den Lauf beenden - lassen Sie die Tonnen bitte genau so stehen.",
     run_active: "Lernlauf läuft: ",
+    run_paused: "PAUSIERT, es wird nichts gesammelt: ",
     run_started: "Lernlauf gestartet. Das System nimmt jetzt selbst auf.",
     run_stopped: "Lernlauf beendet. Gesammelte Aufnahmen: ",
     run_locked: "Ein Lernlauf läuft - bitte beenden Sie ihn, um selbst aufzunehmen oder zu markieren.",
@@ -278,22 +280,48 @@ class WastebinCalibrationCard extends HTMLElement {
     stop.style.display = session ? "" : "none";
     if (session) {
       const declared = Object.entries(session.declaration)
-        .map(
-          ([binId, state]) =>
-            (this._config.bins.find((b) => b.id === binId) || {}).name ||
-            binId
-        )
+        .map(([binId, state]) => {
+          const bin = this._config.bins.find((b) => b.id === binId);
+          return (
+            (bin ? bin.name : binId) +
+            " " +
+            (state === "present" ? this._t.present : this._t.absent)
+          );
+        })
         .join(", ");
+      /* The situation this run is collecting for, and how far it has
+       * got. A paused run is the one state that must never hide: it
+       * looks exactly like a working one otherwise. */
+      const mine = (session.situations || []).find((s2) => {
+        const present = Object.entries(session.declaration)
+          .filter(([, state]) => state === "present")
+          .map(([binId]) => binId)
+          .sort();
+        const absent = Object.entries(session.declaration)
+          .filter(([, state]) => state === "absent")
+          .map(([binId]) => binId)
+          .sort();
+        return (
+          JSON.stringify([...(s2.present || [])].sort()) ===
+            JSON.stringify(present) &&
+          JSON.stringify([...(s2.absent || [])].sort()) ===
+            JSON.stringify(absent)
+        );
+      });
+      const kept = mine ? mine.retained : 0;
       info.textContent =
         this._t.run_active +
         declared +
         " (" +
-        (session.retained ?? 0) +
+        kept +
         "/" +
-        (session.capacity ?? "?") +
-        ")";
+        (session.capacity_per_situation ?? "?") +
+        ")" +
+        (session.paused ? " - " + this._t.run_paused + session.paused : "");
+      info.classList.toggle("warn", Boolean(session.paused));
     } else {
       info.textContent = "";
+      info.classList.remove("warn");
     }
     /* While a run is active the yard must stay as declared, so manual
      * capturing and marking are out of reach until it ends. */
@@ -1087,6 +1115,7 @@ class WastebinCalibrationCard extends HTMLElement {
         .vertex.first { fill: var(--accent-color); }
         #status { margin-top: 8px; font-size: 13px; color: var(--secondary-text-color); min-height: 1.2em; }
         #run-info { font-size: 13px; color: var(--secondary-text-color); }
+        #run-info.warn { color: var(--error-color, #a00); font-weight: 500; }
         #run-actions { margin-bottom: 4px; }
       </style>
       <ha-card>

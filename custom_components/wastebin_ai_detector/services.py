@@ -63,6 +63,7 @@ from .const import (
     SERVICE_SET_ROI,
 )
 from .core import (
+    HUE_TOL_PERCENTILE,
     REL_EPS,
     CalibrationError,
     ProfileError,
@@ -478,6 +479,22 @@ def async_setup_services(hass: HomeAssistant) -> None:
         missing = [
             b.id for b in store.bins if b.active and b.id not in declared
         ]
+        # A run adds one vote per collected frame to the colour pool of
+        # every bin declared present. A bin whose existing marks are
+        # already near the majority rule will therefore lose its model
+        # on the first frame, the adoption test will refuse, and the
+        # run will pause before it ever collected anything - which is
+        # exactly what happened in the field. Say so BEFORE the run,
+        # while re-marking is still cheap.
+        fragile = []
+        profile = storage.profile
+        if profile is not None:
+            for model in profile.bins:
+                if model.id not in present:
+                    continue
+                junk = float(model.learning_stats.get("junk_fraction", 0.0))
+                if junk > (100.0 - HUE_TOL_PERCENTILE) / 100.0:
+                    fragile.append(f"{model.id} ({junk:.0%} junk)")
         storage.learning_declaration = {
             **{b: "present" for b in present},
             **{b: "absent" for b in absent},
@@ -492,6 +509,17 @@ def async_setup_services(hass: HomeAssistant) -> None:
             # Undeclared bins are simply not part of this run: their
             # evidence stays whatever it was.
             "not_declared": missing,
+            "warnings": (
+                []
+                if not fragile
+                else [
+                    "these bins carry more junk in their existing marks "
+                    "than the colour model tolerates, so the first "
+                    "collected frame is likely to end the run: "
+                    + ", ".join(fragile)
+                    + " - re-mark them in softer light first"
+                ]
+            ),
         }
 
     async def handle_stop_learning(call: ServiceCall) -> ServiceResponse:
